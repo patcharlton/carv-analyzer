@@ -2,6 +2,9 @@ import { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import './App.css'
 
+// API base URL - uses environment variable in production, /api proxy in development
+const API_BASE_URL = import.meta.env.VITE_API_URL || '/api'
+
 // Storage key for progress logs
 const STORAGE_KEY = 'carv_progress_logs'
 
@@ -50,7 +53,7 @@ function App() {
         formData.append('images', fileObj.file)
       })
 
-      const response = await axios.post('/api/extract-metadata', formData, {
+      const response = await axios.post(`${API_BASE_URL}/extract-metadata`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
 
@@ -173,7 +176,7 @@ function App() {
         formData.append('images', fileObj.file)
       })
 
-      const response = await axios.post('/api/analyze', formData, {
+      const response = await axios.post(`${API_BASE_URL}/analyze`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data'
         }
@@ -208,7 +211,7 @@ function App() {
     setError(null)
 
     try {
-      const response = await axios.post('/api/generate-plan', analysis)
+      const response = await axios.post(`${API_BASE_URL}/generate-plan`, analysis)
       setTrainingPlan(response.data.training_plan)
     } catch (err) {
       const errorMessage = err.response?.data?.message ||
