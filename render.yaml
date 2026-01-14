@@ -3,7 +3,7 @@ services:
   - type: web
     name: carv-analyzer-api
     runtime: python
-    rootDir: backend
+    rootDir: Carvtrainer/backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT
     envVars:
@@ -18,7 +18,7 @@ services:
   - type: web
     name: carv-analyzer-frontend
     runtime: static
-    rootDir: frontend
+    rootDir: Carvtrainer/frontend
     buildCommand: npm install && npm run build
     staticPublishPath: dist
     envVars:
