@@ -8,22 +8,21 @@ services:
     startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT
     envVars:
       - key: ANTHROPIC_API_KEY
-        sync: false  # You'll set this manually in the Render dashboard
+        sync: false
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.0"
       - key: FRONTEND_URL
-        sync: false  # Set to https://carv-analyzer-frontend.onrender.com after deploy
+        sync: false
 
   # Frontend Static Site
-  - type: web
+  - type: static_site
     name: carv-analyzer-frontend
-    runtime: static
     rootDir: Carvtrainer/frontend
     buildCommand: npm install && npm run build
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL
-        sync: false  # Set to https://carv-analyzer-api.onrender.com after deploy
+        sync: false
     headers:
       - path: /*
         name: Cache-Control
