@@ -1,5 +1,4 @@
 services:
-  # Backend API Service
   - type: web
     name: carv-analyzer-api
     runtime: python
@@ -13,21 +12,3 @@ services:
         value: "3.11.0"
       - key: FRONTEND_URL
         sync: false
-
-staticSites:
-  # Frontend Static Site
-  - name: carv-analyzer-frontend
-    rootDir: Carvtrainer/frontend
-    buildCommand: npm install && npm run build
-    staticPublishPath: dist
-    envVars:
-      - key: VITE_API_URL
-        sync: false
-    headers:
-      - path: /*
-        name: Cache-Control
-        value: public, max-age=31536000
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
