@@ -14,9 +14,9 @@ services:
       - key: FRONTEND_URL
         sync: false
 
+staticSites:
   # Frontend Static Site
-  - type: static_site
-    name: carv-analyzer-frontend
+  - name: carv-analyzer-frontend
     rootDir: Carvtrainer/frontend
     buildCommand: npm install && npm run build
     staticPublishPath: dist
