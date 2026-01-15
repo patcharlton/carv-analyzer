@@ -243,16 +243,11 @@ function App() {
     setChatMessages(newMessages)
 
     try {
-      // Build analysis data to send to chat for context
-      const analysisData = analysis ? {
-        overall: analysis.overall || {},
-        analyses: analysis.analyses || []
-      } : null
-
+      // Pass the full analysis object to chat for context
       const response = await axios.post(`${API_BASE_URL}/chat`, {
         message: userMessage,
         history: chatMessages,
-        analysisData: analysisData
+        analysisData: analysis  // Pass entire analysis object
       })
 
       // Add assistant response

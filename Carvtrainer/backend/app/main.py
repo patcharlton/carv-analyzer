@@ -1202,52 +1202,72 @@ def chat():
         if analysis_data:
             session_context = "\n\n## PATRICK'S CURRENT SESSION DATA\n\n"
 
-            # Overall metrics
-            if 'overall' in analysis_data:
-                overall = analysis_data['overall']
-                session_context += f"**Overall Ski:IQ Score:** {overall.get('skiIQ', 'N/A')}\n"
-                session_context += f"**Skill Level:** {overall.get('level', 'N/A')}\n"
-                if overall.get('observations'):
-                    session_context += f"**Session Observations:** {overall.get('observations')}\n"
-                if overall.get('holisticInsights'):
-                    hi = overall['holisticInsights']
-                    if hi.get('skiingStyle'):
-                        session_context += f"**Skiing Style:** {hi.get('skiingStyle')}\n"
-                    if hi.get('signatureMove'):
-                        session_context += f"**Signature Move:** {hi.get('signatureMove')}\n"
-                    if hi.get('consistencyPattern'):
-                        session_context += f"**Consistency:** {hi.get('consistencyPattern')}\n"
-                    if hi.get('primaryLimiter'):
-                        session_context += f"**Primary Limiter:** {hi.get('primaryLimiter')}\n"
-                    if hi.get('biggestStrength'):
-                        session_context += f"**Biggest Strength:** {hi.get('biggestStrength')}\n"
+            # Session overview (Ski:IQ, turns analyzed, etc.)
+            if 'session_overview' in analysis_data:
+                so = analysis_data['session_overview']
+                if so.get('ski_iq_range'):
+                    iq_range = so['ski_iq_range']
+                    avg_iq = (iq_range.get('min', 0) + iq_range.get('max', 0)) / 2 if iq_range.get('min') and iq_range.get('max') else None
+                    session_context += f"**Ski:IQ Range:** {iq_range.get('min', 'N/A')} - {iq_range.get('max', 'N/A')}"
+                    if avg_iq:
+                        session_context += f" (avg: {avg_iq:.0f})\n"
+                    else:
+                        session_context += "\n"
+                if so.get('total_turns_analyzed'):
+                    session_context += f"**Total Turns Analyzed:** {so['total_turns_analyzed']}\n"
+                if so.get('terrain_types_seen'):
+                    session_context += f"**Terrain Types:** {', '.join(so['terrain_types_seen'])}\n"
+                if so.get('session_date_display'):
+                    session_context += f"**Session Date:** {so['session_date_display']}\n"
 
-            # Individual run metrics
-            if 'analyses' in analysis_data and analysis_data['analyses']:
-                session_context += "\n**Run-by-Run Metrics:**\n"
-                for i, run in enumerate(analysis_data['analyses'], 1):
-                    if run.get('result'):
-                        r = run['result']
-                        session_context += f"\n*Run {i}:*\n"
-                        if r.get('metrics'):
-                            for category, metrics in r['metrics'].items():
-                                if isinstance(metrics, dict):
-                                    avg = metrics.get('average', 'N/A')
-                                    session_context += f"- {category}: {avg}/100\n"
-                        if r.get('strengths'):
-                            session_context += f"- Strengths: {', '.join(r['strengths'][:3])}\n"
-                        if r.get('weaknesses'):
-                            session_context += f"- Areas to improve: {', '.join(r['weaknesses'][:3])}\n"
+            # Overall metrics (Balance, Edging, Rotary, Performance)
+            if 'overall_metrics' in analysis_data:
+                om = analysis_data['overall_metrics']
+                session_context += "\n**Metric Scores:**\n"
+
+                for category in ['balance', 'edging', 'rotary', 'performance']:
+                    if category in om and om[category]:
+                        cat_data = om[category]
+                        cat_avg = cat_data.get('category_average', 'N/A')
+                        session_context += f"\n*{category.title()}* (avg: {cat_avg}/100):\n"
+                        for metric_name, metric_val in cat_data.items():
+                            if metric_name != 'category_average' and isinstance(metric_val, (int, float)):
+                                session_context += f"  - {metric_name.replace('_', ' ').title()}: {metric_val}/100\n"
+
+            # Holistic insights
+            if 'holistic_insights' in analysis_data:
+                hi = analysis_data['holistic_insights']
+                session_context += "\n**Holistic Analysis:**\n"
+                if hi.get('skiing_style'):
+                    session_context += f"- Skiing Style: {hi['skiing_style']}\n"
+                if hi.get('signature_move'):
+                    session_context += f"- Signature Move: {hi['signature_move']}\n"
+                if hi.get('consistency_pattern'):
+                    session_context += f"- Consistency: {hi['consistency_pattern']}\n"
+                if hi.get('primary_limiter'):
+                    session_context += f"- Primary Limiter: {hi['primary_limiter']}\n"
+                if hi.get('biggest_strength'):
+                    session_context += f"- Biggest Strength: {hi['biggest_strength']}\n"
 
             # Training priorities
-            if 'overall' in analysis_data and analysis_data['overall'].get('trainingPriorities'):
-                tp = analysis_data['overall']['trainingPriorities']
-                if tp.get('focusAreas'):
+            if 'training_priorities' in analysis_data:
+                tp = analysis_data['training_priorities']
+                if tp.get('focus_areas'):
                     session_context += "\n**Priority Focus Areas:**\n"
-                    for area in tp['focusAreas'][:3]:
-                        session_context += f"- {area.get('area', 'Unknown')}: {area.get('currentScore', '?')}/100 → Target: {area.get('targetScore', '?')}/100\n"
-                        if area.get('quickWin'):
-                            session_context += f"  Quick win: {area.get('quickWin')}\n"
+                    for area in tp['focus_areas'][:3]:
+                        session_context += f"- {area.get('area', 'Unknown')}: {area.get('current_score', '?')}/100 → Target: {area.get('target_score', '?')}/100\n"
+                        if area.get('why'):
+                            session_context += f"  Why: {area.get('why')}\n"
+                        if area.get('quick_win'):
+                            session_context += f"  Quick win: {area.get('quick_win')}\n"
+                if tp.get('strengths'):
+                    session_context += "\n**Key Strengths:**\n"
+                    for s in tp['strengths'][:3]:
+                        session_context += f"- {s.get('area', 'Unknown')}: {s.get('detail', '')}\n"
+
+            # Observations
+            if 'observations' in analysis_data:
+                session_context += f"\n**Coach Observations:** {analysis_data['observations']}\n"
 
         # Build conversation messages
         messages = []
