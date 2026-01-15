@@ -7,8 +7,17 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || '/api'
 
 // Storage key for progress logs
 const STORAGE_KEY = 'carv_progress_logs'
+const AUTH_KEY = 'carv_auth'
+
+// Simple password protection
+const SITE_PASSWORD = 'Lotus5126'
 
 function App() {
+  // Auth state
+  const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [passwordInput, setPasswordInput] = useState('')
+  const [authError, setAuthError] = useState('')
+
   // State management
   const [selectedFiles, setSelectedFiles] = useState([]) // Array of {file, preview, id, name}
   const [analysis, setAnalysis] = useState(null) // Holistic analysis result
@@ -32,6 +41,27 @@ function App() {
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const chatMessagesEndRef = useRef(null)
+
+  // Check auth on mount
+  useEffect(() => {
+    const savedAuth = sessionStorage.getItem(AUTH_KEY)
+    if (savedAuth === 'true') {
+      setIsAuthenticated(true)
+    }
+  }, [])
+
+  // Handle login
+  const handleLogin = (e) => {
+    e.preventDefault()
+    if (passwordInput === SITE_PASSWORD) {
+      setIsAuthenticated(true)
+      sessionStorage.setItem(AUTH_KEY, 'true')
+      setAuthError('')
+    } else {
+      setAuthError('Incorrect password')
+      setPasswordInput('')
+    }
+  }
 
   // Load progress logs from localStorage on mount
   useEffect(() => {
@@ -1163,6 +1193,37 @@ function App() {
   const sortedLogs = [...progressLogs].sort((a, b) =>
     new Date(b.datetime) - new Date(a.datetime)
   )
+
+  // Login screen
+  if (!isAuthenticated) {
+    return (
+      <div className="login-screen">
+        <div className="login-container">
+          <div className="login-header">
+            <h1>CARV Analyzer</h1>
+            <p>Personal Ski Training Coach</p>
+          </div>
+          <form onSubmit={handleLogin} className="login-form">
+            <div className="login-field">
+              <label htmlFor="password">Enter Password</label>
+              <input
+                type="password"
+                id="password"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                placeholder="Password"
+                autoFocus
+              />
+            </div>
+            {authError && <div className="login-error">{authError}</div>}
+            <button type="submit" className="login-btn">
+              Enter
+            </button>
+          </form>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="app">
