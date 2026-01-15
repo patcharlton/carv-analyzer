@@ -640,32 +640,48 @@ YOU MUST INCLUDE EXACTLY 3 DRILLS with full details. Select from the Drill Libra
 ### Drill 1: [Name] - Primary Focus
 - **Target Metric**: [The CARV metric this improves]
 - **Why This Drill**: [How it addresses their specific weakness]
-- **Execution**: [Step-by-step how to perform it]
-- **Runs Per Session**: [X runs] (e.g., 3-4 runs)
-- **Turns Per Run**: [X focused turns, then free ski]
+- **How To Do It (Step-by-Step)**:
+  1. [Starting position - where to stand, stance width, pole position]
+  2. [The initiation - how to begin the movement]
+  3. [The main movement - what your body does during the drill]
+  4. [The finish - how to complete each rep/turn]
+  5. [Reset - how to prepare for the next rep]
 - **Terrain**: [Green/Blue/Black, groomed, pitch]
-- **Success Feels Like**: [Physical sensation when doing it right]
-- **Common Mistake**: [What to watch out for]
-- **Progression**: [How to make it harder as they improve]
+- **Runs**: [X runs], [X focused turns per run, then free ski]
+- **Success Feels Like**: [Specific physical sensations - what you feel in feet, legs, hips]
+- **Mental Cue**: [3-5 word phrase to think while doing it]
+- **Common Mistakes**:
+  - [Mistake 1 and how to fix it]
+  - [Mistake 2 and how to fix it]
+- **Make It Harder**: [How to progress as they improve]
 
 ### Drill 2: [Name] - Secondary Focus
 - **Target Metric**: [The CARV metric this improves]
 - **Why This Drill**: [How it addresses their specific weakness]
-- **Execution**: [Step-by-step how to perform it]
-- **Runs Per Session**: [X runs]
-- **Turns Per Run**: [X focused turns, then free ski]
+- **How To Do It (Step-by-Step)**:
+  1. [Starting position]
+  2. [The initiation]
+  3. [The main movement]
+  4. [The finish]
 - **Terrain**: [Recommendation]
-- **Success Feels Like**: [Physical sensation]
-- **Common Mistake**: [What to watch out for]
+- **Runs**: [X runs], [X focused turns per run]
+- **Success Feels Like**: [Specific physical sensations]
+- **Mental Cue**: [3-5 word phrase]
+- **Common Mistakes**:
+  - [Mistake and fix]
 
 ### Drill 3: [Name] - Integration/Refinement
 - **Target Metric**: [The CARV metric this improves]
 - **Why This Drill**: [How it ties everything together]
-- **Execution**: [Step-by-step how to perform it]
-- **Runs Per Session**: [X runs]
-- **Turns Per Run**: [X focused turns, then free ski]
+- **How To Do It (Step-by-Step)**:
+  1. [Starting position]
+  2. [The initiation]
+  3. [The main movement]
+  4. [The finish]
 - **Terrain**: [Recommendation]
-- **Success Feels Like**: [Physical sensation]
+- **Runs**: [X runs], [X focused turns per run]
+- **Success Feels Like**: [Specific physical sensations]
+- **Mental Cue**: [3-5 word phrase]
 
 ## Daily Session Plan (10 Runs)
 
