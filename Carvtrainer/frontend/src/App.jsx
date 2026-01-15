@@ -34,6 +34,9 @@ function App() {
   const [sessionNotes, setSessionNotes] = useState('')
   const [showSaveDialog, setShowSaveDialog] = useState(false)
   const [selectedLogForComparison, setSelectedLogForComparison] = useState(null)
+  const [comparisonLogA, setComparisonLogA] = useState(null)
+  const [comparisonLogB, setComparisonLogB] = useState(null)
+  const [showComparisonModal, setShowComparisonModal] = useState(false)
 
   // Chat state
   const [showChat, setShowChat] = useState(false)
@@ -1189,6 +1192,52 @@ function App() {
     return currentValue - previousValue
   }
 
+  // Open comparison modal with two logs
+  const openComparison = (logA, logB) => {
+    // Ensure logA is the older one (baseline), logB is newer
+    const dateA = new Date(logA.datetime)
+    const dateB = new Date(logB.datetime)
+    if (dateA > dateB) {
+      setComparisonLogA(logB)
+      setComparisonLogB(logA)
+    } else {
+      setComparisonLogA(logA)
+      setComparisonLogB(logB)
+    }
+    setShowComparisonModal(true)
+  }
+
+  // Close comparison modal
+  const closeComparison = () => {
+    setShowComparisonModal(false)
+    setComparisonLogA(null)
+    setComparisonLogB(null)
+    setSelectedLogForComparison(null)
+  }
+
+  // Render comparison metric row
+  const renderComparisonRow = (label, valueA, valueB, unit = '') => {
+    const diff = valueA !== null && valueB !== null ? valueB - valueA : null
+    const percentChange = valueA && diff ? ((diff / valueA) * 100) : null
+    return (
+      <div className="comparison-row">
+        <span className="comparison-label">{label}</span>
+        <span className="comparison-value old">{valueA !== null ? Math.round(valueA) : '-'}{unit}</span>
+        <span className={`comparison-diff ${diff > 0 ? 'positive' : diff < 0 ? 'negative' : ''}`}>
+          {diff !== null ? (
+            <>
+              {diff > 0 ? '+' : ''}{Math.round(diff)}
+              {percentChange !== null && Math.abs(percentChange) >= 1 && (
+                <small> ({percentChange > 0 ? '+' : ''}{percentChange.toFixed(1)}%)</small>
+              )}
+            </>
+          ) : '-'}
+        </span>
+        <span className="comparison-value new">{valueB !== null ? Math.round(valueB) : '-'}{unit}</span>
+      </div>
+    )
+  }
+
   // Get sorted logs (newest first)
   const sortedLogs = [...progressLogs].sort((a, b) =>
     new Date(b.datetime) - new Date(a.datetime)
@@ -1683,8 +1732,17 @@ function App() {
                             {sortedLogs.length > 1 && (
                               <button
                                 className={`compare-btn ${selectedLogForComparison?.id === log.id ? 'active' : ''}`}
-                                onClick={() => setSelectedLogForComparison(selectedLogForComparison?.id === log.id ? null : log)}
-                                title="Compare with other sessions"
+                                onClick={() => {
+                                  if (selectedLogForComparison) {
+                                    if (selectedLogForComparison.id !== log.id) {
+                                      openComparison(selectedLogForComparison, log)
+                                    }
+                                    setSelectedLogForComparison(null)
+                                  } else {
+                                    setSelectedLogForComparison(log)
+                                  }
+                                }}
+                                title={selectedLogForComparison ? (selectedLogForComparison.id === log.id ? 'Cancel comparison' : 'Compare with this session') : 'Select to compare'}
                               >
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                   <line x1="18" y1="20" x2="18" y2="10"/>
@@ -1860,6 +1918,106 @@ function App() {
                 <polygon points="22 2 15 22 11 13 2 9 22 2"/>
               </svg>
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Comparison Modal */}
+      {showComparisonModal && comparisonLogA && comparisonLogB && (
+        <div className="comparison-modal-overlay" onClick={closeComparison}>
+          <div className="comparison-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="comparison-modal-header">
+              <h2>Session Comparison</h2>
+              <button className="modal-close" onClick={closeComparison}>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18"/>
+                  <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
+            </div>
+
+            <div className="comparison-dates">
+              <div className="comparison-date baseline">
+                <span className="date-label">Baseline</span>
+                <span className="date-value">{formatDateTime(comparisonLogA.datetime, comparisonLogA.datetimeDisplay)}</span>
+              </div>
+              <div className="comparison-arrow">→</div>
+              <div className="comparison-date current">
+                <span className="date-label">Current</span>
+                <span className="date-value">{formatDateTime(comparisonLogB.datetime, comparisonLogB.datetimeDisplay)}</span>
+              </div>
+            </div>
+
+            <div className="comparison-content">
+              {/* Overall Score */}
+              <div className="comparison-section">
+                <h3>Overall Performance</h3>
+                <div className="comparison-header-row">
+                  <span></span>
+                  <span>Baseline</span>
+                  <span>Change</span>
+                  <span>Current</span>
+                </div>
+                {renderComparisonRow('Ski:IQ', comparisonLogA.metrics?.skiIQ, comparisonLogB.metrics?.skiIQ)}
+              </div>
+
+              {/* Balance */}
+              <div className="comparison-section">
+                <h3>Balance</h3>
+                <div className="comparison-header-row">
+                  <span></span>
+                  <span>Baseline</span>
+                  <span>Change</span>
+                  <span>Current</span>
+                </div>
+                {renderComparisonRow('Category Average', comparisonLogA.metrics?.balance?.category_average, comparisonLogB.metrics?.balance?.category_average)}
+                {renderComparisonRow('Centered Balance', comparisonLogA.metrics?.balance?.centered_balance, comparisonLogB.metrics?.balance?.centered_balance)}
+                {renderComparisonRow('Start of Turn', comparisonLogA.metrics?.balance?.start_of_turn, comparisonLogB.metrics?.balance?.start_of_turn)}
+                {renderComparisonRow('Transition Weight', comparisonLogA.metrics?.balance?.transition_weight_release, comparisonLogB.metrics?.balance?.transition_weight_release)}
+              </div>
+
+              {/* Edging */}
+              <div className="comparison-section">
+                <h3>Edging</h3>
+                <div className="comparison-header-row">
+                  <span></span>
+                  <span>Baseline</span>
+                  <span>Change</span>
+                  <span>Current</span>
+                </div>
+                {renderComparisonRow('Category Average', comparisonLogA.metrics?.edging?.category_average, comparisonLogB.metrics?.edging?.category_average)}
+                {renderComparisonRow('Edge Angle', comparisonLogA.metrics?.edging?.edge_angle, comparisonLogB.metrics?.edging?.edge_angle)}
+                {renderComparisonRow('Early Edging', comparisonLogA.metrics?.edging?.early_edging, comparisonLogB.metrics?.edging?.early_edging)}
+                {renderComparisonRow('Edging Similarity', comparisonLogA.metrics?.edging?.edging_similarity, comparisonLogB.metrics?.edging?.edging_similarity)}
+                {renderComparisonRow('Progressive Edge', comparisonLogA.metrics?.edging?.progressive_edge_build, comparisonLogB.metrics?.edging?.progressive_edge_build)}
+              </div>
+
+              {/* Rotary */}
+              <div className="comparison-section">
+                <h3>Rotary</h3>
+                <div className="comparison-header-row">
+                  <span></span>
+                  <span>Baseline</span>
+                  <span>Change</span>
+                  <span>Current</span>
+                </div>
+                {renderComparisonRow('Category Average', comparisonLogA.metrics?.rotary?.category_average, comparisonLogB.metrics?.rotary?.category_average)}
+                {renderComparisonRow('Parallel Skis', comparisonLogA.metrics?.rotary?.parallel_skis, comparisonLogB.metrics?.rotary?.parallel_skis)}
+                {renderComparisonRow('Turn Shape', comparisonLogA.metrics?.rotary?.turn_shape, comparisonLogB.metrics?.rotary?.turn_shape)}
+              </div>
+
+              {/* Performance */}
+              <div className="comparison-section">
+                <h3>Performance</h3>
+                <div className="comparison-header-row">
+                  <span></span>
+                  <span>Baseline</span>
+                  <span>Change</span>
+                  <span>Current</span>
+                </div>
+                {renderComparisonRow('Turn G-Force', comparisonLogA.metrics?.performance?.turn_g_force, comparisonLogB.metrics?.performance?.turn_g_force)}
+              </div>
+            </div>
           </div>
         </div>
       )}
