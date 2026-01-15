@@ -1176,6 +1176,99 @@ Key principles:
         }), 500
 
 
+@app.route('/chat', methods=['POST'])
+def chat():
+    """
+    Conversational AI chatbot for carving technique questions.
+
+    Expects: JSON with 'message' and optional 'history' (previous messages)
+    Returns: JSON with 'response' from the AI coach
+    """
+    try:
+        data = request.get_json()
+
+        if not data or 'message' not in data:
+            return jsonify({
+                "error": "No message provided",
+                "message": "Please send a message to the coach"
+            }), 400
+
+        user_message = data['message']
+        history = data.get('history', [])
+
+        # Build conversation messages
+        messages = []
+
+        # Add conversation history (limit to last 10 exchanges to manage context)
+        for msg in history[-20:]:  # Last 20 messages (10 exchanges)
+            messages.append({
+                "role": msg.get('role', 'user'),
+                "content": msg.get('content', '')
+            })
+
+        # Add current user message
+        messages.append({
+            "role": "user",
+            "content": user_message
+        })
+
+        # Call Claude API
+        response = client.messages.create(
+            model="claude-3-5-haiku-20241022",  # Fast for chat
+            max_tokens=1500,
+            messages=messages,
+            system=f"""You are Coach Carv, an elite ski coach and carving expert with decades of experience training recreational skiers to advanced racers. You have deep knowledge of CARV technology and biomechanics.
+
+{CARV_METRICS_CONTEXT}
+
+## YOUR COACHING STYLE
+
+1. **Be specific and technical** - Give precise biomechanical advice, not vague suggestions
+2. **Use vivid cues** - Short, memorable phrases like "belly button to the valley" or "paint the snow with your edges"
+3. **Reference CARV metrics** - Explain how specific metrics relate to technique issues
+4. **Diagnose root causes** - Don't just treat symptoms, find the underlying issue
+5. **Be encouraging but honest** - Celebrate progress while being direct about what needs work
+6. **Use analogies** - Help skiers visualize concepts (train on tracks, stacking quarters, etc.)
+7. **Prioritize safety** - Never give advice that could lead to injury
+
+## RESPONSE FORMAT
+
+- Keep responses concise but thorough (2-4 paragraphs typically)
+- Use bullet points for drills or multiple tips
+- Include 1-2 specific drills when relevant
+- End with a clear actionable takeaway when appropriate
+
+You're having a friendly, expert conversation. Be personable but professional."""
+        )
+
+        ai_response = response.content[0].text
+
+        return jsonify({
+            "response": ai_response,
+            "timestamp": datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        error_message = str(e)
+
+        if "api_key" in error_message.lower() or "authentication" in error_message.lower():
+            return jsonify({
+                "error": "API Key Error",
+                "message": "API key issue. Please check configuration."
+            }), 401
+
+        if "rate_limit" in error_message.lower():
+            return jsonify({
+                "error": "Rate Limited",
+                "message": "Too many requests. Please wait a moment and try again."
+            }), 429
+
+        return jsonify({
+            "error": "Chat failed",
+            "message": f"Something went wrong. Error: {error_message}"
+        }), 500
+
+
 if __name__ == '__main__':
     if not os.getenv("ANTHROPIC_API_KEY"):
         print("\n" + "="*60)

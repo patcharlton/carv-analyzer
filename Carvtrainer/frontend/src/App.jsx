@@ -26,6 +26,13 @@ function App() {
   const [showSaveDialog, setShowSaveDialog] = useState(false)
   const [selectedLogForComparison, setSelectedLogForComparison] = useState(null)
 
+  // Chat state
+  const [showChat, setShowChat] = useState(false)
+  const [chatMessages, setChatMessages] = useState([])
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const chatMessagesEndRef = useRef(null)
+
   // Load progress logs from localStorage on mount
   useEffect(() => {
     const savedLogs = localStorage.getItem(STORAGE_KEY)
@@ -222,6 +229,41 @@ function App() {
       setPlanLoading(false)
     }
   }
+
+  // Send chat message
+  const sendChatMessage = async () => {
+    if (!chatInput.trim() || chatLoading) return
+
+    const userMessage = chatInput.trim()
+    setChatInput('')
+    setChatLoading(true)
+
+    // Add user message to chat
+    const newMessages = [...chatMessages, { role: 'user', content: userMessage }]
+    setChatMessages(newMessages)
+
+    try {
+      const response = await axios.post(`${API_BASE_URL}/chat`, {
+        message: userMessage,
+        history: chatMessages
+      })
+
+      // Add assistant response
+      setChatMessages([...newMessages, { role: 'assistant', content: response.data.response }])
+    } catch (err) {
+      const errorMessage = err.response?.data?.message || 'Failed to send message'
+      setChatMessages([...newMessages, { role: 'assistant', content: `Sorry, I encountered an error: ${errorMessage}` }])
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  // Scroll chat to bottom when messages change
+  useEffect(() => {
+    if (chatMessagesEndRef.current) {
+      chatMessagesEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [chatMessages])
 
   // Get color class based on score
   const getScoreColor = (score) => {
@@ -1664,6 +1706,97 @@ function App() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Chat Button */}
+      <button
+        className="chat-toggle-btn"
+        onClick={() => setShowChat(!showChat)}
+        title="Ask Coach Carv"
+      >
+        {showChat ? (
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        ) : (
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        )}
+      </button>
+
+      {/* Chat Panel */}
+      {showChat && (
+        <div className="chat-panel">
+          <div className="chat-header">
+            <div className="chat-title">
+              <span className="coach-icon">⛷️</span>
+              <span>Coach Carv</span>
+            </div>
+            <button className="chat-close" onClick={() => setShowChat(false)}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+
+          <div className="chat-messages">
+            {chatMessages.length === 0 && (
+              <div className="chat-welcome">
+                <p className="welcome-title">Hi! I'm Coach Carv</p>
+                <p>I'm your AI skiing expert. Ask me anything about:</p>
+                <ul>
+                  <li>Carving technique and biomechanics</li>
+                  <li>CARV metrics interpretation</li>
+                  <li>Specific drills to improve</li>
+                  <li>Equipment and setup tips</li>
+                </ul>
+              </div>
+            )}
+
+            {chatMessages.map((msg, index) => (
+              <div key={index} className={`chat-message ${msg.role}`}>
+                {msg.role === 'assistant' && <span className="message-avatar">⛷️</span>}
+                <div className="message-content">{msg.content}</div>
+              </div>
+            ))}
+
+            {chatLoading && (
+              <div className="chat-message assistant">
+                <span className="message-avatar">⛷️</span>
+                <div className="message-content typing">
+                  <span></span><span></span><span></span>
+                </div>
+              </div>
+            )}
+
+            <div ref={chatMessagesEndRef} />
+          </div>
+
+          <div className="chat-input-container">
+            <input
+              type="text"
+              className="chat-input"
+              placeholder="Ask about technique, drills, metrics..."
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && sendChatMessage()}
+              disabled={chatLoading}
+            />
+            <button
+              className="chat-send"
+              onClick={sendChatMessage}
+              disabled={chatLoading || !chatInput.trim()}
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="22" y1="2" x2="11" y2="13"/>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+              </svg>
+            </button>
           </div>
         </div>
       )}
