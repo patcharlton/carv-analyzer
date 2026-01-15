@@ -1195,6 +1195,59 @@ def chat():
 
         user_message = data['message']
         history = data.get('history', [])
+        analysis_data = data.get('analysisData', None)
+
+        # Build session context from analysis data
+        session_context = ""
+        if analysis_data:
+            session_context = "\n\n## PATRICK'S CURRENT SESSION DATA\n\n"
+
+            # Overall metrics
+            if 'overall' in analysis_data:
+                overall = analysis_data['overall']
+                session_context += f"**Overall Ski:IQ Score:** {overall.get('skiIQ', 'N/A')}\n"
+                session_context += f"**Skill Level:** {overall.get('level', 'N/A')}\n"
+                if overall.get('observations'):
+                    session_context += f"**Session Observations:** {overall.get('observations')}\n"
+                if overall.get('holisticInsights'):
+                    hi = overall['holisticInsights']
+                    if hi.get('skiingStyle'):
+                        session_context += f"**Skiing Style:** {hi.get('skiingStyle')}\n"
+                    if hi.get('signatureMove'):
+                        session_context += f"**Signature Move:** {hi.get('signatureMove')}\n"
+                    if hi.get('consistencyPattern'):
+                        session_context += f"**Consistency:** {hi.get('consistencyPattern')}\n"
+                    if hi.get('primaryLimiter'):
+                        session_context += f"**Primary Limiter:** {hi.get('primaryLimiter')}\n"
+                    if hi.get('biggestStrength'):
+                        session_context += f"**Biggest Strength:** {hi.get('biggestStrength')}\n"
+
+            # Individual run metrics
+            if 'analyses' in analysis_data and analysis_data['analyses']:
+                session_context += "\n**Run-by-Run Metrics:**\n"
+                for i, run in enumerate(analysis_data['analyses'], 1):
+                    if run.get('result'):
+                        r = run['result']
+                        session_context += f"\n*Run {i}:*\n"
+                        if r.get('metrics'):
+                            for category, metrics in r['metrics'].items():
+                                if isinstance(metrics, dict):
+                                    avg = metrics.get('average', 'N/A')
+                                    session_context += f"- {category}: {avg}/100\n"
+                        if r.get('strengths'):
+                            session_context += f"- Strengths: {', '.join(r['strengths'][:3])}\n"
+                        if r.get('weaknesses'):
+                            session_context += f"- Areas to improve: {', '.join(r['weaknesses'][:3])}\n"
+
+            # Training priorities
+            if 'overall' in analysis_data and analysis_data['overall'].get('trainingPriorities'):
+                tp = analysis_data['overall']['trainingPriorities']
+                if tp.get('focusAreas'):
+                    session_context += "\n**Priority Focus Areas:**\n"
+                    for area in tp['focusAreas'][:3]:
+                        session_context += f"- {area.get('area', 'Unknown')}: {area.get('currentScore', '?')}/100 → Target: {area.get('targetScore', '?')}/100\n"
+                        if area.get('quickWin'):
+                            session_context += f"  Quick win: {area.get('quickWin')}\n"
 
         # Build conversation messages
         messages = []
@@ -1219,17 +1272,27 @@ def chat():
             messages=messages,
             system=f"""You are Coach Carv, an elite ski coach and carving expert with decades of experience training recreational skiers to advanced racers. You have deep knowledge of CARV technology and biomechanics.
 
+## SKIER PROFILE - PATRICK
+
+- **Height:** 173cm
+- **Weight:** 71kg
+- **Build:** Medium, well-proportioned for skiing
+- **Biomechanical notes:** At this height/weight, Patrick has a good power-to-weight ratio. His stance width should be approximately hip-width (around 30-35cm). He should focus on maintaining a compact, centered stance given his medium frame.
+
 {CARV_METRICS_CONTEXT}
+{session_context}
 
 ## YOUR COACHING STYLE
 
 1. **Be specific and technical** - Give precise biomechanical advice, not vague suggestions
 2. **Use vivid cues** - Short, memorable phrases like "belly button to the valley" or "paint the snow with your edges"
-3. **Reference CARV metrics** - Explain how specific metrics relate to technique issues
-4. **Diagnose root causes** - Don't just treat symptoms, find the underlying issue
-5. **Be encouraging but honest** - Celebrate progress while being direct about what needs work
-6. **Use analogies** - Help skiers visualize concepts (train on tracks, stacking quarters, etc.)
-7. **Prioritize safety** - Never give advice that could lead to injury
+3. **Reference CARV metrics** - When Patrick has session data, directly reference his actual scores and what they mean
+4. **Reference his session data** - If Patrick has uploaded screenshots, use his actual metrics to give personalized advice
+5. **Diagnose root causes** - Don't just treat symptoms, find the underlying issue
+6. **Be encouraging but honest** - Celebrate progress while being direct about what needs work
+7. **Use analogies** - Help skiers visualize concepts (train on tracks, stacking quarters, etc.)
+8. **Prioritize safety** - Never give advice that could lead to injury
+9. **Address Patrick by name** - Make the coaching personal
 
 ## RESPONSE FORMAT
 
@@ -1237,8 +1300,9 @@ def chat():
 - Use bullet points for drills or multiple tips
 - Include 1-2 specific drills when relevant
 - End with a clear actionable takeaway when appropriate
+- When session data is available, reference specific metrics
 
-You're having a friendly, expert conversation. Be personable but professional."""
+You're having a friendly, expert conversation with Patrick. Be personable but professional."""
         )
 
         ai_response = response.content[0].text

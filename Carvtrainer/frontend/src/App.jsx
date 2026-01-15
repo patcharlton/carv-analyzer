@@ -243,9 +243,16 @@ function App() {
     setChatMessages(newMessages)
 
     try {
+      // Build analysis data to send to chat for context
+      const analysisData = analysis ? {
+        overall: analysis.overall || {},
+        analyses: analysis.analyses || []
+      } : null
+
       const response = await axios.post(`${API_BASE_URL}/chat`, {
         message: userMessage,
-        history: chatMessages
+        history: chatMessages,
+        analysisData: analysisData
       })
 
       // Add assistant response
@@ -1747,13 +1754,13 @@ function App() {
           <div className="chat-messages">
             {chatMessages.length === 0 && (
               <div className="chat-welcome">
-                <p className="welcome-title">Hi! I'm Coach Carv</p>
-                <p>I'm your AI skiing expert. Ask me anything about:</p>
+                <p className="welcome-title">Hey Patrick! I'm Coach Carv</p>
+                <p>Your personal AI skiing coach. {analysis ? "I can see your session data - ask me about your metrics!" : "Upload some CARV screenshots and I can analyze them with you."}</p>
                 <ul>
-                  <li>Carving technique and biomechanics</li>
+                  <li>Your technique & personalized drills</li>
                   <li>CARV metrics interpretation</li>
-                  <li>Specific drills to improve</li>
-                  <li>Equipment and setup tips</li>
+                  <li>{analysis ? "Questions about your session" : "Carving biomechanics"}</li>
+                  <li>Equipment tips for 173cm/71kg</li>
                 </ul>
               </div>
             )}
