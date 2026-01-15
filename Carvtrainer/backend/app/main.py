@@ -1110,9 +1110,9 @@ def generate_training_plan():
             num_runs=num_runs
         )
 
-        # Call Claude API for training plan
+        # Call Claude API for training plan (using Haiku for speed on Render's 30s timeout)
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-3-5-haiku-20241022",
             max_tokens=4000,
             messages=[
                 {
