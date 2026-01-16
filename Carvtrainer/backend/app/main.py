@@ -7,14 +7,21 @@ import os
 import base64
 import json
 import re
+import uuid
+import threading
 from io import BytesIO
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from PIL import Image
 from PIL.ExifTags import TAGS
+
+# In-memory job store for background processing
+# Format: {job_id: {"status": "pending"|"processing"|"completed"|"failed", "result": {...}, "error": "..."}}
+jobs = {}
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +40,54 @@ if frontend_url:
     allowed_origins.append(frontend_url)
 
 CORS(app, origins=allowed_origins)
+
+# Database configuration
+database_url = os.getenv("DATABASE_URL")
+if database_url:
+    # Render uses postgres:// but SQLAlchemy needs postgresql://
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+else:
+    # Fallback to SQLite for local development
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///carv_sessions.db"
+
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
+
+# Database Models
+class Session(db.Model):
+    """Stores a skiing session with analysis data and training plan."""
+    __tablename__ = "sessions"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_date = db.Column(db.DateTime, nullable=False)
+    location = db.Column(db.String(200))
+    ski_iq = db.Column(db.Float)
+    metrics = db.Column(db.JSON)  # Full analysis metrics
+    training_plan = db.Column(db.Text)  # Generated training plan markdown
+    notes = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "session_date": self.session_date.isoformat() if self.session_date else None,
+            "location": self.location,
+            "ski_iq": self.ski_iq,
+            "metrics": self.metrics,
+            "training_plan": self.training_plan,
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# Create tables on startup
+with app.app_context():
+    db.create_all()
 
 # Initialize Anthropic client
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -1088,6 +1143,184 @@ def analyze_screenshots():
         }), 500
 
 
+def process_analysis_job(job_id, image_contents, filenames, num_images):
+    """Background worker function to process image analysis."""
+    global jobs
+
+    try:
+        jobs[job_id]["status"] = "processing"
+
+        # Build the message content with all images + prompt
+        message_content = image_contents.copy()
+        message_content.append({
+            "type": "text",
+            "text": HOLISTIC_ANALYSIS_PROMPT.format(num_images=num_images)
+        })
+
+        # Call Claude API with all images
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4000,
+            messages=[
+                {
+                    "role": "user",
+                    "content": message_content
+                }
+            ],
+            system=CARV_METRICS_CONTEXT
+        )
+
+        # Extract response text
+        response_text = response.content[0].text
+
+        # Clean and parse JSON
+        cleaned_json = clean_json_response(response_text)
+
+        try:
+            analysis_data = json.loads(cleaned_json)
+        except json.JSONDecodeError:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = "Failed to parse AI response. Please try again."
+            return
+
+        # Add metadata
+        analysis_data["analyzed_at"] = datetime.now().isoformat()
+        analysis_data["filenames"] = filenames
+        analysis_data["num_screenshots"] = num_images
+
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["result"] = analysis_data
+
+    except Exception as e:
+        jobs[job_id]["status"] = "failed"
+        error_message = str(e)
+
+        if "api_key" in error_message.lower() or "authentication" in error_message.lower():
+            jobs[job_id]["error"] = "API key is missing or invalid."
+        elif "rate_limit" in error_message.lower():
+            jobs[job_id]["error"] = "Rate limited. Please wait and try again."
+        else:
+            jobs[job_id]["error"] = f"Analysis failed: {error_message}"
+
+
+@app.route('/analyze-async', methods=['POST'])
+def analyze_screenshots_async():
+    """
+    Submit screenshots for async analysis. Returns immediately with a job_id.
+    Poll /job-status/<job_id> to get results.
+    """
+    try:
+        # Check if image files are present
+        if 'images' not in request.files:
+            return jsonify({
+                "error": "No image files provided",
+                "message": "Please upload at least one CARV screenshot"
+            }), 400
+
+        files = request.files.getlist('images')
+
+        if len(files) == 0 or (len(files) == 1 and files[0].filename == ''):
+            return jsonify({
+                "error": "No files selected",
+                "message": "Please select at least one CARV screenshot to upload"
+            }), 400
+
+        # Process all images (validation and encoding happens synchronously)
+        image_contents = []
+        filenames = []
+
+        for file in files:
+            if file.filename == '':
+                continue
+
+            # Check file size (max 5MB each)
+            file.seek(0, 2)
+            file_size = file.tell()
+            file.seek(0)
+
+            if file_size > 5 * 1024 * 1024:
+                return jsonify({
+                    "error": "File too large",
+                    "message": f"{file.filename} is larger than 5MB"
+                }), 400
+
+            # Read and encode image
+            image_data = file.read()
+            base64_image = base64.standard_b64encode(image_data).decode('utf-8')
+            media_type = get_media_type(file.filename)
+
+            image_contents.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64_image
+                }
+            })
+            filenames.append(file.filename)
+
+        num_images = len(image_contents)
+
+        if num_images == 0:
+            return jsonify({
+                "error": "No valid images",
+                "message": "Please upload at least one valid image file"
+            }), 400
+
+        # Create job and return immediately
+        job_id = str(uuid.uuid4())
+        jobs[job_id] = {"status": "pending", "result": None, "error": None}
+
+        # Start background thread for processing
+        thread = threading.Thread(
+            target=process_analysis_job,
+            args=(job_id, image_contents, filenames, num_images)
+        )
+        thread.daemon = True
+        thread.start()
+
+        return jsonify({
+            "job_id": job_id,
+            "status": "pending",
+            "message": "Analysis started. Poll /job-status/{job_id} for results."
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to start analysis",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/job-status/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    """
+    Get the status of an async analysis job.
+    Returns status and result (if completed) or error (if failed).
+    """
+    if job_id not in jobs:
+        return jsonify({
+            "error": "Job not found",
+            "message": f"No job found with ID: {job_id}"
+        }), 404
+
+    job = jobs[job_id]
+
+    response = {
+        "job_id": job_id,
+        "status": job["status"]
+    }
+
+    if job["status"] == "completed":
+        response["result"] = job["result"]
+        # Clean up completed job after returning
+        # (Keep it for a bit in case of retry, but could add TTL cleanup)
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+
+    return jsonify(response)
+
+
 @app.route('/generate-plan', methods=['POST'])
 def generate_training_plan():
     """
@@ -1367,6 +1600,328 @@ You're having a friendly, expert conversation with Patrick. Be personable but pr
             "error": "Chat failed",
             "message": f"Something went wrong. Error: {error_message}"
         }), 500
+
+
+# ============================================================================
+# SESSION CRUD ENDPOINTS - For tracking progression over time
+# ============================================================================
+
+@app.route('/sessions', methods=['POST'])
+def create_session():
+    """Save a new skiing session with analysis data."""
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        # Parse session date
+        session_date_str = data.get('session_date')
+        if session_date_str:
+            try:
+                session_date = datetime.fromisoformat(session_date_str.replace('Z', '+00:00'))
+            except ValueError:
+                session_date = datetime.utcnow()
+        else:
+            session_date = datetime.utcnow()
+
+        # Extract Ski:IQ from metrics if available
+        ski_iq = None
+        metrics = data.get('metrics', {})
+        if metrics:
+            session_overview = metrics.get('session_overview', {})
+            ski_iq_range = session_overview.get('ski_iq_range', {})
+            if ski_iq_range.get('min') and ski_iq_range.get('max'):
+                ski_iq = (ski_iq_range['min'] + ski_iq_range['max']) / 2
+
+        session = Session(
+            session_date=session_date,
+            location=data.get('location'),
+            ski_iq=ski_iq,
+            metrics=metrics,
+            training_plan=data.get('training_plan'),
+            notes=data.get('notes')
+        )
+
+        db.session.add(session)
+        db.session.commit()
+
+        return jsonify(session.to_dict()), 201
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to save session: {str(e)}"}), 500
+
+
+@app.route('/sessions', methods=['GET'])
+def list_sessions():
+    """List all saved sessions, ordered by date descending."""
+    try:
+        sessions = Session.query.order_by(Session.session_date.desc()).all()
+        return jsonify([s.to_dict() for s in sessions])
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch sessions: {str(e)}"}), 500
+
+
+@app.route('/sessions/<session_id>', methods=['GET'])
+def get_session(session_id):
+    """Get a single session by ID."""
+    try:
+        session = Session.query.get(session_id)
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+        return jsonify(session.to_dict())
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch session: {str(e)}"}), 500
+
+
+@app.route('/sessions/<session_id>', methods=['PUT'])
+def update_session(session_id):
+    """Update a session (e.g., add notes or training plan)."""
+    try:
+        session = Session.query.get(session_id)
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+
+        data = request.get_json()
+
+        if 'location' in data:
+            session.location = data['location']
+        if 'notes' in data:
+            session.notes = data['notes']
+        if 'training_plan' in data:
+            session.training_plan = data['training_plan']
+
+        db.session.commit()
+        return jsonify(session.to_dict())
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to update session: {str(e)}"}), 500
+
+
+@app.route('/sessions/<session_id>', methods=['DELETE'])
+def delete_session(session_id):
+    """Delete a session."""
+    try:
+        session = Session.query.get(session_id)
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+
+        db.session.delete(session)
+        db.session.commit()
+        return jsonify({"message": "Session deleted"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to delete session: {str(e)}"}), 500
+
+
+# ============================================================================
+# PROGRESSION ANALYSIS - AI-powered trend analysis
+# ============================================================================
+
+PROGRESSION_PROMPT = """You are analyzing a skier's progression over multiple skiing sessions.
+You have access to CARV metrics data from each session.
+
+## YOUR TASK
+
+Analyze the progression data and provide:
+
+1. **METRIC TRENDS** - For key metrics, describe the trend (improving, plateauing, regressing)
+   - Ski:IQ trend
+   - Edge angle trends
+   - Balance metrics trends
+   - Any other notable metric changes
+
+2. **TRAINING PLAN CORRELATION** - If training plans were saved, assess:
+   - Did metrics targeted by training plans improve?
+   - Which drills/focus areas seem most effective?
+   - Which areas need continued focus?
+
+3. **TECHNIQUE NARRATIVE** - In plain language, describe:
+   - How the skier's technique is evolving
+   - What's getting better
+   - What still needs work
+   - Any patterns you notice (e.g., "strong on groomers but struggles on steeps")
+
+4. **RECOMMENDATIONS** - Based on the progression:
+   - What should the skier focus on next?
+   - Any changes to training approach?
+   - Specific drills to add or drop
+
+## OUTPUT FORMAT
+
+Return a JSON object with this structure:
+{
+    "metric_trends": {
+        "ski_iq": {"direction": "improving|stable|declining", "details": "..."},
+        "edge_angle": {"direction": "...", "details": "..."},
+        "balance": {"direction": "...", "details": "..."},
+        "other_notable": [{"metric": "...", "direction": "...", "details": "..."}]
+    },
+    "training_correlation": {
+        "effective_focus_areas": ["..."],
+        "needs_more_work": ["..."],
+        "assessment": "..."
+    },
+    "technique_narrative": "...",
+    "recommendations": {
+        "primary_focus": "...",
+        "secondary_focus": "...",
+        "suggested_drills": ["..."],
+        "overall_assessment": "..."
+    },
+    "summary": "2-3 sentence executive summary of progression"
+}
+"""
+
+
+@app.route('/progression', methods=['POST'])
+def analyze_progression():
+    """
+    Analyze progression across multiple sessions.
+    Can optionally specify session IDs, otherwise uses all sessions.
+    """
+    try:
+        data = request.get_json() or {}
+        session_ids = data.get('session_ids')
+
+        # Get sessions
+        if session_ids:
+            sessions = Session.query.filter(Session.id.in_(session_ids)).order_by(Session.session_date.asc()).all()
+        else:
+            sessions = Session.query.order_by(Session.session_date.asc()).all()
+
+        if len(sessions) < 2:
+            return jsonify({
+                "error": "Not enough sessions",
+                "message": "Need at least 2 sessions to analyze progression"
+            }), 400
+
+        # Build context for Claude
+        session_data = []
+        for s in sessions:
+            session_data.append({
+                "date": s.session_date.strftime("%Y-%m-%d") if s.session_date else "Unknown",
+                "location": s.location,
+                "ski_iq": s.ski_iq,
+                "metrics": s.metrics,
+                "training_plan": s.training_plan[:500] if s.training_plan else None  # Truncate for context
+            })
+
+        # Call Claude for analysis
+        response = client.messages.create(
+            model="claude-3-5-haiku-20241022",  # Fast for this analysis
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": f"""Analyze this skier's progression across {len(sessions)} sessions:
+
+{json.dumps(session_data, indent=2)}
+
+{PROGRESSION_PROMPT}
+
+Return ONLY valid JSON, no markdown code blocks."""
+            }],
+            system=CARV_METRICS_CONTEXT
+        )
+
+        response_text = response.content[0].text
+        cleaned_json = clean_json_response(response_text)
+
+        try:
+            progression_data = json.loads(cleaned_json)
+        except json.JSONDecodeError:
+            return jsonify({
+                "error": "Failed to parse progression analysis",
+                "raw_response": response_text[:500]
+            }), 500
+
+        progression_data["sessions_analyzed"] = len(sessions)
+        progression_data["date_range"] = {
+            "from": sessions[0].session_date.isoformat() if sessions[0].session_date else None,
+            "to": sessions[-1].session_date.isoformat() if sessions[-1].session_date else None
+        }
+
+        return jsonify(progression_data)
+
+    except Exception as e:
+        return jsonify({"error": f"Progression analysis failed: {str(e)}"}), 500
+
+
+@app.route('/compare', methods=['POST'])
+def compare_sessions():
+    """Compare two specific sessions side-by-side."""
+    try:
+        data = request.get_json()
+
+        if not data or 'session_id_1' not in data or 'session_id_2' not in data:
+            return jsonify({
+                "error": "Missing session IDs",
+                "message": "Provide session_id_1 and session_id_2"
+            }), 400
+
+        session1 = Session.query.get(data['session_id_1'])
+        session2 = Session.query.get(data['session_id_2'])
+
+        if not session1 or not session2:
+            return jsonify({"error": "One or both sessions not found"}), 404
+
+        # Determine which is earlier/later
+        if session1.session_date <= session2.session_date:
+            earlier, later = session1, session2
+        else:
+            earlier, later = session2, session1
+
+        # Call Claude for comparison
+        response = client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": f"""Compare these two skiing sessions and describe what changed:
+
+EARLIER SESSION ({earlier.session_date.strftime("%Y-%m-%d") if earlier.session_date else "Unknown"}):
+Location: {earlier.location}
+Ski:IQ: {earlier.ski_iq}
+Metrics: {json.dumps(earlier.metrics, indent=2) if earlier.metrics else "No metrics"}
+
+LATER SESSION ({later.session_date.strftime("%Y-%m-%d") if later.session_date else "Unknown"}):
+Location: {later.location}
+Ski:IQ: {later.ski_iq}
+Metrics: {json.dumps(later.metrics, indent=2) if later.metrics else "No metrics"}
+
+Provide a comparison in JSON format:
+{{
+    "ski_iq_change": {{"from": X, "to": Y, "change": "+/-Z", "assessment": "..."}},
+    "key_improvements": ["..."],
+    "areas_declined": ["..."],
+    "technique_changes": "Plain language description of how technique evolved",
+    "recommendations": "What to focus on next based on this comparison"
+}}
+
+Return ONLY valid JSON."""
+            }],
+            system=CARV_METRICS_CONTEXT
+        )
+
+        response_text = response.content[0].text
+        cleaned_json = clean_json_response(response_text)
+
+        try:
+            comparison_data = json.loads(cleaned_json)
+        except json.JSONDecodeError:
+            return jsonify({
+                "error": "Failed to parse comparison",
+                "raw_response": response_text[:500]
+            }), 500
+
+        comparison_data["session_1"] = earlier.to_dict()
+        comparison_data["session_2"] = later.to_dict()
+
+        return jsonify(comparison_data)
+
+    except Exception as e:
+        return jsonify({"error": f"Comparison failed: {str(e)}"}), 500
 
 
 if __name__ == '__main__':

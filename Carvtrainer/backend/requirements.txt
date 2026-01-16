@@ -4,3 +4,5 @@ anthropic>=0.40.0
 python-dotenv==1.0.0
 gunicorn==21.2.0
 Pillow>=10.0.0
+flask-sqlalchemy==3.1.1
+psycopg2-binary==2.9.9

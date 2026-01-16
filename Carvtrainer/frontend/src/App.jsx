@@ -38,6 +38,15 @@ function App() {
   const [comparisonLogB, setComparisonLogB] = useState(null)
   const [showComparisonModal, setShowComparisonModal] = useState(false)
 
+  // Database-backed sessions state
+  const [dbSessions, setDbSessions] = useState([])
+  const [savingToDb, setSavingToDb] = useState(false)
+  const [progressionAnalysis, setProgressionAnalysis] = useState(null)
+  const [loadingProgression, setLoadingProgression] = useState(false)
+  const [showProgressionModal, setShowProgressionModal] = useState(false)
+  const [aiComparison, setAiComparison] = useState(null)
+  const [loadingAiComparison, setLoadingAiComparison] = useState(false)
+
   // Chat state
   const [showChat, setShowChat] = useState(false)
   const [chatMessages, setChatMessages] = useState([])
@@ -84,6 +93,80 @@ function App() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(progressLogs))
     }
   }, [progressLogs])
+
+  // Load sessions from database on mount
+  useEffect(() => {
+    const loadDbSessions = async () => {
+      try {
+        const response = await axios.get(`${API_BASE_URL}/sessions`)
+        setDbSessions(response.data)
+      } catch (err) {
+        console.log('Could not load sessions from database (may not be configured yet)')
+      }
+    }
+    loadDbSessions()
+  }, [])
+
+  // Save session to database
+  const saveSessionToDb = async (sessionData) => {
+    setSavingToDb(true)
+    try {
+      const response = await axios.post(`${API_BASE_URL}/sessions`, sessionData)
+      setDbSessions(prev => [response.data, ...prev])
+      return response.data
+    } catch (err) {
+      console.error('Failed to save to database:', err)
+      throw err
+    } finally {
+      setSavingToDb(false)
+    }
+  }
+
+  // Delete session from database
+  const deleteSessionFromDb = async (sessionId) => {
+    try {
+      await axios.delete(`${API_BASE_URL}/sessions/${sessionId}`)
+      setDbSessions(prev => prev.filter(s => s.id !== sessionId))
+    } catch (err) {
+      console.error('Failed to delete from database:', err)
+    }
+  }
+
+  // Analyze progression across all sessions
+  const analyzeProgression = async () => {
+    if (dbSessions.length < 2) {
+      setError('Need at least 2 saved sessions to analyze progression')
+      return
+    }
+    setLoadingProgression(true)
+    setShowProgressionModal(true)
+    try {
+      const response = await axios.post(`${API_BASE_URL}/progression`, {})
+      setProgressionAnalysis(response.data)
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to analyze progression')
+    } finally {
+      setLoadingProgression(false)
+    }
+  }
+
+  // AI-powered comparison of two sessions
+  const compareSessionsWithAI = async (sessionId1, sessionId2) => {
+    setLoadingAiComparison(true)
+    setAiComparison(null)
+    try {
+      const response = await axios.post(`${API_BASE_URL}/compare`, {
+        session_id_1: sessionId1,
+        session_id_2: sessionId2
+      })
+      setAiComparison(response.data)
+    } catch (err) {
+      console.error('AI comparison failed:', err)
+      setAiComparison({ error: err.response?.data?.message || 'Comparison failed' })
+    } finally {
+      setLoadingAiComparison(false)
+    }
+  }
 
   // Extract metadata from files when selected
   const extractMetadataFromFiles = async (files) => {
@@ -197,7 +280,7 @@ function App() {
     setSelectedFiles(prev => prev.filter(f => f.id !== id))
   }
 
-  // Analyze all screenshots holistically (sends all to Claude at once)
+  // Analyze all screenshots holistically (async with polling to avoid timeouts)
   const analyzeAllScreenshots = async () => {
     if (selectedFiles.length === 0) {
       setError('Please select at least one screenshot')
@@ -210,26 +293,53 @@ function App() {
     setTrainingPlan(null)
 
     try {
-      // Send all images in a single request
+      // Send all images to start async analysis
       const formData = new FormData()
       selectedFiles.forEach(fileObj => {
         formData.append('images', fileObj.file)
       })
 
-      const response = await axios.post(`${API_BASE_URL}/analyze`, formData, {
+      const submitResponse = await axios.post(`${API_BASE_URL}/analyze-async`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data'
         }
       })
 
-      setAnalysis(response.data)
+      const jobId = submitResponse.data.job_id
 
-      // Update sessionDateTime from CARV screenshot if available (master timestamp)
-      if (response.data?.session_overview?.session_datetime) {
-        const carvDateTime = response.data.session_overview.session_datetime
-        // Format for datetime-local input (YYYY-MM-DDTHH:MM)
-        setSessionDateTime(carvDateTime.slice(0, 16))
+      // Poll for results
+      const pollInterval = 2000 // 2 seconds
+      const maxPolls = 90 // 3 minutes max
+      let polls = 0
+
+      while (polls < maxPolls) {
+        await new Promise(resolve => setTimeout(resolve, pollInterval))
+        polls++
+
+        const statusResponse = await axios.get(`${API_BASE_URL}/job-status/${jobId}`)
+        const { status, result, error: jobError } = statusResponse.data
+
+        if (status === 'completed') {
+          setAnalysis(result)
+
+          // Update sessionDateTime from CARV screenshot if available (master timestamp)
+          if (result?.session_overview?.session_datetime) {
+            const carvDateTime = result.session_overview.session_datetime
+            // Format for datetime-local input (YYYY-MM-DDTHH:MM)
+            setSessionDateTime(carvDateTime.slice(0, 16))
+          }
+          return
+        }
+
+        if (status === 'failed') {
+          setError(jobError || 'Analysis failed')
+          return
+        }
+        // status is 'pending' or 'processing' - continue polling
       }
+
+      // Timeout after max polls
+      setError('Analysis timed out. Please try again with fewer screenshots.')
     } catch (err) {
       const errorMessage = err.response?.data?.message ||
                           err.response?.data?.error ||
@@ -1103,8 +1213,8 @@ function App() {
 
   const skiIQ = getSkiIQ()
 
-  // Save current session to progress log
-  const saveToProgressLog = () => {
+  // Save current session to progress log (localStorage + database)
+  const saveToProgressLog = async () => {
     if (!analysis) return
 
     // Use session_datetime from CARV screenshot as master timestamp (priority 1)
@@ -1134,7 +1244,22 @@ function App() {
       }
     }
 
+    // Save to localStorage (legacy/backup)
     setProgressLogs(prev => [...prev, logEntry])
+
+    // Also save to database for AI progression analysis
+    try {
+      await saveSessionToDb({
+        session_date: masterDateTime,
+        location: analysis?.session_overview?.location || null,
+        metrics: analysis,
+        training_plan: trainingPlan,
+        notes: sessionNotes
+      })
+    } catch (err) {
+      console.log('Database save failed, but localStorage save succeeded')
+    }
+
     setShowSaveDialog(false)
     setSessionNotes('')
   }
@@ -1660,6 +1785,25 @@ function App() {
               <button className="close-btn" onClick={() => setShowProgressPanel(false)}>×</button>
             </div>
 
+            {/* AI Progression Analysis Button */}
+            {dbSessions.length >= 2 && (
+              <div className="progression-analysis-section">
+                <button
+                  className="progression-btn"
+                  onClick={analyzeProgression}
+                  disabled={loadingProgression}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M12 20V10"/>
+                    <path d="M18 20V4"/>
+                    <path d="M6 20v-4"/>
+                  </svg>
+                  {loadingProgression ? 'Analyzing...' : 'AI Progression Analysis'}
+                </button>
+                <span className="session-count">{dbSessions.length} sessions tracked</span>
+              </div>
+            )}
+
             {sortedLogs.length === 0 ? (
               <div className="empty-logs">
                 <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -2018,6 +2162,160 @@ function App() {
                 {renderComparisonRow('Turn G-Force', comparisonLogA.metrics?.performance?.turn_g_force, comparisonLogB.metrics?.performance?.turn_g_force)}
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Progression Analysis Modal */}
+      {showProgressionModal && (
+        <div className="progression-modal-overlay" onClick={() => setShowProgressionModal(false)}>
+          <div className="progression-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="progression-modal-header">
+              <h2>AI Progression Analysis</h2>
+              <button className="close-btn" onClick={() => setShowProgressionModal(false)}>×</button>
+            </div>
+
+            {loadingProgression ? (
+              <div className="progression-loading">
+                <div className="spinner"></div>
+                <p>Analyzing your progression across {dbSessions.length} sessions...</p>
+              </div>
+            ) : progressionAnalysis ? (
+              <div className="progression-content">
+                {/* Summary */}
+                {progressionAnalysis.summary && (
+                  <div className="progression-summary">
+                    <h3>Summary</h3>
+                    <p>{progressionAnalysis.summary}</p>
+                  </div>
+                )}
+
+                {/* Metric Trends */}
+                {progressionAnalysis.metric_trends && (
+                  <div className="progression-section">
+                    <h3>Metric Trends</h3>
+                    <div className="trend-grid">
+                      {progressionAnalysis.metric_trends.ski_iq && (
+                        <div className={`trend-card ${progressionAnalysis.metric_trends.ski_iq.direction}`}>
+                          <span className="trend-label">Ski:IQ</span>
+                          <span className={`trend-direction ${progressionAnalysis.metric_trends.ski_iq.direction}`}>
+                            {progressionAnalysis.metric_trends.ski_iq.direction === 'improving' ? '↑' :
+                             progressionAnalysis.metric_trends.ski_iq.direction === 'declining' ? '↓' : '→'}
+                            {' '}{progressionAnalysis.metric_trends.ski_iq.direction}
+                          </span>
+                          <p className="trend-details">{progressionAnalysis.metric_trends.ski_iq.details}</p>
+                        </div>
+                      )}
+                      {progressionAnalysis.metric_trends.edge_angle && (
+                        <div className={`trend-card ${progressionAnalysis.metric_trends.edge_angle.direction}`}>
+                          <span className="trend-label">Edge Angle</span>
+                          <span className={`trend-direction ${progressionAnalysis.metric_trends.edge_angle.direction}`}>
+                            {progressionAnalysis.metric_trends.edge_angle.direction === 'improving' ? '↑' :
+                             progressionAnalysis.metric_trends.edge_angle.direction === 'declining' ? '↓' : '→'}
+                            {' '}{progressionAnalysis.metric_trends.edge_angle.direction}
+                          </span>
+                          <p className="trend-details">{progressionAnalysis.metric_trends.edge_angle.details}</p>
+                        </div>
+                      )}
+                      {progressionAnalysis.metric_trends.balance && (
+                        <div className={`trend-card ${progressionAnalysis.metric_trends.balance.direction}`}>
+                          <span className="trend-label">Balance</span>
+                          <span className={`trend-direction ${progressionAnalysis.metric_trends.balance.direction}`}>
+                            {progressionAnalysis.metric_trends.balance.direction === 'improving' ? '↑' :
+                             progressionAnalysis.metric_trends.balance.direction === 'declining' ? '↓' : '→'}
+                            {' '}{progressionAnalysis.metric_trends.balance.direction}
+                          </span>
+                          <p className="trend-details">{progressionAnalysis.metric_trends.balance.details}</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Training Correlation */}
+                {progressionAnalysis.training_correlation && (
+                  <div className="progression-section">
+                    <h3>Training Plan Effectiveness</h3>
+                    {progressionAnalysis.training_correlation.effective_focus_areas?.length > 0 && (
+                      <div className="correlation-group">
+                        <h4>Working Well</h4>
+                        <ul className="focus-list success">
+                          {progressionAnalysis.training_correlation.effective_focus_areas.map((area, i) => (
+                            <li key={i}>{area}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {progressionAnalysis.training_correlation.needs_more_work?.length > 0 && (
+                      <div className="correlation-group">
+                        <h4>Needs More Focus</h4>
+                        <ul className="focus-list warning">
+                          {progressionAnalysis.training_correlation.needs_more_work.map((area, i) => (
+                            <li key={i}>{area}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {progressionAnalysis.training_correlation.assessment && (
+                      <p className="correlation-assessment">{progressionAnalysis.training_correlation.assessment}</p>
+                    )}
+                  </div>
+                )}
+
+                {/* Technique Narrative */}
+                {progressionAnalysis.technique_narrative && (
+                  <div className="progression-section">
+                    <h3>How Your Technique Is Evolving</h3>
+                    <p className="narrative">{progressionAnalysis.technique_narrative}</p>
+                  </div>
+                )}
+
+                {/* Recommendations */}
+                {progressionAnalysis.recommendations && (
+                  <div className="progression-section recommendations">
+                    <h3>What To Focus On Next</h3>
+                    {progressionAnalysis.recommendations.primary_focus && (
+                      <div className="recommendation-item primary">
+                        <span className="rec-label">Primary Focus</span>
+                        <p>{progressionAnalysis.recommendations.primary_focus}</p>
+                      </div>
+                    )}
+                    {progressionAnalysis.recommendations.secondary_focus && (
+                      <div className="recommendation-item secondary">
+                        <span className="rec-label">Secondary Focus</span>
+                        <p>{progressionAnalysis.recommendations.secondary_focus}</p>
+                      </div>
+                    )}
+                    {progressionAnalysis.recommendations.suggested_drills?.length > 0 && (
+                      <div className="drills-list">
+                        <h4>Suggested Drills</h4>
+                        <ul>
+                          {progressionAnalysis.recommendations.suggested_drills.map((drill, i) => (
+                            <li key={i}>{drill}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {progressionAnalysis.recommendations.overall_assessment && (
+                      <p className="overall-assessment">{progressionAnalysis.recommendations.overall_assessment}</p>
+                    )}
+                  </div>
+                )}
+
+                <div className="progression-meta">
+                  <span>Analyzed {progressionAnalysis.sessions_analyzed} sessions</span>
+                  {progressionAnalysis.date_range && (
+                    <span>
+                      {new Date(progressionAnalysis.date_range.from).toLocaleDateString()} - {new Date(progressionAnalysis.date_range.to).toLocaleDateString()}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="progression-error">
+                <p>Could not load progression analysis</p>
+              </div>
+            )}
           </div>
         </div>
       )}
