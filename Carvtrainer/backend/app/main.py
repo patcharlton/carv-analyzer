@@ -1720,57 +1720,94 @@ def delete_session(session_id):
 # ============================================================================
 
 PROGRESSION_PROMPT = """You are analyzing a skier's progression over multiple skiing sessions.
-You have access to CARV metrics data from each session.
+You have access to CARV metrics data from each session. Your PRIMARY goal is to find CORRELATIONS between metrics and hypothesize WHY changes occur.
 
 ## YOUR TASK
 
-Analyze the progression data and provide:
+### 1. EXTRACT ALL METRICS
+For each session, extract EVERY metric value you can find:
+- Ski:IQ (overall score)
+- Balance metrics: outside ski %, fore/aft balance, stance width, weight distribution
+- Edging metrics: edge angle (max/avg), turn shape score, carving %
+- Rotary metrics: rotation separation, hip alignment, counter
+- Performance: G-force, speed, turn radius
+- Any other metrics present
 
-1. **METRIC TRENDS** - For key metrics, describe the trend (improving, plateauing, regressing)
-   - Ski:IQ trend
-   - Edge angle trends
-   - Balance metrics trends
-   - Any other notable metric changes
+### 2. ANALYZE METRIC CORRELATIONS (MOST IMPORTANT)
+Look for patterns where metrics change TOGETHER:
+- When metric A improved, did metric B also improve/decline?
+- Are there inverse relationships (A up = B down)?
+- Which metrics seem to move independently?
 
-2. **TRAINING PLAN CORRELATION** - If training plans were saved, assess:
-   - Did metrics targeted by training plans improve?
-   - Which drills/focus areas seem most effective?
-   - Which areas need continued focus?
+Examples of correlations to look for:
+- "Edge angle increased → Turn shape improved" (positive correlation)
+- "Speed increased → Balance decreased" (inverse correlation)
+- "Outside ski pressure improved → Edge angle also improved" (linked skills)
 
-3. **TECHNIQUE NARRATIVE** - In plain language, describe:
-   - How the skier's technique is evolving
-   - What's getting better
-   - What still needs work
-   - Any patterns you notice (e.g., "strong on groomers but struggles on steeps")
+### 3. HYPOTHESIZE CAUSALITY
+For each correlation found, explain WHY this might happen biomechanically:
+- What technique change could cause both metrics to move?
+- Is one metric likely CAUSING the other to change?
+- What does this tell us about the skier's technique evolution?
 
-4. **RECOMMENDATIONS** - Based on the progression:
-   - What should the skier focus on next?
-   - Any changes to training approach?
-   - Specific drills to add or drop
+### 4. SESSION-BY-SESSION BREAKDOWN
+Show the actual metric values for each session so the skier can see the raw data.
 
 ## OUTPUT FORMAT
 
 Return a JSON object with this structure:
 {
+    "sessions_breakdown": [
+        {
+            "date": "YYYY-MM-DD",
+            "ski_iq": number,
+            "key_metrics": {
+                "edge_angle_max": number,
+                "outside_ski_pressure": number,
+                "balance_score": number,
+                "turn_shape": number,
+                "carving_percentage": number
+            }
+        }
+    ],
+    "all_metrics_tracked": ["list of all metric names found across sessions"],
+    "metric_correlations": [
+        {
+            "metric_a": "name",
+            "metric_b": "name",
+            "correlation": "positive|negative|none",
+            "observation": "When X increased by Y%, Z also increased by W%",
+            "biomechanical_explanation": "This happens because...",
+            "confidence": "high|medium|low"
+        }
+    ],
+    "causality_hypotheses": [
+        {
+            "cause": "metric or technique change",
+            "effect": "resulting metric changes",
+            "explanation": "Detailed biomechanical reasoning",
+            "evidence": "Data points supporting this hypothesis"
+        }
+    ],
     "metric_trends": {
-        "ski_iq": {"direction": "improving|stable|declining", "details": "..."},
-        "edge_angle": {"direction": "...", "details": "..."},
-        "balance": {"direction": "...", "details": "..."},
-        "other_notable": [{"metric": "...", "direction": "...", "details": "..."}]
+        "ski_iq": {"values": [list of values per session], "direction": "improving|stable|declining", "change": "+X% or -X%"},
+        "edge_angle": {"values": [], "direction": "...", "change": "..."},
+        "balance": {"values": [], "direction": "...", "change": "..."},
+        "other_metrics": [{"name": "...", "values": [], "direction": "...", "change": "..."}]
     },
-    "training_correlation": {
-        "effective_focus_areas": ["..."],
-        "needs_more_work": ["..."],
-        "assessment": "..."
-    },
-    "technique_narrative": "...",
+    "key_insights": [
+        "Insight 1: Most significant finding about metric relationships",
+        "Insight 2: ...",
+        "Insight 3: ..."
+    ],
+    "technique_narrative": "Plain language description of how technique is evolving based on the correlations found",
     "recommendations": {
-        "primary_focus": "...",
+        "primary_focus": "Based on correlations, focus on X because it appears to drive improvements in Y and Z",
         "secondary_focus": "...",
         "suggested_drills": ["..."],
-        "overall_assessment": "..."
+        "what_to_watch": "When you improve X, watch for changes in Y"
     },
-    "summary": "2-3 sentence executive summary of progression"
+    "summary": "2-3 sentence summary focusing on the most important metric correlations discovered"
 }
 """
 
@@ -1785,11 +1822,14 @@ def analyze_progression():
         data = request.get_json() or {}
         session_ids = data.get('session_ids')
 
-        # Get sessions
-        if session_ids:
-            sessions = Session.query.filter(Session.id.in_(session_ids)).order_by(Session.session_date.asc()).all()
+        # Get all sessions for reference
+        all_sessions = Session.query.order_by(Session.session_date.asc()).all()
+
+        # Filter to selected sessions if specified
+        if session_ids and len(session_ids) > 0:
+            sessions = [s for s in all_sessions if s.id in session_ids]
         else:
-            sessions = Session.query.order_by(Session.session_date.asc()).all()
+            sessions = all_sessions
 
         if len(sessions) < 2:
             return jsonify({
@@ -1797,25 +1837,28 @@ def analyze_progression():
                 "message": "Need at least 2 sessions to analyze progression"
             }), 400
 
-        # Build context for Claude
+        # Build context for Claude - include ALL metrics, don't truncate
         session_data = []
         for s in sessions:
             session_data.append({
                 "date": s.session_date.strftime("%Y-%m-%d") if s.session_date else "Unknown",
+                "session_id": s.id,
                 "location": s.location,
                 "ski_iq": s.ski_iq,
-                "metrics": s.metrics,
-                "training_plan": s.training_plan[:500] if s.training_plan else None  # Truncate for context
+                "metrics": s.metrics,  # Full metrics object
+                "training_plan_summary": s.training_plan[:300] if s.training_plan else None
             })
 
-        # Call Claude for analysis
+        # Call Claude for analysis - use Sonnet for better correlation analysis
         response = client.messages.create(
-            model="claude-3-5-haiku-20241022",  # Fast for this analysis
-            max_tokens=2000,
+            model="claude-sonnet-4-20250514",  # Better reasoning for correlations
+            max_tokens=4000,
             messages=[{
                 "role": "user",
-                "content": f"""Analyze this skier's progression across {len(sessions)} sessions:
+                "content": f"""Analyze this skier's progression across {len(sessions)} sessions.
+IMPORTANT: Extract and analyze ALL metrics from each session. Focus on finding correlations between metrics.
 
+SESSION DATA:
 {json.dumps(session_data, indent=2)}
 
 {PROGRESSION_PROMPT}
@@ -1837,10 +1880,22 @@ Return ONLY valid JSON, no markdown code blocks."""
             }), 500
 
         progression_data["sessions_analyzed"] = len(sessions)
+        progression_data["session_ids_analyzed"] = [s.id for s in sessions]
         progression_data["date_range"] = {
             "from": sessions[0].session_date.isoformat() if sessions[0].session_date else None,
             "to": sessions[-1].session_date.isoformat() if sessions[-1].session_date else None
         }
+        # Include list of all available sessions for UI selection
+        progression_data["available_sessions"] = [
+            {
+                "id": s.id,
+                "date": s.session_date.strftime("%Y-%m-%d") if s.session_date else "Unknown",
+                "ski_iq": s.ski_iq,
+                "location": s.location,
+                "selected": s.id in [sess.id for sess in sessions]
+            }
+            for s in all_sessions
+        ]
 
         return jsonify(progression_data)
 

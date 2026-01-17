@@ -44,6 +44,7 @@ function App() {
   const [progressionAnalysis, setProgressionAnalysis] = useState(null)
   const [loadingProgression, setLoadingProgression] = useState(false)
   const [showProgressionModal, setShowProgressionModal] = useState(false)
+  const [selectedSessionIds, setSelectedSessionIds] = useState([]) // For filtering progression analysis
   const [aiComparison, setAiComparison] = useState(null)
   const [loadingAiComparison, setLoadingAiComparison] = useState(false)
 
@@ -132,8 +133,8 @@ function App() {
     }
   }
 
-  // Analyze progression across all sessions
-  const analyzeProgression = async () => {
+  // Analyze progression across sessions (all by default, or selected subset)
+  const analyzeProgression = async (sessionIds = null) => {
     if (dbSessions.length < 2) {
       setError('Need at least 2 saved sessions to analyze progression')
       return
@@ -141,13 +142,37 @@ function App() {
     setLoadingProgression(true)
     setShowProgressionModal(true)
     try {
-      const response = await axios.post(`${API_BASE_URL}/progression`, {})
+      const response = await axios.post(`${API_BASE_URL}/progression`, {
+        session_ids: sessionIds || selectedSessionIds.length > 0 ? selectedSessionIds : null
+      })
       setProgressionAnalysis(response.data)
+      // Update available sessions from response
+      if (response.data.available_sessions) {
+        setSelectedSessionIds(response.data.session_ids_analyzed || [])
+      }
     } catch (err) {
       setError(err.response?.data?.message || 'Failed to analyze progression')
     } finally {
       setLoadingProgression(false)
     }
+  }
+
+  // Toggle session selection for progression analysis
+  const toggleSessionSelection = (sessionId) => {
+    setSelectedSessionIds(prev =>
+      prev.includes(sessionId)
+        ? prev.filter(id => id !== sessionId)
+        : [...prev, sessionId]
+    )
+  }
+
+  // Re-run analysis with new session selection
+  const rerunProgressionAnalysis = () => {
+    if (selectedSessionIds.length < 2) {
+      setError('Select at least 2 sessions to analyze')
+      return
+    }
+    analyzeProgression(selectedSessionIds)
   }
 
   // AI-powered comparison of two sessions
@@ -2188,11 +2213,146 @@ function App() {
               </div>
             ) : progressionAnalysis ? (
               <div className="progression-content">
+                {/* Session Selection */}
+                {progressionAnalysis.available_sessions?.length > 0 && (
+                  <div className="session-selection-section">
+                    <h3>Sessions Analyzed</h3>
+                    <p className="selection-hint">Select which sessions to include in the analysis:</p>
+                    <div className="session-checkboxes">
+                      {progressionAnalysis.available_sessions.map(session => (
+                        <label key={session.id} className={`session-checkbox ${selectedSessionIds.includes(session.id) ? 'selected' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={selectedSessionIds.includes(session.id)}
+                            onChange={() => toggleSessionSelection(session.id)}
+                          />
+                          <span className="session-info">
+                            <span className="session-date">{session.date}</span>
+                            {session.ski_iq && <span className="session-iq">IQ: {Math.round(session.ski_iq)}</span>}
+                            {session.location && <span className="session-location">{session.location}</span>}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                    <button
+                      className="rerun-btn"
+                      onClick={rerunProgressionAnalysis}
+                      disabled={selectedSessionIds.length < 2 || loadingProgression}
+                    >
+                      {loadingProgression ? 'Analyzing...' : `Re-analyze ${selectedSessionIds.length} sessions`}
+                    </button>
+                  </div>
+                )}
+
                 {/* Summary */}
                 {progressionAnalysis.summary && (
                   <div className="progression-summary">
                     <h3>Summary</h3>
                     <p>{progressionAnalysis.summary}</p>
+                  </div>
+                )}
+
+                {/* Key Insights - Most Important */}
+                {progressionAnalysis.key_insights?.length > 0 && (
+                  <div className="progression-section key-insights">
+                    <h3>Key Insights</h3>
+                    <ul className="insights-list">
+                      {progressionAnalysis.key_insights.map((insight, i) => (
+                        <li key={i}>{insight}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Metric Correlations - THE MAIN FEATURE */}
+                {progressionAnalysis.metric_correlations?.length > 0 && (
+                  <div className="progression-section correlations-section">
+                    <h3>Metric Correlations</h3>
+                    <p className="section-desc">When one metric changes, these other metrics tend to change too:</p>
+                    <div className="correlations-list">
+                      {progressionAnalysis.metric_correlations.map((corr, i) => (
+                        <div key={i} className={`correlation-card ${corr.correlation}`}>
+                          <div className="correlation-header">
+                            <span className="metric-pair">
+                              {corr.metric_a}
+                              <span className={`correlation-arrow ${corr.correlation}`}>
+                                {corr.correlation === 'positive' ? '↔' : corr.correlation === 'negative' ? '↕' : '·'}
+                              </span>
+                              {corr.metric_b}
+                            </span>
+                            <span className={`correlation-type ${corr.correlation}`}>
+                              {corr.correlation === 'positive' ? 'Move Together' :
+                               corr.correlation === 'negative' ? 'Inverse' : 'Independent'}
+                            </span>
+                            {corr.confidence && (
+                              <span className={`confidence-badge ${corr.confidence}`}>{corr.confidence}</span>
+                            )}
+                          </div>
+                          <p className="correlation-observation">{corr.observation}</p>
+                          {corr.biomechanical_explanation && (
+                            <p className="correlation-explanation">
+                              <strong>Why:</strong> {corr.biomechanical_explanation}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Causality Hypotheses */}
+                {progressionAnalysis.causality_hypotheses?.length > 0 && (
+                  <div className="progression-section causality-section">
+                    <h3>Cause & Effect Analysis</h3>
+                    <p className="section-desc">What might be driving your technique changes:</p>
+                    <div className="causality-list">
+                      {progressionAnalysis.causality_hypotheses.map((hyp, i) => (
+                        <div key={i} className="causality-card">
+                          <div className="causality-flow">
+                            <span className="cause">{hyp.cause}</span>
+                            <span className="arrow">→</span>
+                            <span className="effect">{hyp.effect}</span>
+                          </div>
+                          <p className="causality-explanation">{hyp.explanation}</p>
+                          {hyp.evidence && (
+                            <p className="causality-evidence"><em>Evidence: {hyp.evidence}</em></p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Sessions Breakdown - Raw Data */}
+                {progressionAnalysis.sessions_breakdown?.length > 0 && (
+                  <div className="progression-section breakdown-section">
+                    <h3>Session-by-Session Metrics</h3>
+                    <div className="breakdown-table-wrapper">
+                      <table className="breakdown-table">
+                        <thead>
+                          <tr>
+                            <th>Date</th>
+                            <th>Ski:IQ</th>
+                            {progressionAnalysis.sessions_breakdown[0]?.key_metrics &&
+                              Object.keys(progressionAnalysis.sessions_breakdown[0].key_metrics).map(key => (
+                                <th key={key}>{key.replace(/_/g, ' ')}</th>
+                              ))
+                            }
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {progressionAnalysis.sessions_breakdown.map((session, i) => (
+                            <tr key={i}>
+                              <td>{session.date}</td>
+                              <td>{session.ski_iq ? Math.round(session.ski_iq) : '-'}</td>
+                              {session.key_metrics && Object.values(session.key_metrics).map((val, j) => (
+                                <td key={j}>{val !== null && val !== undefined ? (typeof val === 'number' ? Math.round(val) : val) : '-'}</td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 )}
 
@@ -2207,9 +2367,11 @@ function App() {
                           <span className={`trend-direction ${progressionAnalysis.metric_trends.ski_iq.direction}`}>
                             {progressionAnalysis.metric_trends.ski_iq.direction === 'improving' ? '↑' :
                              progressionAnalysis.metric_trends.ski_iq.direction === 'declining' ? '↓' : '→'}
-                            {' '}{progressionAnalysis.metric_trends.ski_iq.direction}
+                            {' '}{progressionAnalysis.metric_trends.ski_iq.change || progressionAnalysis.metric_trends.ski_iq.direction}
                           </span>
-                          <p className="trend-details">{progressionAnalysis.metric_trends.ski_iq.details}</p>
+                          {progressionAnalysis.metric_trends.ski_iq.values && (
+                            <span className="trend-values">{progressionAnalysis.metric_trends.ski_iq.values.map(v => Math.round(v)).join(' → ')}</span>
+                          )}
                         </div>
                       )}
                       {progressionAnalysis.metric_trends.edge_angle && (
@@ -2218,9 +2380,8 @@ function App() {
                           <span className={`trend-direction ${progressionAnalysis.metric_trends.edge_angle.direction}`}>
                             {progressionAnalysis.metric_trends.edge_angle.direction === 'improving' ? '↑' :
                              progressionAnalysis.metric_trends.edge_angle.direction === 'declining' ? '↓' : '→'}
-                            {' '}{progressionAnalysis.metric_trends.edge_angle.direction}
+                            {' '}{progressionAnalysis.metric_trends.edge_angle.change || progressionAnalysis.metric_trends.edge_angle.direction}
                           </span>
-                          <p className="trend-details">{progressionAnalysis.metric_trends.edge_angle.details}</p>
                         </div>
                       )}
                       {progressionAnalysis.metric_trends.balance && (
@@ -2229,42 +2390,21 @@ function App() {
                           <span className={`trend-direction ${progressionAnalysis.metric_trends.balance.direction}`}>
                             {progressionAnalysis.metric_trends.balance.direction === 'improving' ? '↑' :
                              progressionAnalysis.metric_trends.balance.direction === 'declining' ? '↓' : '→'}
-                            {' '}{progressionAnalysis.metric_trends.balance.direction}
+                            {' '}{progressionAnalysis.metric_trends.balance.change || progressionAnalysis.metric_trends.balance.direction}
                           </span>
-                          <p className="trend-details">{progressionAnalysis.metric_trends.balance.details}</p>
                         </div>
                       )}
+                      {progressionAnalysis.metric_trends.other_metrics?.map((metric, i) => (
+                        <div key={i} className={`trend-card ${metric.direction}`}>
+                          <span className="trend-label">{metric.name}</span>
+                          <span className={`trend-direction ${metric.direction}`}>
+                            {metric.direction === 'improving' ? '↑' :
+                             metric.direction === 'declining' ? '↓' : '→'}
+                            {' '}{metric.change || metric.direction}
+                          </span>
+                        </div>
+                      ))}
                     </div>
-                  </div>
-                )}
-
-                {/* Training Correlation */}
-                {progressionAnalysis.training_correlation && (
-                  <div className="progression-section">
-                    <h3>Training Plan Effectiveness</h3>
-                    {progressionAnalysis.training_correlation.effective_focus_areas?.length > 0 && (
-                      <div className="correlation-group">
-                        <h4>Working Well</h4>
-                        <ul className="focus-list success">
-                          {progressionAnalysis.training_correlation.effective_focus_areas.map((area, i) => (
-                            <li key={i}>{area}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {progressionAnalysis.training_correlation.needs_more_work?.length > 0 && (
-                      <div className="correlation-group">
-                        <h4>Needs More Focus</h4>
-                        <ul className="focus-list warning">
-                          {progressionAnalysis.training_correlation.needs_more_work.map((area, i) => (
-                            <li key={i}>{area}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {progressionAnalysis.training_correlation.assessment && (
-                      <p className="correlation-assessment">{progressionAnalysis.training_correlation.assessment}</p>
-                    )}
                   </div>
                 )}
 
@@ -2292,6 +2432,12 @@ function App() {
                         <p>{progressionAnalysis.recommendations.secondary_focus}</p>
                       </div>
                     )}
+                    {progressionAnalysis.recommendations.what_to_watch && (
+                      <div className="recommendation-item watch">
+                        <span className="rec-label">What To Watch</span>
+                        <p>{progressionAnalysis.recommendations.what_to_watch}</p>
+                      </div>
+                    )}
                     {progressionAnalysis.recommendations.suggested_drills?.length > 0 && (
                       <div className="drills-list">
                         <h4>Suggested Drills</h4>
@@ -2301,9 +2447,6 @@ function App() {
                           ))}
                         </ul>
                       </div>
-                    )}
-                    {progressionAnalysis.recommendations.overall_assessment && (
-                      <p className="overall-assessment">{progressionAnalysis.recommendations.overall_assessment}</p>
                     )}
                   </div>
                 )}
