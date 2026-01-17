@@ -1217,51 +1217,57 @@ function App() {
   const saveToProgressLog = async () => {
     if (!analysis) return
 
-    // Use session_datetime from CARV screenshot as master timestamp (priority 1)
-    // Fall back to sessionDateTime (from EXIF/filename) (priority 2)
-    // Finally fall back to current time (priority 3)
-    const masterDateTime = analysis?.session_overview?.session_datetime ||
-      sessionDateTime ||
-      new Date().toISOString()
-
-    const logEntry = {
-      id: `log-${Date.now()}`,
-      datetime: masterDateTime,
-      datetimeDisplay: analysis?.session_overview?.session_date_display || null,
-      datetimeSource: analysis?.session_overview?.session_datetime ? 'carv_screenshot' :
-        (sessionDateTime ? 'exif_or_filename' : 'current_time'),
-      notes: sessionNotes,
-      savedAt: new Date().toISOString(),
-      analysis: analysis,
-      trainingPlan: trainingPlan,
-      screenshotPreviews: selectedFiles.map(f => f.preview).slice(0, 3), // Save up to 3 previews
-      metrics: {
-        skiIQ: skiIQ,
-        balance: analysis.overall_metrics?.balance,
-        edging: analysis.overall_metrics?.edging,
-        rotary: analysis.overall_metrics?.rotary,
-        performance: analysis.overall_metrics?.performance
-      }
-    }
-
-    // Save to localStorage (legacy/backup)
-    setProgressLogs(prev => [...prev, logEntry])
-
-    // Also save to database for AI progression analysis
     try {
-      await saveSessionToDb({
-        session_date: masterDateTime,
-        location: analysis?.session_overview?.location || null,
-        metrics: analysis,
-        training_plan: trainingPlan,
-        notes: sessionNotes
-      })
-    } catch (err) {
-      console.log('Database save failed, but localStorage save succeeded')
-    }
+      // Use session_datetime from CARV screenshot as master timestamp (priority 1)
+      // Fall back to sessionDateTime (from EXIF/filename) (priority 2)
+      // Finally fall back to current time (priority 3)
+      const masterDateTime = analysis?.session_overview?.session_datetime ||
+        sessionDateTime ||
+        new Date().toISOString()
 
-    setShowSaveDialog(false)
-    setSessionNotes('')
+      const logEntry = {
+        id: `log-${Date.now()}`,
+        datetime: masterDateTime,
+        datetimeDisplay: analysis?.session_overview?.session_date_display || null,
+        datetimeSource: analysis?.session_overview?.session_datetime ? 'carv_screenshot' :
+          (sessionDateTime ? 'exif_or_filename' : 'current_time'),
+        notes: sessionNotes,
+        savedAt: new Date().toISOString(),
+        analysis: analysis,
+        trainingPlan: trainingPlan,
+        screenshotPreviews: selectedFiles.map(f => f.preview).slice(0, 3), // Save up to 3 previews
+        metrics: {
+          skiIQ: skiIQ,
+          balance: analysis.overall_metrics?.balance,
+          edging: analysis.overall_metrics?.edging,
+          rotary: analysis.overall_metrics?.rotary,
+          performance: analysis.overall_metrics?.performance
+        }
+      }
+
+      // Save to localStorage (legacy/backup)
+      setProgressLogs(prev => [...prev, logEntry])
+
+      // Also save to database for AI progression analysis
+      try {
+        await saveSessionToDb({
+          session_date: masterDateTime,
+          location: analysis?.session_overview?.location || null,
+          metrics: analysis,
+          training_plan: trainingPlan,
+          notes: sessionNotes
+        })
+      } catch (err) {
+        console.log('Database save failed, but localStorage save succeeded')
+      }
+
+      setShowSaveDialog(false)
+      setSessionNotes('')
+    } catch (err) {
+      console.error('Error saving to progress log:', err)
+      setError('Failed to save session. Please try again.')
+      setShowSaveDialog(false)
+    }
   }
 
   // Delete a progress log entry
@@ -2304,7 +2310,7 @@ function App() {
 
                 <div className="progression-meta">
                   <span>Analyzed {progressionAnalysis.sessions_analyzed} sessions</span>
-                  {progressionAnalysis.date_range && (
+                  {progressionAnalysis.date_range?.from && progressionAnalysis.date_range?.to && (
                     <span>
                       {new Date(progressionAnalysis.date_range.from).toLocaleDateString()} - {new Date(progressionAnalysis.date_range.to).toLocaleDateString()}
                     </span>
