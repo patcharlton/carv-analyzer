@@ -472,11 +472,24 @@ function App() {
     setChatMessages(newMessages)
 
     try {
-      // Pass the full analysis object to chat for context
+      // Build session history summary for chat context
+      const sessionHistory = progressLogs.length > 0 ? progressLogs.map(log => ({
+        date: log.datetime,
+        skiIQ: log.metrics?.skiIQ,
+        balance: log.metrics?.balance?.category_average,
+        edging: log.metrics?.edging?.category_average,
+        rotary: log.metrics?.rotary?.category_average,
+        twr: log.metrics?.balance?.transition_weight_release,
+        edgeAngle: log.metrics?.edging?.edge_angle,
+        notes: log.notes
+      })) : null
+
       const response = await axios.post(`${API_BASE_URL}/chat`, {
         message: userMessage,
         history: chatMessages,
-        analysisData: analysis  // Pass entire analysis object
+        analysisData: analysis,
+        sessionHistory: sessionHistory,
+        progressionInsights: progressionAnalysis?.summary || progressionAnalysis?.technique_narrative || null
       })
 
       // Add assistant response

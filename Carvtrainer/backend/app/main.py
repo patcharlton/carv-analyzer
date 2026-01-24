@@ -1610,6 +1610,8 @@ def chat():
         user_message = data['message']
         history = data.get('history', [])
         analysis_data = data.get('analysisData', None)
+        session_history = data.get('sessionHistory', None)
+        progression_insights = data.get('progressionInsights', None)
 
         # Build session context from analysis data
         session_context = ""
@@ -1621,8 +1623,11 @@ def chat():
                 so = analysis_data['session_overview']
                 if so.get('ski_iq_range'):
                     iq_range = so['ski_iq_range']
-                    avg_iq = (iq_range.get('min', 0) + iq_range.get('max', 0)) / 2 if iq_range.get('min') and iq_range.get('max') else None
-                    session_context += f"**Ski:IQ Range:** {iq_range.get('min', 'N/A')} - {iq_range.get('max', 'N/A')}"
+                    avg_iq = iq_range.get('average') or (
+                        (iq_range.get('lowest', 0) + iq_range.get('highest', 0)) / 2
+                        if iq_range.get('lowest') and iq_range.get('highest') else None
+                    )
+                    session_context += f"**Ski:IQ Range:** {iq_range.get('lowest', iq_range.get('min', 'N/A'))} - {iq_range.get('highest', iq_range.get('max', 'N/A'))}"
                     if avg_iq:
                         session_context += f" (avg: {avg_iq:.0f})\n"
                     else:
@@ -1682,6 +1687,60 @@ def chat():
             # Observations
             if 'observations' in analysis_data:
                 session_context += f"\n**Coach Observations:** {analysis_data['observations']}\n"
+
+            # Detailed observations
+            if 'detailed_observations' in analysis_data:
+                session_context += f"\n**Detailed Analysis:** {analysis_data['detailed_observations']}\n"
+
+            # Holistic analysis (alternate key structure)
+            if 'holistic_analysis' in analysis_data:
+                ha = analysis_data['holistic_analysis']
+                session_context += "\n**Holistic Analysis:**\n"
+                if ha.get('skiing_style'):
+                    session_context += f"- Skiing Style: {ha['skiing_style']}\n"
+                if ha.get('biggest_limiter'):
+                    session_context += f"- Biggest Limiter: {ha['biggest_limiter']}\n"
+                if ha.get('hidden_strength'):
+                    session_context += f"- Hidden Strength: {ha['hidden_strength']}\n"
+                if ha.get('technique_signature'):
+                    session_context += f"- Technique Signature: {ha['technique_signature']}\n"
+
+            # Top priorities (alternate key structure)
+            if 'top_3_priorities' in analysis_data:
+                session_context += "\n**Top Priorities:**\n"
+                for p in analysis_data['top_3_priorities'][:3]:
+                    session_context += f"- {p.get('area', '?')} ({p.get('current_score', '?')}/100): {p.get('quick_win', '')}\n"
+
+            # Top strengths
+            if 'top_3_strengths' in analysis_data:
+                session_context += "\n**Key Strengths:**\n"
+                for s in analysis_data['top_3_strengths'][:3]:
+                    session_context += f"- {s.get('area', '?')} ({s.get('score', '?')}/100): {s.get('why_it_matters', '')}\n"
+
+        # Add session history (progression data across multiple sessions)
+        if session_history and len(session_history) > 0:
+            session_context += "\n\n## PATRICK'S SESSION HISTORY (oldest to newest)\n\n"
+            for i, session in enumerate(session_history):
+                session_context += f"**Session {i+1}** ({session.get('date', 'unknown date')}):\n"
+                if session.get('skiIQ'):
+                    session_context += f"  Ski:IQ: {session['skiIQ']}\n"
+                if session.get('balance') is not None:
+                    session_context += f"  Balance: {session['balance']}/100\n"
+                if session.get('twr') is not None:
+                    session_context += f"  TWR: {session['twr']}/100\n"
+                if session.get('edging') is not None:
+                    session_context += f"  Edging: {session['edging']}/100\n"
+                if session.get('edgeAngle') is not None:
+                    session_context += f"  Edge Angle: {session['edgeAngle']}°\n"
+                if session.get('rotary') is not None:
+                    session_context += f"  Rotary: {session['rotary']}/100\n"
+                if session.get('notes'):
+                    session_context += f"  Notes: {session['notes']}\n"
+                session_context += "\n"
+
+        # Add AI progression insights if available
+        if progression_insights:
+            session_context += f"\n## AI PROGRESSION ANALYSIS INSIGHTS\n\n{progression_insights}\n"
 
         # Build conversation messages
         messages = []
