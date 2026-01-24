@@ -33,10 +33,12 @@ function App() {
   const [sessionDateTime, setSessionDateTime] = useState('')
   const [sessionNotes, setSessionNotes] = useState('')
   const [showSaveDialog, setShowSaveDialog] = useState(false)
+  const [savingSession, setSavingSession] = useState(false)
   const [selectedLogForComparison, setSelectedLogForComparison] = useState(null)
   const [comparisonLogA, setComparisonLogA] = useState(null)
   const [comparisonLogB, setComparisonLogB] = useState(null)
   const [showComparisonModal, setShowComparisonModal] = useState(false)
+  const [deleteConfirmId, setDeleteConfirmId] = useState(null)
 
   // Database-backed sessions state
   const [dbSessions, setDbSessions] = useState([])
@@ -45,8 +47,6 @@ function App() {
   const [loadingProgression, setLoadingProgression] = useState(false)
   const [showProgressionModal, setShowProgressionModal] = useState(false)
   const [selectedSessionIds, setSelectedSessionIds] = useState([]) // For filtering progression analysis
-  const [aiComparison, setAiComparison] = useState(null)
-  const [loadingAiComparison, setLoadingAiComparison] = useState(false)
 
   // Chat state
   const [showChat, setShowChat] = useState(false)
@@ -76,22 +76,90 @@ function App() {
     }
   }
 
+  // Validate and migrate a log entry's schema
+  const validateLogEntry = (log) => {
+    if (!log || typeof log !== 'object') return null
+    if (!log.id || !log.datetime) return null
+    return {
+      id: log.id,
+      datetime: log.datetime,
+      datetimeDisplay: log.datetimeDisplay || null,
+      datetimeSource: log.datetimeSource || 'unknown',
+      notes: log.notes || '',
+      savedAt: log.savedAt || log.datetime,
+      analysis: log.analysis || null,
+      trainingPlan: log.trainingPlan || null,
+      dbSessionId: log.dbSessionId || null,
+      metrics: {
+        skiIQ: log.metrics?.skiIQ || null,
+        balance: log.metrics?.balance || null,
+        edging: log.metrics?.edging || null,
+        rotary: log.metrics?.rotary || null,
+        performance: log.metrics?.performance || null
+      }
+    }
+  }
+
   // Load progress logs from localStorage on mount
   useEffect(() => {
     const savedLogs = localStorage.getItem(STORAGE_KEY)
     if (savedLogs) {
       try {
-        setProgressLogs(JSON.parse(savedLogs))
+        const parsed = JSON.parse(savedLogs)
+        if (!Array.isArray(parsed)) {
+          console.error('Progress logs is not an array, resetting')
+          localStorage.removeItem(STORAGE_KEY)
+          return
+        }
+        // Validate each entry, strip base64 previews from old entries
+        const validated = parsed
+          .map(log => {
+            const valid = validateLogEntry(log)
+            if (valid) {
+              // Strip screenshotPreviews (base64 bloat) from old entries
+              delete log.screenshotPreviews
+            }
+            return valid
+          })
+          .filter(Boolean)
+        setProgressLogs(validated)
+        // Re-save without bloat if we stripped anything
+        if (validated.length !== parsed.length || savedLogs.includes('screenshotPreviews')) {
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(validated))
+          } catch (e) {
+            // Quota issue even after cleanup - clear and rely on DB
+            console.error('localStorage quota exceeded even after cleanup')
+          }
+        }
       } catch (e) {
-        console.error('Failed to load progress logs:', e)
+        console.error('Failed to load progress logs, resetting:', e)
+        localStorage.removeItem(STORAGE_KEY)
       }
     }
   }, [])
 
-  // Save progress logs to localStorage whenever they change
+  // Save progress logs to localStorage whenever they change (with quota handling)
   useEffect(() => {
     if (progressLogs.length > 0) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(progressLogs))
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(progressLogs))
+      } catch (e) {
+        console.error('localStorage quota exceeded:', e)
+        // Try saving without analysis data as a last resort
+        try {
+          const slim = progressLogs.map(log => ({
+            ...log,
+            analysis: null,
+            trainingPlan: null
+          }))
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(slim))
+        } catch (e2) {
+          console.error('Cannot save to localStorage at all:', e2)
+        }
+      }
+    } else {
+      localStorage.removeItem(STORAGE_KEY)
     }
   }, [progressLogs])
 
@@ -134,24 +202,35 @@ function App() {
   }
 
   // Analyze progression across sessions (all by default, or selected subset)
+  const [progressionError, setProgressionError] = useState(null)
   const analyzeProgression = async (sessionIds = null) => {
     if (dbSessions.length < 2) {
       setError('Need at least 2 saved sessions to analyze progression')
       return
     }
     setLoadingProgression(true)
+    setProgressionError(null)
+    setProgressionAnalysis(null)
     setShowProgressionModal(true)
     try {
       const response = await axios.post(`${API_BASE_URL}/progression`, {
-        session_ids: sessionIds || selectedSessionIds.length > 0 ? selectedSessionIds : null
-      })
+        session_ids: sessionIds || (selectedSessionIds.length > 0 ? selectedSessionIds : null)
+      }, { timeout: 120000 }) // 2 min timeout - progression analysis uses Sonnet and can take time
       setProgressionAnalysis(response.data)
       // Update available sessions from response
       if (response.data.available_sessions) {
         setSelectedSessionIds(response.data.session_ids_analyzed || [])
       }
     } catch (err) {
-      setError(err.response?.data?.message || 'Failed to analyze progression')
+      let message
+      if (err.code === 'ERR_NETWORK' || !err.response) {
+        message = 'Cannot reach the server. Check that the backend is running.'
+      } else if (err.response?.status === 500) {
+        message = err.response.data?.error || 'Server error during analysis. The AI service may be unavailable.'
+      } else {
+        message = err.response?.data?.message || err.response?.data?.error || err.message || 'Failed to analyze progression'
+      }
+      setProgressionError(message)
     } finally {
       setLoadingProgression(false)
     }
@@ -173,24 +252,6 @@ function App() {
       return
     }
     analyzeProgression(selectedSessionIds)
-  }
-
-  // AI-powered comparison of two sessions
-  const compareSessionsWithAI = async (sessionId1, sessionId2) => {
-    setLoadingAiComparison(true)
-    setAiComparison(null)
-    try {
-      const response = await axios.post(`${API_BASE_URL}/compare`, {
-        session_id_1: sessionId1,
-        session_id_2: sessionId2
-      })
-      setAiComparison(response.data)
-    } catch (err) {
-      console.error('AI comparison failed:', err)
-      setAiComparison({ error: err.response?.data?.message || 'Comparison failed' })
-    } finally {
-      setLoadingAiComparison(false)
-    }
   }
 
   // Extract metadata from files when selected
@@ -1238,10 +1299,11 @@ function App() {
 
   const skiIQ = getSkiIQ()
 
-  // Save current session to progress log (localStorage + database)
+  // Save current session to progress log (database primary, localStorage cache)
   const saveToProgressLog = async () => {
-    if (!analysis) return
+    if (!analysis || savingSession) return
 
+    setSavingSession(true)
     try {
       // Use session_datetime from CARV screenshot as master timestamp (priority 1)
       // Fall back to sessionDateTime (from EXIF/filename) (priority 2)
@@ -1250,8 +1312,23 @@ function App() {
         sessionDateTime ||
         new Date().toISOString()
 
+      // Save to database first (source of truth)
+      let dbSession = null
+      try {
+        dbSession = await saveSessionToDb({
+          session_date: masterDateTime,
+          location: analysis?.session_overview?.location || null,
+          metrics: analysis,
+          training_plan: trainingPlan,
+          notes: sessionNotes
+        })
+      } catch (err) {
+        console.warn('Database save failed, saving to localStorage only:', err)
+      }
+
       const logEntry = {
-        id: `log-${Date.now()}`,
+        id: dbSession?.id || `log-${Date.now()}`,
+        dbSessionId: dbSession?.id || null,
         datetime: masterDateTime,
         datetimeDisplay: analysis?.session_overview?.session_date_display || null,
         datetimeSource: analysis?.session_overview?.session_datetime ? 'carv_screenshot' :
@@ -1260,7 +1337,6 @@ function App() {
         savedAt: new Date().toISOString(),
         analysis: analysis,
         trainingPlan: trainingPlan,
-        screenshotPreviews: selectedFiles.map(f => f.preview).slice(0, 3), // Save up to 3 previews
         metrics: {
           skiIQ: skiIQ,
           balance: analysis.overall_metrics?.balance,
@@ -1270,21 +1346,8 @@ function App() {
         }
       }
 
-      // Save to localStorage (legacy/backup)
+      // Save to localStorage as cache (no base64 previews)
       setProgressLogs(prev => [...prev, logEntry])
-
-      // Also save to database for AI progression analysis
-      try {
-        await saveSessionToDb({
-          session_date: masterDateTime,
-          location: analysis?.session_overview?.location || null,
-          metrics: analysis,
-          training_plan: trainingPlan,
-          notes: sessionNotes
-        })
-      } catch (err) {
-        console.log('Database save failed, but localStorage save succeeded')
-      }
 
       setShowSaveDialog(false)
       setSessionNotes('')
@@ -1292,24 +1355,43 @@ function App() {
       console.error('Error saving to progress log:', err)
       setError('Failed to save session. Please try again.')
       setShowSaveDialog(false)
+    } finally {
+      setSavingSession(false)
     }
   }
 
-  // Delete a progress log entry
-  const deleteProgressLog = (logId) => {
+  // Delete a progress log entry (from both localStorage and database)
+  const deleteProgressLog = async (logId) => {
+    const logToDelete = progressLogs.find(log => log.id === logId)
+
+    // Remove from localStorage state
     setProgressLogs(prev => prev.filter(log => log.id !== logId))
+
     if (selectedLogForComparison?.id === logId) {
       setSelectedLogForComparison(null)
     }
-    // Update localStorage
-    const updated = progressLogs.filter(log => log.id !== logId)
-    if (updated.length === 0) {
-      localStorage.removeItem(STORAGE_KEY)
+
+    // Remove from database if it has a DB session ID
+    const dbId = logToDelete?.dbSessionId || logId
+    if (dbId) {
+      try {
+        await deleteSessionFromDb(dbId)
+      } catch (err) {
+        console.warn('Failed to delete from database:', err)
+      }
     }
+
+    setDeleteConfirmId(null)
   }
 
   // Load a previous log for viewing
   const loadProgressLog = (log) => {
+    // Warn if current analysis hasn't been saved
+    if (analysis && !progressLogs.some(l => l.analysis === analysis)) {
+      if (!window.confirm('You have an unsaved analysis. Loading a previous session will overwrite it. Continue?')) {
+        return
+      }
+    }
     setAnalysis(log.analysis)
     setTrainingPlan(log.trainingPlan)
     setSessionDateTime(log.datetime)
@@ -1440,7 +1522,13 @@ function App() {
         </div>
         <button
           className="progress-toggle-btn"
-          onClick={() => setShowProgressPanel(!showProgressPanel)}
+          onClick={() => {
+            if (!showProgressPanel) {
+              // Refresh DB sessions when opening panel
+              axios.get(`${API_BASE_URL}/sessions`).then(res => setDbSessions(res.data)).catch(() => {})
+            }
+            setShowProgressPanel(!showProgressPanel)
+          }}
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 12V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h7"/>
@@ -1795,12 +1883,23 @@ function App() {
               </div>
             </div>
             <div className="save-dialog-footer">
-              <button className="btn btn-cancel" onClick={() => setShowSaveDialog(false)}>Cancel</button>
-              <button className="btn btn-save-confirm" onClick={saveToProgressLog}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <polyline points="20 6 9 17 4 12"/>
-                </svg>
-                Save Session
+              <button className="btn btn-cancel" onClick={() => setShowSaveDialog(false)} disabled={savingSession}>Cancel</button>
+              <button className="btn btn-save-confirm" onClick={saveToProgressLog} disabled={savingSession}>
+                {savingSession ? (
+                  <>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="spinning">
+                      <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+                    </svg>
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                    Save Session
+                  </>
+                )}
               </button>
             </div>
           </div>
@@ -1926,25 +2025,32 @@ function App() {
                                 </svg>
                               </button>
                             )}
-                            <button className="delete-btn" onClick={() => deleteProgressLog(log.id)} title="Delete this session">
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                <polyline points="3 6 5 6 21 6"/>
-                                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                                <path d="M10 11v6"/>
-                                <path d="M14 11v6"/>
-                              </svg>
-                            </button>
+                            {deleteConfirmId === log.id ? (
+                              <div className="delete-confirm-inline">
+                                <button className="delete-confirm-yes" onClick={() => deleteProgressLog(log.id)} title="Confirm delete">
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <polyline points="20 6 9 17 4 12"/>
+                                  </svg>
+                                </button>
+                                <button className="delete-confirm-no" onClick={() => setDeleteConfirmId(null)} title="Cancel">
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <line x1="18" y1="6" x2="6" y2="18"/>
+                                    <line x1="6" y1="6" x2="18" y2="18"/>
+                                  </svg>
+                                </button>
+                              </div>
+                            ) : (
+                              <button className="delete-btn" onClick={() => setDeleteConfirmId(log.id)} title="Delete this session">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <polyline points="3 6 5 6 21 6"/>
+                                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                                  <path d="M10 11v6"/>
+                                  <path d="M14 11v6"/>
+                                </svg>
+                              </button>
+                            )}
                           </div>
                         </div>
-
-                        {/* Thumbnails */}
-                        {log.screenshotPreviews?.length > 0 && (
-                          <div className="log-thumbnails">
-                            {log.screenshotPreviews.map((preview, i) => (
-                              <img key={i} src={preview} alt={`Screenshot ${i + 1}`} />
-                            ))}
-                          </div>
-                        )}
 
                         {/* Metrics Summary */}
                         <div className="log-metrics">
@@ -2462,7 +2568,10 @@ function App() {
               </div>
             ) : (
               <div className="progression-error">
-                <p>Could not load progression analysis</p>
+                <p>{progressionError || 'Could not load progression analysis'}</p>
+                <button className="btn btn-save-confirm" onClick={() => analyzeProgression()} style={{ marginTop: '1rem' }}>
+                  Retry Analysis
+                </button>
               </div>
             )}
           </div>

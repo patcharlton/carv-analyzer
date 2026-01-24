@@ -53,6 +53,13 @@ else:
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///carv_sessions.db"
 
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# Connection pool settings to handle Render's free-tier DB sleeping
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_recycle": 300,       # Recycle connections after 5 minutes
+    "pool_pre_ping": True,     # Test connections before using them (detects dead connections)
+    "pool_size": 5,
+    "max_overflow": 10,
+}
 db = SQLAlchemy(app)
 
 
@@ -146,15 +153,27 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 - BIOMECHANICS: Ankle flexion, knee drive, hips stacked over feet
 - TARGET FEELING: "Balanced over the arch of the foot"
 
-**3. Transition Weight Release** - Score 0-100
-- WHAT IT MEASURES: How cleanly you release the old outside ski to start the new turn
-- WHY IT MATTERS: Clean release allows quick edge change and early new edge engagement
+**3. Transition Weight Release (TWR)** - Score 0-100%
+- WHAT IT MEASURES: Vertical G-force variation throughout the turn cycle. Compares peak forces (end of turn) to minimum forces (transition phase).
+- CALCULATION: TWR = (Peak G-force - Trough G-force) / Peak G-force × 100
+- WHY IT MATTERS: High TWR indicates dynamic skiing with strong pressure buildup AND clean release - the hallmark of expert carving. Clean release allows quick edge change and early new edge engagement.
+- SCORE RANGES:
+  * 90-100%: Elite - Full weightlessness achieved in transition. World Cup level dynamics.
+  * 70-89%: Expert - Strong vertical movement. Clean pressure release with good rebound utilization.
+  * 50-69%: Advanced - Moderate dynamics. Room to improve unweighting and pressure buildup.
+  * 30-49%: Intermediate - Static through transition. Limited pressure buildup and release.
+  * Below 30%: Developing - Flat vertical profile. Likely balance or stance issues preventing dynamic movement.
 - LOW SCORE INDICATES:
-  * Hanging onto the old turn too long
-  * Hesitation in transition (fear of commitment)
-  * Not trusting the new outside ski
-- BIOMECHANICS: Active retraction/extension, positive move down the hill
+  * Insufficient pressure buildup during turn (weak peaks)
+  * Failure to release pressure at transition (shallow troughs)
+  * Stiff/upright posture through transition
+  * Mistimed or resisted rebound energy
+- BIOMECHANICS: Active retraction/flexion, rebound utilization, positive move down the hill
 - TARGET FEELING: "Light feet between turns" / "Floating through transition"
+- CROSS-METRIC CORRELATIONS:
+  * Low TWR + Low Edge Angle = Likely fore/aft balance issue (fix balance first)
+  * Low TWR + Good Edge Angle = Transition mechanics issue (fix release technique)
+  * Low TWR + Low Outside Ski Pressure = Weight transfer issue (fix commitment first)
 
 ### EDGING CATEGORY (The Heart of Carving)
 
@@ -264,11 +283,23 @@ ROOT CAUSES:
 CASCADING EFFECTS: Skidded entry, delayed grip, inconsistent turns
 
 ### Low Transition Weight Release Score
-ROOT CAUSES:
-1. Fear of the fall line - not trusting the new turn
-2. Z-turn habit - finishing turn hard, then flat, then next turn
-3. Lack of extension/retraction - static body position
-CASCADING EFFECTS: Choppy transitions, loss of flow, fatigue
+ROOT CAUSE HIERARCHY (diagnose in this order - upstream issues block downstream fixes):
+Level 1 - Fore/Aft Balance (if compromised, blocks everything below):
+  * Inside ski tip lifting = aft stance
+  * Skis "washing out" at turn end = aft stance
+  * Both low peaks AND shallow troughs = fundamental stance issue
+Level 2 - Outside Ski Pressure (if weak, limits pressure buildup):
+  * Low peak G-forces = weak outside ski commitment
+  * Equal pressure both skis = poor weight transfer
+Level 3 - Transition Mechanics (flexion/retraction/rebound skills):
+  * Shallow troughs only = static transition mechanics
+  * Good peaks but shallow troughs = transition technique issue only
+Level 4 - Timing & Rhythm
+DIAGNOSTIC SIGNALS:
+  * Low TWR + Low Edge Angle = Likely fore/aft issue (Level 1)
+  * Low TWR + Good Edge Angle = Transition mechanics issue (Level 3)
+  * Low TWR + Low Outside Ski Pressure = Weight transfer issue (Level 2)
+CASCADING EFFECTS: Choppy transitions, loss of flow, fatigue, inability to build dynamic range
 
 ### Low Centered Balance Score
 ROOT CAUSES:
@@ -471,11 +502,13 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Common Mistake: Leaning into hill for balance instead of angulating
 
 **3. Shuffle Turns**
-- Purpose: Develops independent leg action and balance
-- Execution: Slide inside foot forward, outside foot back during turns
-- Feel: Scissors motion, dynamic leg independence
-- Duration: Full run, green terrain
-- Improves: Parallel Skis, Turn Shape, balance awareness
+- Purpose: Builds awareness of fore/aft range of motion and balance
+- Execution: While skiing, shuffle feet forward/back against each other
+- Variants: Straight line shuffle, two-footed shuffle, shuffle while turning
+- Feel: Distinct pressure shifts along foot length, exploring balance range
+- Duration: Full run, green/blue terrain
+- Improves: Fore/Aft Balance awareness, Centered Balance, proprioception
+- Success Criteria: Can feel distinct pressure shifts along foot length
 
 **4. Pivot Slips**
 - Purpose: Develops rotary control and edge release ability
@@ -535,11 +568,12 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Common Mistake: Bending too much at waist
 
 **11. Tall-Small Transitions**
-- Purpose: Develops extension/flexion timing
-- Execution: Extend tall at turn finish, flex small at turn apex
-- Feel: Up-down rhythm, dynamic range of motion
-- Duration: Full run, exaggerate movement
+- Purpose: Develops flexion/retraction timing for dynamic transitions
+- Execution: Build pressure (tall/strong outside leg) through turn, then actively collapse/flex old outside leg at transition to release. Don't push off - just flex and untip.
+- Feel: Hips stay level through transition, significant vertical separation of skis at crossover
+- Duration: Full run, exaggerate the flex/collapse at transition
 - Improves: Transition Weight Release, Pressure Management
+- Key Point: This is a down-unweighting/retraction pattern, not an extension-push pattern. Collapse to release, don't stand up to release.
 
 **12. Touch the Outside Boot**
 - Purpose: Develops outside ski pressure and forward commitment
@@ -590,11 +624,12 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Improves: Transition Weight Release, Early Edging, G-Force
 
 **18. Dolphin Turns**
-- Purpose: Develops pressure modulation and dynamic range
-- Execution: Flex deep into turn apex, extend through transition
-- Feel: Wave-like body motion, pressure on-off-on
-- Duration: Full runs, flowing terrain
-- Improves: Progressive Edge Build, Turn G-Force, Pressure Management
+- Purpose: Develops dynamic fore/aft cycling through each turn
+- Execution: Pop off ski tails, land on shovels. Back-pedaling motion with feet - push feet forward to pop off tails, pull feet back with heels up to land on shovels
+- Feel: Visible "dolphin" shape to ski trajectory, dynamic fore/aft weight shift
+- Duration: Blue/Black terrain, focus on clean edge change while airborne
+- Improves: Transition Weight Release, Fore/Aft Balance, Dynamic Range
+- Success Criteria: Clean edge change while airborne, visible dolphin trajectory
 
 **19. Speed Carving**
 - Purpose: Develops trust in edge grip at speed
@@ -633,13 +668,143 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Open slope, mark mental gates
 - Improves: All metrics, race application
 
+### TWR-SPECIFIC DRILLS (Organized by Root Cause Level)
+
+#### Level 1: Fore/Aft Balance Drills (Fix First if Balance is Compromised)
+
+**24. Stork Turns**
+- Purpose: Forces forward commitment - cannot execute if aft
+- Execution: Lift inside ski's tail only, keeping tip on snow throughout turn
+- Difficulty: Beginner-Intermediate
+- Terrain: Green/Blue
+- Progression: Start on gentle terrain, increase steepness as competent
+- Improves: Start of Turn, Centered Balance, Transition Weight Release
+- Success Criteria: Can maintain tip contact without losing balance backward
+
+**25. Outside-to-Outside**
+- Purpose: 100% commitment to stance ski, requires forward balance
+- Execution: Lift entire inside ski parallel to snow surface (few inches clearance)
+- Difficulty: Intermediate
+- Terrain: Blue
+- Progression: Start with minimal lift, increase height as balance improves
+- Improves: Outside Ski Pressure, Fore/Aft Balance, Transition Weight Release
+- Common Error: Dragging pole for stability (remove crutch by holding poles at mid-shaft)
+- Success Criteria: Can link 6+ turns with inside ski lifted, no pole assistance
+
+**26. Unbuckled Boots**
+- Purpose: Removes boot cuff as balance crutch. Forces standing on feet, not shins.
+- Execution: Ski with boot buckles open
+- Difficulty: Intermediate
+- Terrain: Green/Easy Blue ONLY
+- Improves: Centered Balance, proprioception, stance awareness
+- Caution: Very easy terrain only. Instant feedback when aft.
+- Success Criteria: Can make controlled turns without relying on boot support
+
+**27. Range of Motion Turns**
+- Purpose: Exploring full fore/aft range, building proprioceptive awareness
+- Execution: Deliberately ski as far forward as possible, then as far aft as possible
+- Difficulty: Intermediate
+- Terrain: Green/Blue ONLY
+- Improves: Fore/Aft Balance awareness, ability to find centered position
+- Caution: Never above blue groomers
+- Success Criteria: Can identify and feel the "centered" position between extremes
+
+#### Level 2: Outside Ski Pressure Drills (Fix if Weak Pressure Buildup)
+
+**28. Single Leg Carving (Basic)**
+- Purpose: Proves full commitment to outside ski
+- Execution: Lift inside ski completely after transition is established
+- Difficulty: Intermediate
+- Terrain: Blue
+- Progression: Lift late in turn → lift mid-turn → lift at transition
+- Improves: Outside Ski Pressure, Transition Weight Release, Edge Angle
+- Success Criteria: Can carve clean arcs on single ski through shaping phase
+
+**29. Single Leg Carving (Advanced)**
+- Purpose: Early weight transfer to new outside ski
+- Execution: Lift inside ski at or before the transition
+- Difficulty: Advanced
+- Terrain: Blue/Black
+- Improves: Transition Weight Release, Early Edging, commitment
+- Success Criteria: Can lift inside ski while still on "wrong" edge, maintain carved arc
+
+**30. Up and Over (Early Stepping)**
+- Purpose: Earliest possible platform on new stance ski
+- Execution: Transfer weight to new outside ski while still on uphill edge (before edge change)
+- Difficulty: Advanced
+- Terrain: Blue/Black
+- Reference: Ted Ligety technique, US Ski Team staple drill
+- Improves: Transition Weight Release, Early Edging, Outside Ski Pressure
+- Success Criteria: Weight commits to new outside ski before that ski changes edges
+
+**31. Skating**
+- Purpose: Learn to tip lower leg to establish edge platform before pushing
+- Execution: Skate on skis without poles
+- Difficulty: Beginner-Intermediate
+- Terrain: Flat/Slight Uphill
+- Best With: Short skis (130cm) or slalom skis
+- Improves: Edge awareness, Outside Ski Pressure, weight transfer timing
+- Success Criteria: Can generate forward momentum through proper edge-then-push sequence
+
+#### Level 3: Transition Mechanics Drills (Fix if Peaks Good but Troughs Shallow)
+
+**32. Hop Drill (Tom Gellie)**
+- Purpose: Building control, lightness, and confidence in unweighting
+- Execution: Hop from one set of edges to the other, exaggerating unweighting
+- Difficulty: Advanced
+- Terrain: Steep Blue/Black (steeper terrain naturally challenges balance, timing, precision)
+- Goal: Skis completely off ground during transition
+- Improves: Transition Weight Release, edge change confidence, athleticism
+- Success Criteria: Can hop cleanly between edge sets with controlled landings
+
+**33. The Power Release**
+- Purpose: Flexing to release, maintaining low position through transition
+- Execution: Wide stance carving. Long/strong outside leg at apex, then actively collapse/flex that leg while keeping hips level.
+- Mechanics: Collapse old outside leg → pull inside boot up → extend new outside leg passively
+- Difficulty: Advanced
+- Terrain: Blue/Black
+- Key Point: Don't push off old outside ski. Just flex and untip.
+- Improves: Transition Weight Release, dynamic range, pressure modulation
+- Success Criteria: Hips stay level through transition, significant vertical separation of skis at crossover
+
+**34. Bounce Turns (Powder Variant)**
+- Purpose: Weightless transition feeling, flow development
+- Execution: Short-radius turns focusing on finding bounce rhythm
+- Difficulty: Intermediate-Advanced
+- Terrain: Powder
+- Adjustments: Experiment with stance width and pressure distribution (outside ski focus vs two-footed platform)
+- Improves: Transition Weight Release, rhythm, flow
+- Success Criteria: Rhythmic "float" feeling between turns in powder
+
+**35. Retraction Practice**
+- Purpose: Down-unweighting, creating weightlessness at transition
+- Execution: At turn's end, actively pull knees toward body
+- Difficulty: Advanced
+- Terrain: Blue/Black
+- Contrast With: Extension release where you stand up through transition
+- Improves: Transition Weight Release, edge change speed, lightness
+- Success Criteria: Skis feel light/weightless at transition, clean edge change
+
+**36. 3-3-3 Balance Drill**
+- Purpose: Refines sensory awareness, develops ability to relocate balance state on demand
+- Execution: 3 turns FORE, 3 turns AFT, 3 turns CENTERED. Repeat.
+- Difficulty: Intermediate
+- Terrain: Blue
+- Variant: Add FORE-to-AFT within single turn (fore at initiation, aft at completion)
+- Improves: Fore/Aft Balance, Centered Balance, proprioceptive awareness
+- Success Criteria: Can consciously shift between balance states while maintaining turn quality
+
 ## DRILL SELECTION FRAMEWORK
 
 Based on the skier's profile, select drills using this logic:
 
 **For Low START OF TURN scores**: Shin Banger, Hands on Knees, Touch Outside Boot
 **For Low CENTERED BALANCE scores**: Javelin Turns, Thousand Steps, No Pole Skiing
-**For Low TRANSITION WEIGHT RELEASE scores**: White Pass Turns, Crossover Focus, Tall-Small
+**For Low TRANSITION WEIGHT RELEASE scores** (diagnose root cause first):
+  - If TWR < 50% AND Edge Angle < 40°: Prioritize Level 1 Fore/Aft drills (Shuffle Turns, Stork Turns, Range of Motion Turns)
+  - If TWR < 50% AND Edge Angle > 40°: Prioritize Level 3 Transition drills (Power Release, Retraction Practice, Hop Drill)
+  - If Outside Ski Pressure < 70%: Prioritize Level 2 drills (Single Leg Carving, Javelin Turns, Up and Over)
+  - If TWR 50-70%: Mix of Level 2 and Level 3 drills (Tall-Small, Dolphin Turns, 3-3-3 Balance)
 **For Low EDGE ANGLE scores**: J-Turns, Angulation Exaggeration, Pole Drag Carving
 **For Low EARLY EDGING scores**: White Pass Turns, Retraction Turns, Hop Transitions
 **For Low EDGING SIMILARITY scores**: Thousand Steps, One-Ski Carving, Javelin Turns (weak side focus)
@@ -1631,7 +1796,12 @@ def create_session():
         if metrics:
             session_overview = metrics.get('session_overview', {})
             ski_iq_range = session_overview.get('ski_iq_range', {})
-            if ski_iq_range.get('min') and ski_iq_range.get('max'):
+            # Try 'average' first, then calculate from 'lowest'/'highest' (AI response keys)
+            if ski_iq_range.get('average'):
+                ski_iq = ski_iq_range['average']
+            elif ski_iq_range.get('lowest') and ski_iq_range.get('highest'):
+                ski_iq = (ski_iq_range['lowest'] + ski_iq_range['highest']) / 2
+            elif ski_iq_range.get('min') and ski_iq_range.get('max'):
                 ski_iq = (ski_iq_range['min'] + ski_iq_range['max']) / 2
 
         session = Session(
