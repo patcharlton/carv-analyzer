@@ -2007,26 +2007,38 @@ def analyze_progression():
                 "message": "Need at least 2 sessions to analyze progression"
             }), 400
 
-        # Build context for Claude - include ALL metrics, don't truncate
+        # Build context for Claude - extract key metrics, keep payload lean for speed
         session_data = []
         for s in sessions:
-            session_data.append({
+            metrics = s.metrics or {}
+            overall = metrics.get('overall_metrics', {})
+            overview = metrics.get('session_overview', {})
+            # Extract just the numerical data and key observations
+            session_entry = {
                 "date": s.session_date.strftime("%Y-%m-%d") if s.session_date else "Unknown",
                 "session_id": s.id,
                 "location": s.location,
-                "ski_iq": s.ski_iq,
-                "metrics": s.metrics,  # Full metrics object
-                "training_plan_summary": s.training_plan[:300] if s.training_plan else None
-            })
+                "ski_iq": overview.get('ski_iq_range', {}).get('average') or s.ski_iq,
+                "terrain": overview.get('terrain_types_seen', []),
+                "turns_analyzed": overview.get('total_turns_analyzed'),
+                "balance": overall.get('balance', {}),
+                "edging": overall.get('edging', {}),
+                "rotary": overall.get('rotary', {}),
+                "performance": overall.get('performance', {}),
+                "top_priorities": [p.get('area') + f" ({p.get('current_score')})" for p in metrics.get('top_3_priorities', []) if p.get('area')],
+                "biggest_limiter": metrics.get('holistic_analysis', {}).get('biggest_limiter', ''),
+                "detailed_observations": metrics.get('detailed_observations', '')[:500]
+            }
+            session_data.append(session_entry)
 
-        # Call Claude for analysis - use Sonnet for better correlation analysis
+        # Call Claude for analysis - use Haiku for speed within Render's timeout
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",  # Better reasoning for correlations
+            model="claude-3-5-haiku-20241022",  # Fast model to stay within Render timeout
             max_tokens=4000,
             messages=[{
                 "role": "user",
                 "content": f"""Analyze this skier's progression across {len(sessions)} sessions.
-IMPORTANT: Extract and analyze ALL metrics from each session. Focus on finding correlations between metrics.
+IMPORTANT: Focus on finding correlations between metrics and how they change over time.
 
 SESSION DATA:
 {json.dumps(session_data, indent=2)}
