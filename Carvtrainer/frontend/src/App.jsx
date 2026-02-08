@@ -203,6 +203,70 @@ function App() {
     }
   }
 
+  // Migration state
+  const [migrating, setMigrating] = useState(false)
+  const [migrationResult, setMigrationResult] = useState(null)
+
+  // Migrate localStorage logs to database
+  const migrateLogsToDatabase = async () => {
+    if (progressLogs.length === 0) {
+      setMigrationResult({ success: false, message: 'No local logs to migrate' })
+      return
+    }
+
+    setMigrating(true)
+    setMigrationResult(null)
+    let migrated = 0
+    let skipped = 0
+    let failed = 0
+
+    for (const log of progressLogs) {
+      // Check if already in database (by matching datetime)
+      const alreadyExists = dbSessions.some(s => {
+        const dbDate = new Date(s.session_date).getTime()
+        const logDate = new Date(log.datetime).getTime()
+        return Math.abs(dbDate - logDate) < 60000 // Within 1 minute
+      })
+
+      if (alreadyExists) {
+        skipped++
+        continue
+      }
+
+      try {
+        const sessionData = {
+          session_date: log.datetime,
+          notes: log.notes || '',
+          metrics: log.analysis || {
+            session_overview: {
+              ski_iq_range: { average: log.metrics?.skiIQ }
+            },
+            overall_metrics: {
+              balance: log.metrics?.balance,
+              edging: log.metrics?.edging,
+              rotary: log.metrics?.rotary,
+              performance: log.metrics?.performance
+            }
+          },
+          training_plan: log.trainingPlan || null
+        }
+
+        const response = await axios.post(`${API_BASE_URL}/sessions`, sessionData)
+        setDbSessions(prev => [response.data, ...prev])
+        migrated++
+      } catch (err) {
+        console.error('Failed to migrate log:', log.id, err)
+        failed++
+      }
+    }
+
+    setMigrating(false)
+    setMigrationResult({
+      success: true,
+      message: `Migration complete: ${migrated} uploaded, ${skipped} already existed, ${failed} failed`
+    })
+  }
+
   // Analyze progression across sessions (all by default, or selected subset)
   const [progressionError, setProgressionError] = useState(null)
   const analyzeProgression = async (sessionIds = null) => {
@@ -2258,6 +2322,35 @@ function App() {
               </div>
             ) : (
               <div className="progress-panel-content">
+                {/* Migration Banner - Show if local logs exist but not all are in DB */}
+                {progressLogs.length > 0 && progressLogs.length > dbSessions.length && (
+                  <div className="migration-banner">
+                    <div className="migration-info">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="17 8 12 3 7 8"/>
+                        <line x1="12" y1="3" x2="12" y2="15"/>
+                      </svg>
+                      <span>{progressLogs.length} local session{progressLogs.length !== 1 ? 's' : ''} found</span>
+                    </div>
+                    <button
+                      className="migrate-btn"
+                      onClick={migrateLogsToDatabase}
+                      disabled={migrating}
+                    >
+                      {migrating ? 'Uploading...' : 'Sync to Cloud'}
+                    </button>
+                  </div>
+                )}
+
+                {/* Migration Result */}
+                {migrationResult && (
+                  <div className={`migration-result ${migrationResult.success ? 'success' : 'error'}`}>
+                    {migrationResult.message}
+                    <button onClick={() => setMigrationResult(null)}>×</button>
+                  </div>
+                )}
+
                 {/* AI Progression Analysis Button */}
                 {dbSessions.length >= 2 && (
                   <div className="progression-analysis-section">
