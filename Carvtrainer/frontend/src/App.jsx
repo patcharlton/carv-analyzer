@@ -39,6 +39,8 @@ function App() {
   const [comparisonLogB, setComparisonLogB] = useState(null)
   const [showComparisonModal, setShowComparisonModal] = useState(false)
   const [deleteConfirmId, setDeleteConfirmId] = useState(null)
+  const [expandedLogId, setExpandedLogId] = useState(null) // For expandable log cards
+  const [selectedMetric, setSelectedMetric] = useState('skiIQ') // For chart metric selection
 
   // Database-backed sessions state
   const [dbSessions, setDbSessions] = useState([])
@@ -2237,27 +2239,11 @@ function App() {
           <div className="progress-panel" onClick={e => e.stopPropagation()}>
             <div className="progress-panel-header">
               <h2>Progress History</h2>
-              <button className="close-btn" onClick={() => setShowProgressPanel(false)}>×</button>
-            </div>
-
-            {/* AI Progression Analysis Button */}
-            {dbSessions.length >= 2 && (
-              <div className="progression-analysis-section">
-                <button
-                  className="progression-btn"
-                  onClick={analyzeProgression}
-                  disabled={loadingProgression}
-                >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M12 20V10"/>
-                    <path d="M18 20V4"/>
-                    <path d="M6 20v-4"/>
-                  </svg>
-                  {loadingProgression ? 'Analyzing...' : 'AI Progression Analysis'}
-                </button>
-                <span className="session-count">{dbSessions.length} sessions tracked</span>
+              <div className="panel-header-actions">
+                <span className="session-badge">{sortedLogs.length} session{sortedLogs.length !== 1 ? 's' : ''}</span>
+                <button className="close-btn" onClick={() => setShowProgressPanel(false)}>×</button>
               </div>
-            )}
+            </div>
 
             {sortedLogs.length === 0 ? (
               <div className="empty-logs">
@@ -2271,7 +2257,25 @@ function App() {
                 <span>Analyze your CARV screenshots and save them to track progress over time</span>
               </div>
             ) : (
-              <>
+              <div className="progress-panel-content">
+                {/* AI Progression Analysis Button */}
+                {dbSessions.length >= 2 && (
+                  <div className="progression-analysis-section">
+                    <button
+                      className="progression-btn"
+                      onClick={analyzeProgression}
+                      disabled={loadingProgression}
+                    >
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M12 20V10"/>
+                        <path d="M18 20V4"/>
+                        <path d="M6 20v-4"/>
+                      </svg>
+                      {loadingProgression ? 'Analyzing...' : 'AI Progression Analysis'}
+                    </button>
+                  </div>
+                )}
+
                 {/* Comparison Selection */}
                 {sortedLogs.length > 1 && selectedLogForComparison && (
                   <div className="comparison-banner">
@@ -2280,158 +2284,341 @@ function App() {
                   </div>
                 )}
 
-                {/* Progress Chart - Simple Ski:IQ over time */}
+                {/* Progression Line Chart */}
                 {sortedLogs.length > 1 && (
                   <div className="progress-chart-container">
-                    <h3>Ski:IQ Progress</h3>
-                    <div className="mini-chart">
-                      {[...sortedLogs].reverse().map((log, idx) => {
-                        const maxIQ = Math.max(...sortedLogs.map(l => l.metrics.skiIQ || 100))
-                        const minIQ = Math.min(...sortedLogs.map(l => l.metrics.skiIQ || 100))
-                        const range = maxIQ - minIQ || 20
-                        const height = log.metrics.skiIQ
-                          ? ((log.metrics.skiIQ - minIQ + 10) / (range + 20)) * 100
-                          : 50
+                    <div className="chart-header">
+                      <h3>Progression Over Time</h3>
+                      <div className="metric-selector">
+                        <select
+                          value={selectedMetric}
+                          onChange={(e) => setSelectedMetric(e.target.value)}
+                          className="metric-select"
+                        >
+                          <option value="skiIQ">Ski:IQ</option>
+                          <option value="balance">Balance</option>
+                          <option value="edging">Edging</option>
+                          <option value="rotary">Rotary</option>
+                          <option value="gforce">G-Force</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="line-chart-container">
+                      {(() => {
+                        const chartLogs = [...sortedLogs].reverse()
+                        const getMetricValue = (log) => {
+                          switch(selectedMetric) {
+                            case 'skiIQ': return log.metrics.skiIQ
+                            case 'balance': return log.metrics.balance?.category_average
+                            case 'edging': return log.metrics.edging?.category_average
+                            case 'rotary': return log.metrics.rotary?.category_average
+                            case 'gforce': return log.metrics.performance?.turn_g_force
+                            default: return log.metrics.skiIQ
+                          }
+                        }
+                        const values = chartLogs.map(l => getMetricValue(l)).filter(v => v != null)
+                        if (values.length < 2) return <div className="no-chart-data">Not enough data for chart</div>
+
+                        const minVal = Math.min(...values) - 5
+                        const maxVal = Math.max(...values) + 5
+                        const range = maxVal - minVal || 20
+                        const width = 340
+                        const height = 120
+                        const padding = { top: 10, right: 10, bottom: 25, left: 35 }
+                        const chartWidth = width - padding.left - padding.right
+                        const chartHeight = height - padding.top - padding.bottom
+
+                        const points = chartLogs.map((log, idx) => {
+                          const val = getMetricValue(log)
+                          if (val == null) return null
+                          const x = padding.left + (idx / (chartLogs.length - 1)) * chartWidth
+                          const y = padding.top + chartHeight - ((val - minVal) / range) * chartHeight
+                          return { x, y, val, date: log.datetime, log }
+                        }).filter(Boolean)
+
+                        const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
+                        const areaD = `${pathD} L ${points[points.length-1].x} ${height - padding.bottom} L ${points[0].x} ${height - padding.bottom} Z`
+
+                        // Calculate trend
+                        const firstVal = values[0]
+                        const lastVal = values[values.length - 1]
+                        const trend = lastVal - firstVal
+
                         return (
-                          <div key={log.id} className="chart-bar-container">
-                            <div
-                              className="chart-bar"
-                              style={{ height: `${height}%` }}
-                              title={`${formatDateTime(log.datetime, log.datetimeDisplay)}: ${log.metrics.skiIQ ? Math.round(log.metrics.skiIQ) : 'N/A'}`}
-                            >
-                              <span className="bar-value">{log.metrics.skiIQ ? Math.round(log.metrics.skiIQ) : '?'}</span>
-                            </div>
-                            <span className="bar-date">{new Date(log.datetime).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
-                          </div>
+                          <svg viewBox={`0 0 ${width} ${height}`} className="line-chart-svg">
+                            {/* Grid lines */}
+                            {[0, 0.25, 0.5, 0.75, 1].map((pct, i) => (
+                              <g key={i}>
+                                <line
+                                  x1={padding.left}
+                                  y1={padding.top + chartHeight * pct}
+                                  x2={width - padding.right}
+                                  y2={padding.top + chartHeight * pct}
+                                  stroke="#e0e0e0"
+                                  strokeWidth="1"
+                                />
+                                <text
+                                  x={padding.left - 5}
+                                  y={padding.top + chartHeight * pct + 4}
+                                  textAnchor="end"
+                                  fontSize="9"
+                                  fill="#999"
+                                >
+                                  {Math.round(maxVal - (range * pct))}
+                                </text>
+                              </g>
+                            ))}
+
+                            {/* Gradient fill under line */}
+                            <defs>
+                              <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" stopColor={trend >= 0 ? "#28a745" : "#dc3545"} stopOpacity="0.3"/>
+                                <stop offset="100%" stopColor={trend >= 0 ? "#28a745" : "#dc3545"} stopOpacity="0.05"/>
+                              </linearGradient>
+                            </defs>
+                            <path d={areaD} fill="url(#chartGradient)" />
+
+                            {/* Line */}
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke={trend >= 0 ? "#28a745" : "#dc3545"}
+                              strokeWidth="2.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+
+                            {/* Data points */}
+                            {points.map((p, i) => (
+                              <g key={i}>
+                                <circle
+                                  cx={p.x}
+                                  cy={p.y}
+                                  r="5"
+                                  fill="white"
+                                  stroke={trend >= 0 ? "#28a745" : "#dc3545"}
+                                  strokeWidth="2"
+                                  className="chart-point"
+                                />
+                                <title>{`${new Date(p.date).toLocaleDateString()}: ${Math.round(p.val)}`}</title>
+                                {/* Date labels for first, middle, last */}
+                                {(i === 0 || i === points.length - 1 || (points.length > 4 && i === Math.floor(points.length / 2))) && (
+                                  <text
+                                    x={p.x}
+                                    y={height - 5}
+                                    textAnchor="middle"
+                                    fontSize="8"
+                                    fill="#666"
+                                  >
+                                    {new Date(p.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                                  </text>
+                                )}
+                              </g>
+                            ))}
+                          </svg>
                         )
-                      })}
+                      })()}
+                    </div>
+                    <div className="chart-summary">
+                      {(() => {
+                        const getMetricValue = (log) => {
+                          switch(selectedMetric) {
+                            case 'skiIQ': return log.metrics.skiIQ
+                            case 'balance': return log.metrics.balance?.category_average
+                            case 'edging': return log.metrics.edging?.category_average
+                            case 'rotary': return log.metrics.rotary?.category_average
+                            case 'gforce': return log.metrics.performance?.turn_g_force
+                            default: return log.metrics.skiIQ
+                          }
+                        }
+                        const chartLogs = [...sortedLogs].reverse()
+                        const values = chartLogs.map(l => getMetricValue(l)).filter(v => v != null)
+                        if (values.length < 2) return null
+                        const firstVal = values[0]
+                        const lastVal = values[values.length - 1]
+                        const trend = lastVal - firstVal
+                        const metricLabels = { skiIQ: 'Ski:IQ', balance: 'Balance', edging: 'Edging', rotary: 'Rotary', gforce: 'G-Force' }
+                        return (
+                          <>
+                            <span className="summary-label">{metricLabels[selectedMetric]} Trend:</span>
+                            <span className={`summary-value ${trend >= 0 ? 'positive' : 'negative'}`}>
+                              {trend >= 0 ? '+' : ''}{trend.toFixed(1)} pts
+                            </span>
+                            <span className="summary-range">({Math.round(firstVal)} → {Math.round(lastVal)})</span>
+                          </>
+                        )
+                      })()}
                     </div>
                   </div>
                 )}
 
-                {/* Logs List */}
+                {/* Logs List - All Sessions */}
                 <div className="logs-list">
+                  <div className="logs-list-header">
+                    <span>All Sessions ({sortedLogs.length})</span>
+                  </div>
                   {sortedLogs.map((log, idx) => {
                     const prevLog = sortedLogs[idx + 1] // Previous chronological log
                     const skiIQChange = prevLog ? getMetricChange(log.metrics.skiIQ, prevLog.metrics.skiIQ) : null
+                    const isExpanded = expandedLogId === log.id
 
                     return (
-                      <div key={log.id} className="log-card">
-                        <div className="log-card-header">
-                          <div className="log-date">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
-                              <line x1="16" y1="2" x2="16" y2="6"/>
-                              <line x1="8" y1="2" x2="8" y2="6"/>
-                              <line x1="3" y1="10" x2="21" y2="10"/>
+                      <div key={log.id} className={`log-card ${isExpanded ? 'expanded' : ''}`}>
+                        <div
+                          className="log-card-header clickable"
+                          onClick={() => setExpandedLogId(isExpanded ? null : log.id)}
+                        >
+                          <div className="log-header-left">
+                            <svg
+                              width="12"
+                              height="12"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              className={`expand-icon ${isExpanded ? 'rotated' : ''}`}
+                            >
+                              <polyline points="9 18 15 12 9 6"/>
                             </svg>
-                            {formatDateTime(log.datetime, log.datetimeDisplay)}
+                            <div className="log-date">
+                              {formatDateTime(log.datetime, log.datetimeDisplay)}
+                            </div>
                           </div>
-                          <div className="log-actions">
-                            {sortedLogs.length > 1 && (
-                              <button
-                                className={`compare-btn ${selectedLogForComparison?.id === log.id ? 'active' : ''}`}
-                                onClick={() => {
-                                  if (selectedLogForComparison) {
-                                    if (selectedLogForComparison.id !== log.id) {
-                                      openComparison(selectedLogForComparison, log)
+                          <div className="log-header-right">
+                            <div className="log-skiiq-badge">
+                              <span className="skiiq-value">{log.metrics.skiIQ ? Math.round(log.metrics.skiIQ) : '?'}</span>
+                              {skiIQChange !== null && (
+                                <span className={`skiiq-change ${skiIQChange >= 0 ? 'positive' : 'negative'}`}>
+                                  {skiIQChange >= 0 ? '+' : ''}{Math.round(skiIQChange)}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {isExpanded && (
+                          <div className="log-card-body">
+                            {/* Metrics Grid */}
+                            <div className="log-metrics-expanded">
+                              <div className="metric-row">
+                                <span className="metric-name">Balance</span>
+                                <div className="metric-bar-container">
+                                  <div
+                                    className="metric-bar"
+                                    style={{ width: `${log.metrics.balance?.category_average || 0}%` }}
+                                  />
+                                </div>
+                                <span className="metric-val">{log.metrics.balance?.category_average ? Math.round(log.metrics.balance.category_average) : '-'}</span>
+                              </div>
+                              <div className="metric-row">
+                                <span className="metric-name">Edging</span>
+                                <div className="metric-bar-container">
+                                  <div
+                                    className="metric-bar edging"
+                                    style={{ width: `${log.metrics.edging?.category_average || 0}%` }}
+                                  />
+                                </div>
+                                <span className="metric-val">{log.metrics.edging?.category_average ? Math.round(log.metrics.edging.category_average) : '-'}</span>
+                              </div>
+                              <div className="metric-row">
+                                <span className="metric-name">Rotary</span>
+                                <div className="metric-bar-container">
+                                  <div
+                                    className="metric-bar rotary"
+                                    style={{ width: `${log.metrics.rotary?.category_average || 0}%` }}
+                                  />
+                                </div>
+                                <span className="metric-val">{log.metrics.rotary?.category_average ? Math.round(log.metrics.rotary.category_average) : '-'}</span>
+                              </div>
+                              <div className="metric-row">
+                                <span className="metric-name">G-Force</span>
+                                <div className="metric-bar-container">
+                                  <div
+                                    className="metric-bar gforce"
+                                    style={{ width: `${log.metrics.performance?.turn_g_force || 0}%` }}
+                                  />
+                                </div>
+                                <span className="metric-val">{log.metrics.performance?.turn_g_force ? Math.round(log.metrics.performance.turn_g_force) : '-'}</span>
+                              </div>
+                            </div>
+
+                            {/* Notes */}
+                            {log.notes && (
+                              <div className="log-notes">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                                  <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                                </svg>
+                                <span>{log.notes}</span>
+                              </div>
+                            )}
+
+                            {/* Action Buttons */}
+                            <div className="log-actions-expanded">
+                              <button className="load-log-btn" onClick={() => loadProgressLog(log)}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                  <circle cx="12" cy="12" r="3"/>
+                                </svg>
+                                View Analysis
+                              </button>
+                              {sortedLogs.length > 1 && (
+                                <button
+                                  className={`compare-log-btn ${selectedLogForComparison?.id === log.id ? 'active' : ''}`}
+                                  onClick={() => {
+                                    if (selectedLogForComparison) {
+                                      if (selectedLogForComparison.id !== log.id) {
+                                        openComparison(selectedLogForComparison, log)
+                                      }
+                                      setSelectedLogForComparison(null)
+                                    } else {
+                                      setSelectedLogForComparison(log)
                                     }
-                                    setSelectedLogForComparison(null)
+                                  }}
+                                >
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <line x1="18" y1="20" x2="18" y2="10"/>
+                                    <line x1="12" y1="20" x2="12" y2="4"/>
+                                    <line x1="6" y1="20" x2="6" y2="14"/>
+                                  </svg>
+                                  {selectedLogForComparison?.id === log.id ? 'Cancel' : 'Compare'}
+                                </button>
+                              )}
+                              <button
+                                className="delete-log-btn"
+                                onClick={() => {
+                                  if (deleteConfirmId === log.id) {
+                                    deleteProgressLog(log.id)
                                   } else {
-                                    setSelectedLogForComparison(log)
+                                    setDeleteConfirmId(log.id)
                                   }
                                 }}
-                                title={selectedLogForComparison ? (selectedLogForComparison.id === log.id ? 'Cancel comparison' : 'Compare with this session') : 'Select to compare'}
                               >
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <line x1="18" y1="20" x2="18" y2="10"/>
-                                  <line x1="12" y1="20" x2="12" y2="4"/>
-                                  <line x1="6" y1="20" x2="6" y2="14"/>
-                                </svg>
+                                {deleteConfirmId === log.id ? (
+                                  <>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                      <polyline points="20 6 9 17 4 12"/>
+                                    </svg>
+                                    Confirm
+                                  </>
+                                ) : (
+                                  <>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                      <polyline points="3 6 5 6 21 6"/>
+                                      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                                    </svg>
+                                    Delete
+                                  </>
+                                )}
                               </button>
-                            )}
-                            {deleteConfirmId === log.id ? (
-                              <div className="delete-confirm-inline">
-                                <button className="delete-confirm-yes" onClick={() => deleteProgressLog(log.id)} title="Confirm delete">
-                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                    <polyline points="20 6 9 17 4 12"/>
-                                  </svg>
-                                </button>
-                                <button className="delete-confirm-no" onClick={() => setDeleteConfirmId(null)} title="Cancel">
-                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                    <line x1="18" y1="6" x2="6" y2="18"/>
-                                    <line x1="6" y1="6" x2="18" y2="18"/>
-                                  </svg>
-                                </button>
-                              </div>
-                            ) : (
-                              <button className="delete-btn" onClick={() => setDeleteConfirmId(log.id)} title="Delete this session">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <polyline points="3 6 5 6 21 6"/>
-                                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                                  <path d="M10 11v6"/>
-                                  <path d="M14 11v6"/>
-                                </svg>
-                              </button>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Metrics Summary */}
-                        <div className="log-metrics">
-                          <div className="log-metric-item main">
-                            <span className="metric-label">Ski:IQ</span>
-                            <span className="metric-value">{log.metrics.skiIQ ? Math.round(log.metrics.skiIQ) : 'N/A'}</span>
-                            {skiIQChange !== null && (
-                              <span className={`metric-change ${skiIQChange >= 0 ? 'positive' : 'negative'}`}>
-                                {skiIQChange >= 0 ? '+' : ''}{Math.round(skiIQChange)}
-                              </span>
-                            )}
-                          </div>
-                          <div className="log-metric-grid">
-                            <div className="log-metric-item">
-                              <span className="metric-label">Balance</span>
-                              <span className="metric-value">{log.metrics.balance?.category_average ? Math.round(log.metrics.balance.category_average) : 'N/A'}</span>
                             </div>
-                            <div className="log-metric-item">
-                              <span className="metric-label">Edging</span>
-                              <span className="metric-value">{log.metrics.edging?.category_average ? Math.round(log.metrics.edging.category_average) : 'N/A'}</span>
-                            </div>
-                            <div className="log-metric-item">
-                              <span className="metric-label">Rotary</span>
-                              <span className="metric-value">{log.metrics.rotary?.category_average ? Math.round(log.metrics.rotary.category_average) : 'N/A'}</span>
-                            </div>
-                            <div className="log-metric-item">
-                              <span className="metric-label">G-Force</span>
-                              <span className="metric-value">{log.metrics.performance?.turn_g_force ? Math.round(log.metrics.performance.turn_g_force) : 'N/A'}</span>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Notes */}
-                        {log.notes && (
-                          <div className="log-notes">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                              <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                            </svg>
-                            {log.notes}
                           </div>
                         )}
-
-                        {/* Load Button */}
-                        <button className="load-log-btn" onClick={() => loadProgressLog(log)}>
-                          View Full Analysis
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <line x1="5" y1="12" x2="19" y2="12"/>
-                            <polyline points="12 5 19 12 12 19"/>
-                          </svg>
-                        </button>
                       </div>
                     )
                   })}
                 </div>
-              </>
+              </div>
             )}
           </div>
         </div>

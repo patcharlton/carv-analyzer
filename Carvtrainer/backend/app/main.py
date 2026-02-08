@@ -492,6 +492,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: 2-3 runs, green/easy blue terrain
 - Improves: Centered Balance, Weight Release, Edging Similarity
 - Common Mistake: Steps too big - keep them small and quick
+- Video: https://www.youtube.com/results?search_query=1000+steps+ski+drill+carving
 
 **2. Javelin Turns**
 - Purpose: Forces commitment to outside ski, eliminates inside ski dependency
@@ -500,6 +501,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: 5-8 turns each side, moderate blue terrain
 - Improves: Edge Angle, Start of Turn, Centered Balance
 - Common Mistake: Leaning into hill for balance instead of angulating
+- Video: https://www.youtube.com/results?search_query=javelin+turns+ski+drill+carving
 
 **3. Shuffle Turns**
 - Purpose: Builds awareness of fore/aft range of motion and balance
@@ -509,6 +511,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Full run, green/blue terrain
 - Improves: Fore/Aft Balance awareness, Centered Balance, proprioception
 - Success Criteria: Can feel distinct pressure shifts along foot length
+- Video: https://www.youtube.com/results?search_query=shuffle+turns+ski+drill+balance
 
 **4. Pivot Slips**
 - Purpose: Develops rotary control and edge release ability
@@ -516,6 +519,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Controlled sliding, precise edge control
 - Duration: 10 pivots each direction
 - Improves: Transition Weight Release, edge awareness
+- Video: https://www.youtube.com/results?search_query=pivot+slips+ski+drill+edge+control
 
 ### EDGE ANGLE DEVELOPMENT DRILLS
 
@@ -526,6 +530,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Full runs, focus on quality not quantity
 - Improves: Edge Angle, Turn Shape, Progressive Edge Build
 - Common Mistake: Going too fast - start slow, prioritize clean tracks
+- Video: https://www.youtube.com/results?search_query=railroad+track+carving+ski+drill
 
 **6. J-Turns (Edge Lock Drill)**
 - Purpose: Maximizes edge angle commitment
@@ -533,6 +538,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Maximum edge engagement, G-force building, ski bending
 - Duration: 5 each direction, moderate pitch
 - Improves: Edge Angle, Progressive Edge Build, commitment
+- Video: https://www.youtube.com/results?search_query=j+turns+edge+lock+ski+drill+carving
 
 **7. Angulation Exaggeration**
 - Purpose: Develops hip angulation for higher edge angles
@@ -541,6 +547,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: 4-6 turns each direction
 - Improves: Edge Angle, Centered Balance
 - Common Mistake: Bending at waist instead of creating hip angle
+- Video: https://www.youtube.com/results?search_query=angulation+drill+skiing+hip+angulation
 
 **8. Pole Drag Carving**
 - Purpose: Forces upper body countering and angulation
@@ -548,6 +555,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Upper body stays facing downhill, separation from lower body
 - Duration: Full run
 - Improves: Edge Angle, Turn Shape, upper/lower body separation
+- Video: https://www.youtube.com/results?search_query=pole+drag+carving+ski+drill
 
 ### BALANCE & FORE-AFT DRILLS
 
@@ -558,6 +566,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Every turn, conscious focus
 - Improves: Start of Turn, Centered Balance
 - Cue: "Crush the tongue"
+- Video: https://www.youtube.com/results?search_query=shin+pressure+boot+tongue+ski+drill+forward+stance
 
 **10. Hands on Knees Turns**
 - Purpose: Forces forward stance and commitment
@@ -566,6 +575,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: 4-6 turns, easy terrain
 - Improves: Start of Turn, Centered Balance
 - Common Mistake: Bending too much at waist
+- Video: https://www.youtube.com/results?search_query=hands+on+knees+ski+drill+forward+stance
 
 **11. Tall-Small Transitions**
 - Purpose: Develops flexion/retraction timing for dynamic transitions
@@ -574,6 +584,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Full run, exaggerate the flex/collapse at transition
 - Improves: Transition Weight Release, Pressure Management
 - Key Point: This is a down-unweighting/retraction pattern, not an extension-push pattern. Collapse to release, don't stand up to release.
+- Video: https://www.youtube.com/results?search_query=tall+small+transitions+ski+drill+retraction
 
 **12. Touch the Outside Boot**
 - Purpose: Develops outside ski pressure and forward commitment
@@ -581,6 +592,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Weight over outside ski, forward and low
 - Duration: Alternating turns
 - Improves: Start of Turn, Centered Balance, Edge Angle
+- Video: https://www.youtube.com/results?search_query=touch+outside+boot+ski+drill+carving
 
 ### TRANSITION & FLOW DRILLS
 
@@ -591,6 +603,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Focus drill, 6-8 turns
 - Improves: Transition Weight Release, Early Edging
 - Common Mistake: Finishing old turn completely before starting new
+- Video: https://www.youtube.com/results?search_query=white+pass+turns+ski+drill+early+weight+transfer
 
 **14. Crossover Focus**
 - Purpose: Develops positive movement into new turn
@@ -599,6 +612,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Every transition, conscious awareness
 - Improves: Transition Weight Release, Early Edging
 - Cue: "Fall into the new turn"
+- Video: https://www.youtube.com/results?search_query=crossover+skiing+drill+center+of+mass+transition
 
 **15. No Pole Skiing**
 - Purpose: Develops balance without pole crutch
@@ -606,6 +620,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Pure balance, can't push off anything
 - Duration: Full runs
 - Improves: Centered Balance, Core engagement
+- Video: https://www.youtube.com/results?search_query=no+pole+skiing+drill+balance
 
 **16. Patience Turns**
 - Purpose: Develops complete turn finish and clean transitions
@@ -613,6 +628,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: No rushing, complete the arc
 - Duration: Focus on slow rhythmic skiing
 - Improves: Turn Shape, Transition Weight Release
+- Video: https://www.youtube.com/results?search_query=patience+turns+ski+drill+complete+turn+shape
 
 ### ADVANCED PERFORMANCE DRILLS
 
@@ -622,6 +638,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Light feet at crossover, snappy transition
 - Duration: Moderate to steep terrain
 - Improves: Transition Weight Release, Early Edging, G-Force
+- Video: https://www.youtube.com/results?search_query=retraction+turns+ski+drill+edge+change
 
 **18. Dolphin Turns**
 - Purpose: Develops dynamic fore/aft cycling through each turn
@@ -630,6 +647,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Duration: Blue/Black terrain, focus on clean edge change while airborne
 - Improves: Transition Weight Release, Fore/Aft Balance, Dynamic Range
 - Success Criteria: Clean edge change while airborne, visible dolphin trajectory
+- Video: https://www.youtube.com/results?search_query=dolphin+turns+ski+drill+dynamic+fore+aft
 
 **19. Speed Carving**
 - Purpose: Develops trust in edge grip at speed
@@ -637,6 +655,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Acceleration through the arc, G-forces building
 - Duration: Open blue/black runs
 - Improves: Edge Angle, Turn G-Force, confidence
+- Video: https://www.youtube.com/results?search_query=speed+carving+ski+high+edge+angle+GS+turns
 
 **20. Variable Radius Carving**
 - Purpose: Develops ability to adjust turn shape
@@ -644,6 +663,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Adjustable pressure/edge, ski bending different amounts
 - Duration: Full runs
 - Improves: Progressive Edge Build, Turn Shape, versatility
+- Video: https://www.youtube.com/results?search_query=variable+radius+carving+ski+short+long+turns
 
 ### HIGH-PERFORMANCE DRILLS
 
@@ -653,6 +673,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Explosive, athletic, immediate edge engagement
 - Duration: Steep terrain, short sections
 - Improves: Early Edging, Transition Weight Release, athleticism
+- Video: https://www.youtube.com/results?search_query=hop+transitions+ski+drill+edge+change+carving
 
 **22. One-Ski Carving**
 - Purpose: Ultimate balance and edge control test
@@ -660,6 +681,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Total commitment, no backup
 - Duration: Easy terrain, 3-4 turns per side
 - Improves: Edge Angle, Centered Balance, balance mastery
+- Video: https://www.youtube.com/results?search_query=one+ski+carving+drill+single+ski+balance
 
 **23. Gate Training Simulation**
 - Purpose: Develops race-timing and line
@@ -667,6 +689,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Feel: Early pressure, round the gate, explode out
 - Duration: Open slope, mark mental gates
 - Improves: All metrics, race application
+- Video: https://www.youtube.com/results?search_query=gate+training+simulation+ski+racing+drill
 
 ### TWR-SPECIFIC DRILLS (Organized by Root Cause Level)
 
@@ -680,6 +703,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Progression: Start on gentle terrain, increase steepness as competent
 - Improves: Start of Turn, Centered Balance, Transition Weight Release
 - Success Criteria: Can maintain tip contact without losing balance backward
+- Video: https://www.youtube.com/results?search_query=stork+turns+ski+drill+inside+ski+tip
 
 **25. Outside-to-Outside**
 - Purpose: 100% commitment to stance ski, requires forward balance
@@ -690,6 +714,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Improves: Outside Ski Pressure, Fore/Aft Balance, Transition Weight Release
 - Common Error: Dragging pole for stability (remove crutch by holding poles at mid-shaft)
 - Success Criteria: Can link 6+ turns with inside ski lifted, no pole assistance
+- Video: https://www.youtube.com/results?search_query=outside+ski+to+outside+ski+drill+carving
 
 **26. Unbuckled Boots**
 - Purpose: Removes boot cuff as balance crutch. Forces standing on feet, not shins.
@@ -699,6 +724,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Improves: Centered Balance, proprioception, stance awareness
 - Caution: Very easy terrain only. Instant feedback when aft.
 - Success Criteria: Can make controlled turns without relying on boot support
+- Video: https://www.youtube.com/results?search_query=unbuckled+boots+ski+drill+balance+proprioception
 
 **27. Range of Motion Turns**
 - Purpose: Exploring full fore/aft range, building proprioceptive awareness
@@ -708,6 +734,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Improves: Fore/Aft Balance awareness, ability to find centered position
 - Caution: Never above blue groomers
 - Success Criteria: Can identify and feel the "centered" position between extremes
+- Video: https://www.youtube.com/results?search_query=range+of+motion+ski+drill+fore+aft+balance
 
 #### Level 2: Outside Ski Pressure Drills (Fix if Weak Pressure Buildup)
 
@@ -719,6 +746,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Progression: Lift late in turn → lift mid-turn → lift at transition
 - Improves: Outside Ski Pressure, Transition Weight Release, Edge Angle
 - Success Criteria: Can carve clean arcs on single ski through shaping phase
+- Video: https://www.youtube.com/results?search_query=single+leg+carving+outside+ski+drill
 
 **29. Single Leg Carving (Advanced)**
 - Purpose: Early weight transfer to new outside ski
@@ -727,6 +755,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Terrain: Blue/Black
 - Improves: Transition Weight Release, Early Edging, commitment
 - Success Criteria: Can lift inside ski while still on "wrong" edge, maintain carved arc
+- Video: https://www.youtube.com/results?search_query=advanced+single+ski+carving+early+weight+transfer
 
 **30. Up and Over (Early Stepping)**
 - Purpose: Earliest possible platform on new stance ski
@@ -736,6 +765,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Reference: Ted Ligety technique, US Ski Team staple drill
 - Improves: Transition Weight Release, Early Edging, Outside Ski Pressure
 - Success Criteria: Weight commits to new outside ski before that ski changes edges
+- Video: https://www.youtube.com/results?search_query=up+and+over+early+stepping+ski+drill+ted+ligety
 
 **31. Skating**
 - Purpose: Learn to tip lower leg to establish edge platform before pushing
@@ -745,6 +775,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Best With: Short skis (130cm) or slalom skis
 - Improves: Edge awareness, Outside Ski Pressure, weight transfer timing
 - Success Criteria: Can generate forward momentum through proper edge-then-push sequence
+- Video: https://www.youtube.com/results?search_query=skating+on+skis+drill+edge+platform+weight+transfer
 
 #### Level 3: Transition Mechanics Drills (Fix if Peaks Good but Troughs Shallow)
 
@@ -756,6 +787,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Goal: Skis completely off ground during transition
 - Improves: Transition Weight Release, edge change confidence, athleticism
 - Success Criteria: Can hop cleanly between edge sets with controlled landings
+- Video: https://www.youtube.com/results?search_query=tom+gellie+hop+drill+skiing+edge+change
 
 **33. The Power Release**
 - Purpose: Flexing to release, maintaining low position through transition
@@ -766,6 +798,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Key Point: Don't push off old outside ski. Just flex and untip.
 - Improves: Transition Weight Release, dynamic range, pressure modulation
 - Success Criteria: Hips stay level through transition, significant vertical separation of skis at crossover
+- Video: https://www.youtube.com/results?search_query=power+release+ski+drill+flex+retraction+transition
 
 **34. Bounce Turns (Powder Variant)**
 - Purpose: Weightless transition feeling, flow development
@@ -775,6 +808,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Adjustments: Experiment with stance width and pressure distribution (outside ski focus vs two-footed platform)
 - Improves: Transition Weight Release, rhythm, flow
 - Success Criteria: Rhythmic "float" feeling between turns in powder
+- Video: https://www.youtube.com/results?search_query=bounce+turns+powder+skiing+rhythm+drill
 
 **35. Retraction Practice**
 - Purpose: Down-unweighting, creating weightlessness at transition
@@ -784,6 +818,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Contrast With: Extension release where you stand up through transition
 - Improves: Transition Weight Release, edge change speed, lightness
 - Success Criteria: Skis feel light/weightless at transition, clean edge change
+- Video: https://www.youtube.com/results?search_query=retraction+release+skiing+down+unweighting+transition
 
 **36. 3-3-3 Balance Drill**
 - Purpose: Refines sensory awareness, develops ability to relocate balance state on demand
@@ -793,6 +828,7 @@ This analysis represents data from {num_runs} screenshot(s) giving us a complete
 - Variant: Add FORE-to-AFT within single turn (fore at initiation, aft at completion)
 - Improves: Fore/Aft Balance, Centered Balance, proprioceptive awareness
 - Success Criteria: Can consciously shift between balance states while maintaining turn quality
+- Video: https://www.youtube.com/results?search_query=3-3-3+balance+drill+skiing+fore+aft+centered
 
 ## DRILL SELECTION FRAMEWORK
 
@@ -874,6 +910,7 @@ YOU MUST INCLUDE EXACTLY 3 DRILLS with full details. Select from the Drill Libra
   - [Mistake 1 and how to fix it]
   - [Mistake 2 and how to fix it]
 - **Make It Harder**: [How to progress as they improve]
+- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
 
 ### Drill 2: [Name] - Secondary Focus
 - **Target Metric**: [The CARV metric this improves]
@@ -889,6 +926,7 @@ YOU MUST INCLUDE EXACTLY 3 DRILLS with full details. Select from the Drill Libra
 - **Mental Cue**: [3-5 word phrase]
 - **Common Mistakes**:
   - [Mistake and fix]
+- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
 
 ### Drill 3: [Name] - Integration/Refinement
 - **Target Metric**: [The CARV metric this improves]
@@ -902,6 +940,7 @@ YOU MUST INCLUDE EXACTLY 3 DRILLS with full details. Select from the Drill Libra
 - **Runs**: [X runs], [X focused turns per run]
 - **Success Feels Like**: [Specific physical sensations]
 - **Mental Cue**: [3-5 word phrase]
+- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
 
 ## Daily Session Plan (10 Runs)
 
@@ -1526,8 +1565,8 @@ def generate_training_plan():
 
         # Call Claude API for training plan (using Haiku for speed on Render's 30s timeout)
         response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=4000,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=6000,
             messages=[
                 {
                     "role": "user",
@@ -1551,6 +1590,7 @@ When creating training plans:
 6. Be encouraging but honest about what needs work
 7. Use actual scores from the analysis
 8. Structure sessions: Warm-up → Focus Phase → Integration → Cool-down
+9. For EVERY drill recommended, include the YouTube video search link from the drill's Video field as a clickable reference (format: [Watch examples](URL))
 
 Key principles:
 - Quality over quantity (10 perfect turns beat 100 sloppy ones)
@@ -1760,7 +1800,7 @@ def chat():
 
         # Call Claude API
         response = client.messages.create(
-            model="claude-3-5-haiku-20241022",  # Fast for chat
+            model="claude-haiku-4-5-20251001",  # Fast for chat
             max_tokens=1500,
             messages=messages,
             system=f"""You are Coach Carv, an elite ski coach and carving expert with decades of experience training recreational skiers to advanced racers. You have deep knowledge of CARV technology and biomechanics.
@@ -1792,6 +1832,7 @@ def chat():
 - Keep responses concise but thorough (2-4 paragraphs typically)
 - Use bullet points for drills or multiple tips
 - Include 1-2 specific drills when relevant
+- When recommending drills, include the YouTube video search link from the drill's Video field as a clickable reference (format: [Watch examples](URL))
 - End with a clear actionable takeaway when appropriate
 - When session data is available, reference specific metrics
 
@@ -2092,7 +2133,7 @@ def analyze_progression():
 
         # Call Claude for analysis - use Haiku for speed within Render's timeout
         response = client.messages.create(
-            model="claude-3-5-haiku-20241022",  # Fast model to stay within Render timeout
+            model="claude-haiku-4-5-20251001",  # Fast model to stay within Render timeout
             max_tokens=4000,
             messages=[{
                 "role": "user",
@@ -2170,7 +2211,7 @@ def compare_sessions():
 
         # Call Claude for comparison
         response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1500,
             messages=[{
                 "role": "user",
