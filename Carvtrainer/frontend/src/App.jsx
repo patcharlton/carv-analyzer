@@ -459,6 +459,171 @@ function App() {
     }
   }
 
+  // Export analysis results to text file
+  const exportAnalysisToFile = () => {
+    if (!analysis) {
+      setError('No analysis data to export')
+      return
+    }
+
+    const lines = []
+    const divider = '═'.repeat(60)
+    const subDivider = '─'.repeat(40)
+
+    // Header
+    lines.push(divider)
+    lines.push('CARV SKIING ANALYSIS REPORT')
+    lines.push(divider)
+    lines.push('')
+
+    // Session Overview
+    if (analysis.session_overview) {
+      lines.push('SESSION OVERVIEW')
+      lines.push(subDivider)
+      if (analysis.session_overview.session_date_display) {
+        lines.push(`Date: ${analysis.session_overview.session_date_display}`)
+      }
+      if (analysis.session_overview.ski_iq_range) {
+        const range = analysis.session_overview.ski_iq_range
+        lines.push(`Ski:IQ Range: ${range.lowest} - ${range.highest} (Average: ${range.average})`)
+      }
+      if (analysis.session_overview.total_turns_analyzed) {
+        lines.push(`Total Turns Analyzed: ${analysis.session_overview.total_turns_analyzed}`)
+      }
+      if (analysis.session_overview.terrain_types_seen?.length > 0) {
+        lines.push(`Terrain Types: ${analysis.session_overview.terrain_types_seen.join(', ')}`)
+      }
+      lines.push(`Screenshots Analyzed: ${analysis.num_screenshots || 'N/A'}`)
+      lines.push('')
+    }
+
+    // Holistic Analysis
+    if (analysis.holistic_analysis) {
+      lines.push('SKIING PROFILE')
+      lines.push(subDivider)
+      if (analysis.holistic_analysis.skiing_style) {
+        lines.push(`Skiing Style: ${analysis.holistic_analysis.skiing_style}`)
+      }
+      if (analysis.holistic_analysis.technique_signature) {
+        lines.push(`Technique Signature: ${analysis.holistic_analysis.technique_signature}`)
+      }
+      if (analysis.holistic_analysis.consistency_assessment) {
+        lines.push(`Consistency: ${analysis.holistic_analysis.consistency_assessment}`)
+      }
+      if (analysis.holistic_analysis.biggest_limiter) {
+        lines.push(`Biggest Limiter: ${analysis.holistic_analysis.biggest_limiter}`)
+      }
+      if (analysis.holistic_analysis.hidden_strength) {
+        lines.push(`Hidden Strength: ${analysis.holistic_analysis.hidden_strength}`)
+      }
+      lines.push('')
+    }
+
+    // Detailed Observations
+    if (analysis.detailed_observations) {
+      lines.push('DETAILED ANALYSIS')
+      lines.push(subDivider)
+      lines.push(analysis.detailed_observations)
+      lines.push('')
+    }
+
+    // Overall Metrics
+    if (analysis.overall_metrics) {
+      lines.push('OVERALL METRICS')
+      lines.push(subDivider)
+
+      const formatMetricCategory = (name, metrics) => {
+        if (!metrics) return
+        lines.push(`\n${name}:`)
+        Object.entries(metrics).forEach(([key, value]) => {
+          if (value !== null && value !== undefined) {
+            const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+            lines.push(`  ${label}: ${typeof value === 'number' ? value.toFixed(1) : value}`)
+          }
+        })
+      }
+
+      formatMetricCategory('Balance', analysis.overall_metrics.balance)
+      formatMetricCategory('Edging', analysis.overall_metrics.edging)
+      formatMetricCategory('Rotary', analysis.overall_metrics.rotary)
+      formatMetricCategory('Performance', analysis.overall_metrics.performance)
+      lines.push('')
+    }
+
+    // Top 3 Strengths
+    if (analysis.top_3_strengths?.length > 0) {
+      lines.push('TOP 3 STRENGTHS')
+      lines.push(subDivider)
+      analysis.top_3_strengths.forEach((strength, idx) => {
+        lines.push(`${idx + 1}. ${strength.metric || 'Strength'}`)
+        if (strength.observation) lines.push(`   ${strength.observation}`)
+        if (strength.impact) lines.push(`   Impact: ${strength.impact}`)
+      })
+      lines.push('')
+    }
+
+    // Top 3 Priorities
+    if (analysis.top_3_priorities?.length > 0) {
+      lines.push('TOP 3 PRIORITIES FOR IMPROVEMENT')
+      lines.push(subDivider)
+      analysis.top_3_priorities.forEach((priority, idx) => {
+        lines.push(`${idx + 1}. ${priority.metric || 'Priority'}`)
+        if (priority.current_issue) lines.push(`   Current Issue: ${priority.current_issue}`)
+        if (priority.root_cause) lines.push(`   Root Cause: ${priority.root_cause}`)
+        if (priority.specific_drill) lines.push(`   Drill: ${priority.specific_drill}`)
+        if (priority.success_metric) lines.push(`   Success Metric: ${priority.success_metric}`)
+      })
+      lines.push('')
+    }
+
+    // Run-by-Run Notes
+    if (analysis.run_by_run_notes?.length > 0) {
+      lines.push('RUN-BY-RUN NOTES')
+      lines.push(subDivider)
+      analysis.run_by_run_notes.forEach((note, idx) => {
+        lines.push(`Run ${idx + 1}:`)
+        if (note.ski_iq) lines.push(`  Ski:IQ: ${note.ski_iq}`)
+        if (note.terrain) lines.push(`  Terrain: ${note.terrain}`)
+        if (note.highlight) lines.push(`  Highlight: ${note.highlight}`)
+        if (note.focus_area) lines.push(`  Focus Area: ${note.focus_area}`)
+        lines.push('')
+      })
+    }
+
+    // Training Plan (if available)
+    if (trainingPlan) {
+      lines.push(divider)
+      lines.push('TRAINING PLAN')
+      lines.push(divider)
+      lines.push(trainingPlan)
+      lines.push('')
+    }
+
+    // Footer
+    lines.push(divider)
+    lines.push(`Exported: ${new Date().toLocaleString()}`)
+    lines.push('Generated by CARV Trainer AI')
+    lines.push(divider)
+
+    // Create and download file
+    const content = lines.join('\n')
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+
+    // Generate filename with date
+    const dateStr = analysis.session_overview?.session_datetime
+      ? new Date(analysis.session_overview.session_datetime).toISOString().split('T')[0]
+      : new Date().toISOString().split('T')[0]
+    link.download = `carv-analysis-${dateStr}.txt`
+
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
   // Send chat message
   const sendChatMessage = async () => {
     if (!chatInput.trim() || chatLoading) return
@@ -697,10 +862,16 @@ function App() {
             terrain: '',
             successFeels: '',
             commonMistake: '',
-            progression: ''
+            progression: '',
+            videoUrl: ''
           }
           lines.forEach(line => {
             const cleanLine = line.replace(/^-\s*/, '').replace(/\*\*/g, '')
+            // Check for markdown video link format: [Watch examples](URL)
+            const mdLinkMatch = line.match(/\[Watch[^\]]*\]\((https?:\/\/[^)]+)\)/)
+            if (mdLinkMatch) {
+              drill.videoUrl = mdLinkMatch[1]
+            }
             if (line.includes(':')) {
               const colonIdx = cleanLine.indexOf(':')
               const label = cleanLine.substring(0, colonIdx).toLowerCase()
@@ -708,13 +879,17 @@ function App() {
 
               if (label.includes('target metric')) drill.targetMetric = value
               if (label.includes('why this drill')) drill.why = value
-              if (label.includes('execution')) drill.execution = value
-              if (label.includes('runs per session')) drill.runsPerSession = value
+              if (label.includes('execution') || label.includes('how to do it')) drill.execution = value
+              if (label.includes('runs per session') || (label.includes('runs') && !label.includes('run'))) drill.runsPerSession = value
               if (label.includes('turns per run')) drill.turnsPerRun = value
               if (label.includes('terrain')) drill.terrain = value
               if (label.includes('success feels')) drill.successFeels = value
               if (label.includes('common mistake')) drill.commonMistake = value
-              if (label.includes('progression')) drill.progression = value
+              if (label.includes('make it harder') || label.includes('progression')) drill.progression = value
+              if (label.includes('video') || label.includes('watch')) {
+                const urlMatch = value.match(/https?:\/\/[^\s\])]+ /)?.[0]?.trim() || value.match(/https?:\/\/[^\s\])]+/)?.[0] || ''
+                drill.videoUrl = urlMatch || value.replace(/[\[\]()]/g, '').trim()
+              }
             }
             // Get drill name from first line or header remnant
             if (!drill.name && lines.indexOf(line) === 0) {
@@ -819,10 +994,116 @@ function App() {
     return sections
   }
 
+  // Extract search query from YouTube URL and build embed URL
+  const getYouTubeSearchQuery = (url) => {
+    if (!url) return null
+    try {
+      const urlObj = new URL(url)
+      return urlObj.searchParams.get('search_query') || urlObj.searchParams.get('q') || null
+    } catch {
+      return null
+    }
+  }
+
+  // Render chat/text content with embedded YouTube videos
+  const renderContentWithVideos = (text) => {
+    if (!text) return null
+    // Split by YouTube URLs (both search and watch URLs)
+    const urlRegex = /(https?:\/\/(?:www\.)?youtube\.com\/(?:results\?search_query=[^\s)]+|watch\?v=[^\s)]+))/g
+    const mdLinkRegex = /\[([^\]]+)\]\((https?:\/\/(?:www\.)?youtube\.com\/(?:results\?search_query=[^\s)]+|watch\?v=[^\s)]+))\)/g
+
+    // First, replace markdown links with a placeholder
+    let processed = text
+    const videoLinks = []
+    let match
+
+    // Collect all YouTube markdown links
+    while ((match = mdLinkRegex.exec(text)) !== null) {
+      videoLinks.push({ label: match[1], url: match[2], fullMatch: match[0] })
+    }
+
+    // Collect bare YouTube URLs not in markdown format
+    const bareUrlRegex = /(?<!\()(?<!\])(https?:\/\/(?:www\.)?youtube\.com\/(?:results\?search_query=[^\s)]+|watch\?v=[^\s)]+))/g
+    while ((match = bareUrlRegex.exec(text)) !== null) {
+      // Check it's not already part of a markdown link
+      if (!videoLinks.some(v => v.url === match[1])) {
+        videoLinks.push({ label: 'Watch Video', url: match[1], fullMatch: match[1] })
+      }
+    }
+
+    if (videoLinks.length === 0) {
+      // No YouTube links, render as formatted text
+      return text.split('\n').map((line, i) => {
+        if (line.startsWith('**') && line.endsWith('**')) {
+          return <p key={i}><strong>{line.replace(/\*\*/g, '')}</strong></p>
+        }
+        if (line.startsWith('- ')) {
+          return <p key={i} style={{paddingLeft: '12px'}}>{'• ' + line.slice(2)}</p>
+        }
+        if (line.trim() === '') return <br key={i} />
+        return <p key={i}>{line.replace(/\*\*([^*]+)\*\*/g, (_, text) => text)}</p>
+      })
+    }
+
+    // Split the text and insert video embeds
+    const parts = []
+    let lastIndex = 0
+    const allMatches = [...text.matchAll(/\[([^\]]*)\]\((https?:\/\/(?:www\.)?youtube\.com\/(?:results\?search_query=[^\s)]+|watch\?v=[^\s)]+))\)|(https?:\/\/(?:www\.)?youtube\.com\/(?:results\?search_query=[^\s)]+|watch\?v=[^\s)]+))/g)]
+
+    allMatches.forEach((m, i) => {
+      const before = text.slice(lastIndex, m.index)
+      if (before) {
+        parts.push(<span key={`t${i}`}>{before.split('\n').map((line, li) => {
+          if (line.trim() === '') return <br key={li} />
+          return <span key={li}>{line}{li < before.split('\n').length - 1 ? <br/> : null}</span>
+        })}</span>)
+      }
+      const url = m[2] || m[3]
+      const query = getYouTubeSearchQuery(url)
+      const label = m[1] || query?.replace(/\+/g, ' ') || 'Watch Video'
+      parts.push(
+        <a key={`v${i}`} href={url} target="_blank" rel="noopener noreferrer" className="chat-video-card">
+          <div className="chat-video-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+              <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+            </svg>
+          </div>
+          <div className="chat-video-info">
+            <span className="chat-video-title">{label}</span>
+            <span className="chat-video-subtitle">Watch on YouTube</span>
+          </div>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="chat-video-arrow">
+            <polyline points="9 18 15 12 9 6"/>
+          </svg>
+        </a>
+      )
+      lastIndex = m.index + m[0].length
+    })
+
+    const remaining = text.slice(lastIndex)
+    if (remaining) {
+      parts.push(<span key="end">{remaining.split('\n').map((line, li) => {
+        if (line.trim() === '') return <br key={li} />
+        return <span key={li}>{line}{li < remaining.split('\n').length - 1 ? <br/> : null}</span>
+      })}</span>)
+    }
+
+    return <>{parts}</>
+  }
+
   // Render structured training plan
   const renderTrainingPlan = (planText) => {
     const plan = parseTrainingPlan(planText)
-    if (!plan) return null
+    if (!plan) return <div className="training-plan-raw"><pre>{planText}</pre></div>
+
+    // Check if we actually parsed any meaningful content
+    const hasContent = plan.drills.length > 0 || plan.bigPicture.length > 0 ||
+      plan.immediateFocus.details.length > 0 || plan.dailyPlan.length > 0 ||
+      plan.weekPlan.length > 0 || plan.weeklySchedule.length > 0
+    if (!hasContent) {
+      // Fallback: render as formatted text with video links
+      return <div className="training-plan-raw">{renderContentWithVideos(planText)}</div>
+    }
 
     return (
       <div className="training-plan-structured">
@@ -975,6 +1256,26 @@ function App() {
                         <line x1="12" y1="16" x2="12.01" y2="16"/>
                       </svg>
                       <span>Watch out: {drill.commonMistake}</span>
+                    </div>
+                  )}
+                  {drill.videoUrl && (
+                    <div className="drill-video-section">
+                      <a
+                        href={drill.videoUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="drill-video-btn"
+                      >
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                          <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+                        </svg>
+                        Watch Examples
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="external-icon">
+                          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                          <polyline points="15 3 21 3 21 9"/>
+                          <line x1="10" y1="14" x2="21" y2="3"/>
+                        </svg>
+                      </a>
                     </div>
                   )}
                 </div>
@@ -1656,6 +1957,17 @@ function App() {
                   </svg>
                   Save to Progress Log
                 </button>
+                <button
+                  className="btn btn-export"
+                  onClick={exportAnalysisToFile}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  Export to File
+                </button>
               </>
             )}
           </div>
@@ -2176,7 +2488,9 @@ function App() {
             {chatMessages.map((msg, index) => (
               <div key={index} className={`chat-message ${msg.role}`}>
                 {msg.role === 'assistant' && <span className="message-avatar">⛷️</span>}
-                <div className="message-content">{msg.content}</div>
+                <div className="message-content">
+                  {msg.role === 'assistant' ? renderContentWithVideos(msg.content) : msg.content}
+                </div>
               </div>
             ))}
 

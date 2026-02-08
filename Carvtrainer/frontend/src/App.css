@@ -380,6 +380,17 @@ body {
   box-shadow: var(--shadow-lg);
 }
 
+.btn-export {
+  background: linear-gradient(135deg, #17a2b8 0%, #138496 100%);
+  color: var(--color-white);
+  box-shadow: var(--shadow-md);
+}
+
+.btn-export:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
 /* Spinner */
 .spinner {
   width: 20px;
@@ -713,6 +724,27 @@ body {
 }
 
 /* Structured Training Plan */
+.training-plan-raw {
+  white-space: pre-wrap;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: #e0e0e0;
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 12px;
+}
+
+.training-plan-raw pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: inherit;
+  margin: 0;
+}
+
+.training-plan-raw p {
+  margin: 0.3em 0;
+}
+
 .training-plan-structured {
   display: flex;
   flex-direction: column;
@@ -1582,6 +1614,123 @@ body {
 .drill-warning svg {
   flex-shrink: 0;
   margin-top: 2px;
+}
+
+/* ============================================
+   Video Embed Styles (Drill Cards & Chat)
+   ============================================ */
+
+.drill-video-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.drill-video-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 14px;
+  background: linear-gradient(135deg, #ff0000 0%, #cc0000 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px rgba(255, 0, 0, 0.2);
+}
+
+.drill-video-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(255, 0, 0, 0.3);
+  background: linear-gradient(135deg, #ff2020 0%, #dd0000 100%);
+  color: white;
+}
+
+.drill-video-btn svg {
+  flex-shrink: 0;
+}
+
+.drill-video-btn .external-icon {
+  margin-left: auto;
+  opacity: 0.7;
+}
+
+/* Chat video cards */
+.chat-video-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0;
+  padding: 12px 14px;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  border: 1px solid rgba(255, 0, 0, 0.2);
+  border-radius: 10px;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  max-width: 360px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.chat-video-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 0, 0, 0.4);
+  box-shadow: 0 4px 16px rgba(255, 0, 0, 0.15);
+  background: linear-gradient(135deg, #1f1f35 0%, #1a2744 100%);
+}
+
+.chat-video-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  background: rgba(255, 0, 0, 0.1);
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.chat-video-icon svg {
+  color: #ff4444;
+  fill: #ff4444;
+}
+
+.chat-video-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.chat-video-title {
+  color: #e0e0e0;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-transform: capitalize;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-video-subtitle {
+  color: #888;
+  font-size: 0.72rem;
+}
+
+.chat-video-arrow {
+  color: #666;
+  flex-shrink: 0;
+  transition: transform 0.2s;
+}
+
+.chat-video-card:hover .chat-video-arrow {
+  color: #ff4444;
+  transform: translateX(2px);
 }
 
 /* ============================================
