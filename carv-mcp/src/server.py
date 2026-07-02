@@ -532,7 +532,7 @@ async def compare_sessions(index1: int, index2: int) -> list[TextContent]:
     if iq1 and iq2:
         diff = iq1 - iq2
         emoji = "📈" if diff > 0 else "📉" if diff < 0 else "➡️"
-        lines.append(f"### Ski:IQ: {iq2} → {iq1} ({emoji} {diff:+d})\n")
+        lines.append(f"### Ski:IQ: {iq2} → {iq1} ({emoji} {diff:+g})\n")
 
     # Metric comparisons
     metrics1 = session1.get("metrics", {})
@@ -552,7 +552,7 @@ async def compare_sessions(index1: int, index2: int) -> list[TextContent]:
                     diff = v1 - v2
                     emoji = "📈" if diff > 0 else "📉" if diff < 0 else "➡️"
                     name = key.replace("_", " ").title()
-                    lines.append(f"- {name}: {v2} → {v1} ({emoji} {diff:+d})")
+                    lines.append(f"- {name}: {v2} → {v1} ({emoji} {diff:+g})")
             lines.append("")
 
     return [TextContent(type="text", text="\n".join(lines))]

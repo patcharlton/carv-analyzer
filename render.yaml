@@ -8,6 +8,8 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: API_ACCESS_TOKEN
+        sync: false
       - key: PYTHON_VERSION
         value: "3.11.0"
       - key: FRONTEND_URL

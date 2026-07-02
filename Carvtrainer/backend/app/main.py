@@ -9,6 +9,8 @@ import json
 import re
 import uuid
 import threading
+import secrets
+import time
 from io import BytesIO
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -40,6 +42,66 @@ if frontend_url:
     allowed_origins.append(frontend_url)
 
 CORS(app, origins=allowed_origins)
+
+# ============================================================================
+# ACCESS CONTROL - shared-secret auth + basic per-IP rate limiting
+# ============================================================================
+# No fallback: if API_ACCESS_TOKEN is unset, all requests (except /health)
+# are refused rather than served unauthenticated.
+API_ACCESS_TOKEN = os.getenv("API_ACCESS_TOKEN")
+
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
+RATE_LIMIT_WINDOW_SECONDS = 60
+# In-memory sliding window per IP - fine for the single-worker gunicorn setup
+_request_log = {}
+_rate_lock = threading.Lock()
+
+
+@app.before_request
+def check_access():
+    # CORS preflight requests carry no auth headers
+    if request.method == "OPTIONS":
+        return None
+    # Keep the health check open for uptime monitoring
+    if request.path == "/health":
+        return None
+
+    if not API_ACCESS_TOKEN:
+        return jsonify({
+            "error": "Service not configured",
+            "message": "API_ACCESS_TOKEN is not set on the server; refusing all requests."
+        }), 503
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        provided = auth_header[len("Bearer "):]
+    else:
+        provided = request.headers.get("X-API-Key", "")
+
+    if not secrets.compare_digest(provided, API_ACCESS_TOKEN):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # Rate limit per client IP (Render sits behind a proxy, so trust the
+    # first entry of X-Forwarded-For when present)
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    ip = forwarded.split(",")[0].strip() if forwarded else (request.remote_addr or "unknown")
+    now = time.time()
+    with _rate_lock:
+        window = [t for t in _request_log.get(ip, []) if now - t < RATE_LIMIT_WINDOW_SECONDS]
+        if len(window) >= RATE_LIMIT_REQUESTS:
+            _request_log[ip] = window
+            return jsonify({
+                "error": "Rate Limited",
+                "message": "Too many requests. Please wait a moment and try again."
+            }), 429
+        window.append(now)
+        # Evict stale IPs so the table can't grow unbounded
+        if len(_request_log) > 1000:
+            for stale_ip in [k for k, v in _request_log.items() if not v or now - v[-1] > RATE_LIMIT_WINDOW_SECONDS]:
+                del _request_log[stale_ip]
+        _request_log[ip] = window
+    return None
+
 
 # Database configuration
 database_url = os.getenv("DATABASE_URL")
@@ -1200,10 +1262,11 @@ def extract_metadata():
             "extracted_at": datetime.now().isoformat()
         })
 
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Metadata extraction failed")
         return jsonify({
             "error": "Metadata extraction failed",
-            "message": str(e)
+            "message": "Something went wrong extracting metadata. Please try again."
         }), 500
 
 
@@ -1327,6 +1390,7 @@ def analyze_screenshots():
         return jsonify(analysis_data)
 
     except Exception as e:
+        app.logger.exception("Request failed")
         error_message = str(e)
 
         if "api_key" in error_message.lower() or "authentication" in error_message.lower():
@@ -1343,7 +1407,7 @@ def analyze_screenshots():
 
         return jsonify({
             "error": "Analysis failed",
-            "message": f"Something went wrong during analysis. Error: {error_message}"
+            "message": "Something went wrong during analysis. Please try again."
         }), 500
 
 
@@ -1397,6 +1461,7 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
 
     except Exception as e:
         jobs[job_id]["status"] = "failed"
+        app.logger.exception("Request failed")
         error_message = str(e)
 
         if "api_key" in error_message.lower() or "authentication" in error_message.lower():
@@ -1404,7 +1469,7 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
         elif "rate_limit" in error_message.lower():
             jobs[job_id]["error"] = "Rate limited. Please wait and try again."
         else:
-            jobs[job_id]["error"] = f"Analysis failed: {error_message}"
+            jobs[job_id]["error"] = "Analysis failed. Please try again."
 
 
 @app.route('/analyze-async', methods=['POST'])
@@ -1489,10 +1554,11 @@ def analyze_screenshots_async():
             "message": "Analysis started. Poll /job-status/{job_id} for results."
         })
 
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Failed to start analysis")
         return jsonify({
             "error": "Failed to start analysis",
-            "message": str(e)
+            "message": "Something went wrong starting the analysis. Please try again."
         }), 500
 
 
@@ -1610,6 +1676,7 @@ Key principles:
         })
 
     except Exception as e:
+        app.logger.exception("Request failed")
         error_message = str(e)
 
         if "api_key" in error_message.lower() or "authentication" in error_message.lower():
@@ -1626,7 +1693,7 @@ Key principles:
 
         return jsonify({
             "error": "Plan generation failed",
-            "message": f"Something went wrong generating your training plan. Error: {error_message}"
+            "message": "Something went wrong generating your training plan. Please try again."
         }), 500
 
 
@@ -1847,6 +1914,7 @@ You're having a friendly, expert conversation with Patrick. Be personable but pr
         })
 
     except Exception as e:
+        app.logger.exception("Request failed")
         error_message = str(e)
 
         if "api_key" in error_message.lower() or "authentication" in error_message.lower():
@@ -1863,7 +1931,7 @@ You're having a friendly, expert conversation with Patrick. Be personable but pr
 
         return jsonify({
             "error": "Chat failed",
-            "message": f"Something went wrong. Error: {error_message}"
+            "message": "Something went wrong. Please try again."
         }), 500
 
 
@@ -1920,7 +1988,8 @@ def create_session():
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to save session: {str(e)}"}), 500
+        app.logger.exception("Failed to save session")
+        return jsonify({"error": "Failed to save session"}), 500
 
 
 @app.route('/sessions', methods=['GET'])
@@ -1930,7 +1999,8 @@ def list_sessions():
         sessions = Session.query.order_by(Session.session_date.desc()).all()
         return jsonify([s.to_dict() for s in sessions])
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch sessions: {str(e)}"}), 500
+        app.logger.exception("Failed to fetch sessions")
+        return jsonify({"error": "Failed to fetch sessions"}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['GET'])
@@ -1942,7 +2012,8 @@ def get_session(session_id):
             return jsonify({"error": "Session not found"}), 404
         return jsonify(session.to_dict())
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch session: {str(e)}"}), 500
+        app.logger.exception("Failed to fetch session")
+        return jsonify({"error": "Failed to fetch session"}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['PUT'])
@@ -1966,7 +2037,8 @@ def update_session(session_id):
         return jsonify(session.to_dict())
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to update session: {str(e)}"}), 500
+        app.logger.exception("Failed to update session")
+        return jsonify({"error": "Failed to update session"}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['DELETE'])
@@ -1982,7 +2054,8 @@ def delete_session(session_id):
         return jsonify({"message": "Session deleted"})
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to delete session: {str(e)}"}), 500
+        app.logger.exception("Failed to delete session")
+        return jsonify({"error": "Failed to delete session"}), 500
 
 
 # ============================================================================
@@ -2182,7 +2255,8 @@ Return ONLY valid JSON, no markdown code blocks."""
         return jsonify(progression_data)
 
     except Exception as e:
-        return jsonify({"error": f"Progression analysis failed: {str(e)}"}), 500
+        app.logger.exception("Progression analysis failed")
+        return jsonify({"error": "Progression analysis failed"}), 500
 
 
 @app.route('/compare', methods=['POST'])
@@ -2258,7 +2332,8 @@ Return ONLY valid JSON."""
         return jsonify(comparison_data)
 
     except Exception as e:
-        return jsonify({"error": f"Comparison failed: {str(e)}"}), 500
+        app.logger.exception("Comparison failed")
+        return jsonify({"error": "Comparison failed"}), 500
 
 
 if __name__ == '__main__':
@@ -2274,4 +2349,4 @@ if __name__ == '__main__':
         print("API Key: Configured")
         print("="*60 + "\n")
 
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5001, debug=os.getenv("FLASK_DEBUG", "").lower() in ("1", "true"))

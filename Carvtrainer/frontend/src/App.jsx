@@ -5,12 +5,19 @@ import './App.css'
 // API base URL - uses environment variable in production, /api proxy in development
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api'
 
+// Shared-secret token for the backend API (matches API_ACCESS_TOKEN on the server)
+const API_ACCESS_TOKEN = import.meta.env.VITE_API_ACCESS_TOKEN
+if (API_ACCESS_TOKEN) {
+  axios.defaults.headers.common['Authorization'] = `Bearer ${API_ACCESS_TOKEN}`
+}
+
 // Storage key for progress logs
 const STORAGE_KEY = 'carv_progress_logs'
 const AUTH_KEY = 'carv_auth'
 
-// Simple password protection
-const SITE_PASSWORD = 'Lotus5126'
+// Simple password protection - set VITE_SITE_PASSWORD at build time.
+// This repo is public, so the password must never be committed here.
+const SITE_PASSWORD = import.meta.env.VITE_SITE_PASSWORD
 
 function App() {
   // Auth state
@@ -68,7 +75,7 @@ function App() {
   // Handle login
   const handleLogin = (e) => {
     e.preventDefault()
-    if (passwordInput === SITE_PASSWORD) {
+    if (SITE_PASSWORD && passwordInput === SITE_PASSWORD) {
       setIsAuthenticated(true)
       sessionStorage.setItem(AUTH_KEY, 'true')
       setAuthError('')
