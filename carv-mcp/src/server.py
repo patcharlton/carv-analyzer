@@ -157,6 +157,14 @@ def save_progress(logs: list[dict]) -> None:
     PROGRESS_FILE.write_text(json.dumps(logs, indent=2))
 
 
+MODEL = "claude-sonnet-5-5"
+
+
+def response_text(response) -> str:
+    """The reply's text. Newer models put a thinking block first, so never read content[0]."""
+    return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+
+
 def get_anthropic_client() -> Anthropic:
     """Get Anthropic client with API key from environment."""
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -296,9 +304,13 @@ async def analyze_screenshot(image_path: str) -> list[TextContent]:
 
         # Call Claude API
         client = get_anthropic_client()
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
+        # claude-sonnet-4-20250514 was retired on 15 June 2026; max_tokens covers thinking too
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=16000,
+            output_config={"effort": "medium"},
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
             system=CARV_METRICS_CONTEXT,
             messages=[{
                 "role": "user",
@@ -319,7 +331,7 @@ async def analyze_screenshot(image_path: str) -> list[TextContent]:
             }]
         )
 
-        response_text = response.content[0].text
+        response_text = response_text(response)
 
         # Try to parse JSON and format nicely
         try:
@@ -409,9 +421,13 @@ async def generate_plan(analysis_json: str) -> list[TextContent]:
         analysis = json.loads(analysis_json)
 
         client = get_anthropic_client()
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=3000,
+        # claude-sonnet-4-20250514 was retired on 15 June 2026; max_tokens covers thinking too
+        response = client.beta.messages.create(
+            model=MODEL,
+            max_tokens=16000,
+            output_config={"effort": "medium"},
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
             system="You are an elite ski coach with deep expertise in carving biomechanics and CARV technology. Create actionable, specific training plans.",
             messages=[{
                 "role": "user",
@@ -419,7 +435,7 @@ async def generate_plan(analysis_json: str) -> list[TextContent]:
             }]
         )
 
-        return [TextContent(type="text", text=response.content[0].text)]
+        return [TextContent(type="text", text=response_text(response))]
 
     except json.JSONDecodeError:
         return [TextContent(type="text", text="Error: Invalid JSON. Please provide the analysis JSON from analyze_carv_screenshot.")]

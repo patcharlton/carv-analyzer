@@ -105,6 +105,32 @@ with app.app_context():
 # Initialize Anthropic client
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+# Screenshot analysis (vision). claude-sonnet-4-20250514, used here before, was retired on 15 June 2026.
+ANALYSIS_MODEL = "claude-sonnet-5-5"
+# Fast model for training plans, chat, progression and comparisons (kept quick for Render's request limits)
+FAST_MODEL = "claude-haiku-4-5-20251001"
+
+
+def create_analysis_message(**kwargs):
+    """
+    Call the analysis model. Medium effort keeps a multi-screenshot analysis well inside the
+    frontend's 3-minute polling window; max_tokens covers thinking as well as the JSON reply.
+    The server-side fallback re-runs the request on another model if this one declines it.
+    """
+    return client.beta.messages.create(
+        model=ANALYSIS_MODEL,
+        max_tokens=16000,
+        output_config={"effort": "medium"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        **kwargs,
+    )
+
+
+def response_text(response):
+    """The reply's text. Newer models put a thinking block first, so never read content[0]."""
+    return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+
 # CARV Metrics Context for AI Analysis - Comprehensive Carving Knowledge Base
 CARV_METRICS_CONTEXT = """
 You are an elite ski coach and CARV technology expert with deep knowledge of carving biomechanics.
@@ -1327,9 +1353,7 @@ def analyze_screenshots():
         })
 
         # Call Claude API with all images
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4000,
+        response = create_analysis_message(
             messages=[
                 {
                     "role": "user",
@@ -1340,7 +1364,7 @@ def analyze_screenshots():
         )
 
         # Extract response text
-        response_text = response.content[0].text
+        response_text = response_text(response)
 
         # Clean and parse JSON
         cleaned_json = clean_json_response(response_text)
@@ -1400,9 +1424,7 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
         })
 
         # Call Claude API with all images
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=8000,  # run details and per-metric zones make the JSON longer
+        response = create_analysis_message(
             messages=[
                 {
                     "role": "user",
@@ -1412,13 +1434,18 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
             system=CARV_METRICS_CONTEXT
         )
 
+        if response.stop_reason == "refusal":
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = "The AI declined to analyse these screenshots. Please try again with CARV screenshots only."
+            return
+
         if response.stop_reason == "max_tokens":
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = "The analysis was too long and got cut off. Try fewer screenshots at once."
             return
 
         # Extract response text
-        response_text = response.content[0].text
+        response_text = response_text(response)
 
         # Clean and parse JSON
         cleaned_json = clean_json_response(response_text)
@@ -1611,7 +1638,7 @@ def generate_training_plan():
 
         # Call Claude API for training plan (using Haiku for speed on Render's 30s timeout)
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=FAST_MODEL,
             max_tokens=6000,
             messages=[
                 {
@@ -1646,7 +1673,7 @@ Key principles:
 - Address root causes, not just symptoms"""
         )
 
-        training_plan = response.content[0].text
+        training_plan = response_text(response)
 
         return jsonify({
             "training_plan": training_plan,
@@ -1854,7 +1881,7 @@ def chat():
 
         # Call Claude API
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",  # Fast for chat
+            model=FAST_MODEL,  # Fast for chat
             max_tokens=1500,
             messages=messages,
             system=f"""You are Coach Carv, an elite ski coach and carving expert with decades of experience training recreational skiers to advanced racers. You have deep knowledge of CARV technology and biomechanics.
@@ -1893,7 +1920,7 @@ def chat():
 You're having a friendly, expert conversation with Patrick. Be personable but professional."""
         )
 
-        ai_response = response.content[0].text
+        ai_response = response_text(response)
 
         return jsonify({
             "response": ai_response,
@@ -2220,7 +2247,7 @@ def analyze_progression():
 
         # Call Claude for analysis - use Haiku for speed within Render's timeout
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",  # Fast model to stay within Render timeout
+            model=FAST_MODEL,  # Fast model to stay within Render timeout
             max_tokens=4000,
             messages=[{
                 "role": "user",
@@ -2237,7 +2264,7 @@ Return ONLY valid JSON, no markdown code blocks."""
             system=CARV_METRICS_CONTEXT
         )
 
-        response_text = response.content[0].text
+        response_text = response_text(response)
         cleaned_json = clean_json_response(response_text)
 
         try:
@@ -2298,7 +2325,7 @@ def compare_sessions():
 
         # Call Claude for comparison
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=FAST_MODEL,
             max_tokens=1500,
             messages=[{
                 "role": "user",
@@ -2328,7 +2355,7 @@ Return ONLY valid JSON."""
             system=CARV_METRICS_CONTEXT
         )
 
-        response_text = response.content[0].text
+        response_text = response_text(response)
         cleaned_json = clean_json_response(response_text)
 
         try:
