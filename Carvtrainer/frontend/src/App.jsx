@@ -7,10 +7,256 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || '/api'
 
 // Storage key for progress logs
 const STORAGE_KEY = 'carv_progress_logs'
-const AUTH_KEY = 'carv_auth'
 
-// Simple password protection
-const SITE_PASSWORD = 'Lotus5126'
+// Login: the backend checks the password and returns a token, kept on this device for 30 days
+const TOKEN_KEY = 'carv_login_token'
+const readToken = () => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } }
+const writeToken = (token) => {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    // storage unavailable (private mode): the token lasts until reload
+  }
+}
+
+// Send the login token with every API request
+axios.interceptors.request.use((config) => {
+  const token = readToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+// Local wall-clock time as "YYYY-MM-DDTHH:MM" (the datetime-local input format).
+// toISOString() would convert to UTC and shift the session by the timezone offset.
+const toLocalInputValue = (date = new Date()) => {
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+// Normalise a datetime string to "YYYY-MM-DDTHH:MM" local time without timezone shifting.
+// Naive strings (from CARV screenshots, EXIF, filenames) are kept as written.
+const normaliseLocalDateTime = (value) => {
+  if (!value) return null
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value) && !/(Z|[+-]\d{2}:?\d{2})$/.test(value)) {
+    return value.slice(0, 16)
+  }
+  const parsed = new Date(value)
+  return isNaN(parsed) ? null : toLocalInputValue(parsed)
+}
+
+// Do a database session and a local log describe the same saved session?
+// Older saves sent UTC ("...Z") times that the backend stored without a timezone,
+// so allow a whole-hour offset when the Ski:IQ also matches.
+const isSameSessionMoment = (dbSession, log) => {
+  const diff = Math.abs(new Date(dbSession.session_date).getTime() - new Date(log.datetime).getTime())
+  if (isNaN(diff)) return false
+  if (diff < 60000) return true
+  const hourMs = 3600000
+  const offByWholeHours = diff <= 14 * hourMs && (diff % hourMs < 60000 || hourMs - (diff % hourMs) < 60000)
+  const sameSkiIQ = dbSession.ski_iq != null && log.metrics?.skiIQ != null &&
+    Math.round(dbSession.ski_iq) === Math.round(log.metrics.skiIQ)
+  return offByWholeHours && sameSkiIQ
+}
+
+// Convert a database session into the progress-log shape used by the UI
+const dbSessionToLog = (session) => {
+  const metrics = session.metrics || {}
+  const overall = metrics.overall_metrics || {}
+  return {
+    id: session.id,
+    dbSessionId: session.id,
+    datetime: session.session_date,
+    datetimeDisplay: metrics.session_overview?.session_date_display || null,
+    datetimeSource: 'database',
+    notes: session.notes || '',
+    savedAt: session.created_at || session.session_date,
+    analysis: session.metrics || null,
+    trainingPlan: parseStoredPlan(session.training_plan),
+    metrics: {
+      skiIQ: session.ski_iq ?? metrics.session_overview?.ski_iq_range?.average ?? null,
+      balance: overall.balance || null,
+      edging: overall.edging || null,
+      rotary: overall.rotary || null,
+      performance: overall.performance || null
+    }
+  }
+}
+
+// Link local logs to their database copies and add database sessions missing locally
+const mergeDbSessionsIntoLogs = (localLogs, sessions) => {
+  const claimed = new Set(localLogs.map(log => log.dbSessionId).filter(Boolean))
+  const byId = new Map(sessions.map(s => [s.id, s]))
+  const merged = localLogs.map(log => {
+    if (log.dbSessionId) {
+      // The database copy wins (it may have been updated on another device),
+      // unless this device has drill progress waiting to be sent
+      const dbCopy = byId.get(log.dbSessionId)
+      return dbCopy && !log.planSyncPending ? { ...dbSessionToLog(dbCopy), id: log.id } : log
+    }
+    const match = sessions.find(s => !claimed.has(s.id) && (s.id === log.id || isSameSessionMoment(s, log)))
+    if (!match) return log
+    claimed.add(match.id)
+    return { ...log, dbSessionId: match.id }
+  })
+  sessions.forEach(s => {
+    if (!claimed.has(s.id)) merged.push(dbSessionToLog(s))
+  })
+  return merged
+}
+
+// The Ski:IQ Metrics list as the Carv app shows it, in Carv's order and units.
+// Mirrors CARV_METRICS in backend/app/carv_metrics.py.
+const CARV_METRIC_DEFS = [
+  { key: 'parallel_skis', label: 'Parallel Skis', unit: '%', legacy: ['rotary', 'parallel_skis'] },
+  { key: 'turn_shape', label: 'Turn Shape', unit: '%', legacy: ['rotary', 'turn_shape'] },
+  { key: 'turn_closure', label: 'Turn Closure', unit: '%', zoneOnly: true, legacy: ['rotary', 'turn_closure'] },
+  { key: 'early_edging', label: 'Early Edging', unit: '%', legacy: ['edging', 'early_edging'] },
+  { key: 'edging_smoothness', label: 'Edging Smoothness', unit: '%', legacy: ['edging', 'edging_smoothness'] },
+  { key: 'edging_similarity', label: 'Edging Similarity', unit: '%', legacy: ['edging', 'edging_similarity'] },
+  { key: 'edge_build', label: 'Edge Build', unit: '%', legacy: ['edging', 'progressive_edge_build'] },
+  { key: 'edge_angle', label: 'Edge Angle', unit: '°', legacy: ['edging', 'edge_angle'] },
+  { key: 'weight_release', label: 'Weight Release', unit: '%', legacy: ['balance', 'transition_weight_release'] },
+  { key: 'g_force', label: 'G-Force', unit: 'g', legacy: ['performance', 'turn_g_force'] },
+  { key: 'slope_pitch', label: 'Slope Pitch', unit: '°' }
+]
+
+const ZONE_LABELS = { below: 'Below zone', in: 'In zone', above: 'Above zone' }
+
+// Ski:IQ 26 "Stelvio" was announced on this date (Carv app 10)
+const STELVIO_RELEASE_DATE = '2026-11-09'
+const SKI_IQ_VERSION_LABELS = { stelvio: 'Ski:IQ 26', wasatch: 'Pre-26' }
+
+// Which Ski:IQ scoring an analysis was scored with: as read from the screenshots
+// (or set by hand), otherwise guessed from the session date
+const getSkiIQVersion = (analysis, fallbackDate = null) => {
+  const version = analysis?.session_overview?.ski_iq_version
+  if (version === 'stelvio' || version === 'wasatch') return version
+  const date = normaliseLocalDateTime(analysis?.session_overview?.session_datetime || fallbackDate)
+  if (!date) return null
+  return date.slice(0, 10) >= STELVIO_RELEASE_DATE ? 'stelvio' : 'wasatch'
+}
+
+const formatMetricValue = (value, unit) => {
+  if (value === null || value === undefined) return '-'
+  if (unit === 'g') return `${Number(value).toFixed(1)} g`
+  return `${Math.round(value)}${unit}`
+}
+
+// A Carv metric's value from a progress log: the Carv metrics list when present,
+// otherwise the older grouped fields saved by earlier versions of the app
+const getLogMetricValue = (log, def) => {
+  const carvValue = log?.analysis?.carv_metrics?.[def.key]?.value
+  if (carvValue !== null && carvValue !== undefined) return carvValue
+  if (!def.legacy) return null
+  const [category, key] = def.legacy
+  const value = log?.metrics?.[category]?.[key] ?? log?.analysis?.overall_metrics?.[category]?.[key]
+  return value === undefined ? null : value
+}
+
+// Structured training plans (from /generate-plan). Older plans are markdown strings.
+const PLAN_FORMAT = 'carv-plan-v1'
+
+// A training plan from state, localStorage or the database: a structured plan object,
+// or the original markdown string for plans made before structured plans existed
+const parseStoredPlan = (value) => {
+  if (!value) return null
+  if (typeof value === 'object') return value.format === PLAN_FORMAT ? value : null
+  if (typeof value === 'string' && value.trimStart().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed?.format === PLAN_FORMAT) return parsed
+    } catch {
+      // not JSON: an old markdown plan
+    }
+  }
+  return value
+}
+
+// The database column is text, so structured plans are stored as JSON
+const serializePlan = (plan) => (plan && typeof plan === 'object' ? JSON.stringify(plan) : plan || null)
+
+const isStructuredPlan = (plan) => !!plan && typeof plan === 'object' && plan.format === PLAN_FORMAT
+
+const drillName = (drill) => drill?.reference?.name || drill?.drill_id || 'Drill'
+
+// A ski day built from the plan's three drills: warm-up, a block per drill, integration, a fun run
+const buildDailySchedule = (plan) => {
+  const totalRuns = plan.runs_per_day || 10
+  const drills = plan.drills || []
+  const warmUp = totalRuns >= 8 ? 2 : 1
+  const drillRuns = Math.max(drills.length, totalRuns - warmUp - 2)
+  const perDrill = drills.map((_, idx) => Math.floor(drillRuns / drills.length) + (idx < drillRuns % drills.length ? 1 : 0))
+  const phases = []
+  let run = 1
+  const span = (count) => {
+    const label = count > 1 ? `${run}-${run + count - 1}` : `${run}`
+    run += count
+    return label
+  }
+  phases.push({ runs: span(warmUp), phase: 'Warm-up', details: ['Free skiing at about 70% effort', 'Get loose and feel the snow'] })
+  drills.forEach((drill, idx) => {
+    phases.push({
+      runs: span(perDrill[idx]),
+      phase: drillName(drill),
+      details: [
+        `${drill.focused_turns || 4} focused turns, then free ski to the bottom`,
+        drill.mental_cue ? `Cue: "${drill.mental_cue}"` : null,
+        idx > 0 ? 'Connect the feeling to the drill before' : 'Rest at the bottom and think about the feel'
+      ].filter(Boolean)
+    })
+  })
+  phases.push({ runs: span(1), phase: 'Integration run', details: ['Free skiing at about 80% effort', 'Let the drills show up without thinking'] })
+  phases.push({ runs: span(1), phase: 'Fun run', details: ['Ski for enjoyment', 'Notice what feels different'] })
+  return phases
+}
+
+// A training week built from the plan's three drills, sized to the days available
+const buildWeeklySchedule = (plan) => {
+  const [primary, secondary, integration] = (plan.drills || []).map(drillName)
+  const templates = {
+    foundation: { name: 'Foundation', primaryFocus: `${primary} (about 4 runs)`, secondary: `${secondary} (about 2 runs)`, terrain: 'Easier runs, perfect technique', goal: 'Establish the movement pattern' },
+    development: { name: 'Development', primaryFocus: `${secondary} (about 4 runs)`, secondary: `${primary} review (2 runs), introduce ${integration}`, terrain: 'Moderate terrain', goal: 'Build on day one and add complexity' },
+    integration: { name: 'Integration', primaryFocus: `All three drills, about 2 runs each`, secondary: 'Several free runs applying them', terrain: 'Varied pitch', goal: 'Connect everything and build confidence' },
+    challenge: { name: 'Challenge', primaryFocus: 'One run of each drill as a warm-up', secondary: 'Apply them on steeper or faster terrain', terrain: 'Steeper terrain', goal: 'Keep the technique under pressure' },
+    recovery: { name: 'Recovery and check', primaryFocus: 'Your favourite drill (2-3 runs)', secondary: 'Mostly free skiing with awareness', terrain: 'Comfortable runs', goal: 'Take new Carv screenshots to compare' }
+  }
+  const orders = {
+    1: ['integration'],
+    2: ['foundation', 'integration'],
+    3: ['foundation', 'integration', 'recovery'],
+    4: ['foundation', 'development', 'integration', 'recovery'],
+    5: ['foundation', 'development', 'integration', 'challenge', 'recovery'],
+    6: ['foundation', 'development', 'integration', 'integration', 'challenge', 'recovery'],
+    7: ['foundation', 'development', 'integration', 'challenge', 'integration', 'challenge', 'recovery']
+  }
+  const days = Math.min(7, Math.max(1, plan.days_available || 5))
+  return orders[days].map((key, idx) => ({ dayNum: idx + 1, ...templates[key] }))
+}
+
+// Plain-text version of a structured plan for the text export
+const planToText = (plan) => {
+  if (!isStructuredPlan(plan)) return typeof plan === 'string' ? plan : ''
+  const lines = []
+  if (plan.summary) lines.push(plan.summary, '')
+  if (plan.biggest_limiter) lines.push(`Biggest limiter: ${plan.biggest_limiter}`)
+  if (plan.carv_alignment) lines.push(`Carv's view: ${plan.carv_alignment}`)
+  if (plan.changes_since_last) lines.push(`Since last time: ${plan.changes_since_last}`)
+  lines.push('')
+  ;(plan.drills || []).forEach((drill, idx) => {
+    lines.push(`DRILL ${idx + 1}: ${drillName(drill)} (${drill.role}) - target ${drill.target_metric}`)
+    if (drill.why) lines.push(`  Why: ${drill.why}`)
+    ;(drill.steps || []).forEach((step, sIdx) => lines.push(`  ${sIdx + 1}. ${step}`))
+    lines.push(`  ${drill.runs} runs, ${drill.focused_turns} focused turns per run`)
+    if (drill.success_feels_like) lines.push(`  Success feels like: ${drill.success_feels_like}`)
+    if (drill.mental_cue) lines.push(`  Cue: "${drill.mental_cue}"`)
+    ;(drill.common_mistakes || []).forEach(m => lines.push(`  Mistake: ${m.mistake} - fix: ${m.fix}`))
+    if (drill.reference?.video_url) lines.push(`  Video: ${drill.reference.video_url}`)
+    lines.push('')
+  })
+  ;(plan.priorities || []).forEach((p, idx) => lines.push(`Priority ${idx + 1}: ${p.metric} ${p.current} -> ${p.target}${p.drill_name ? ` (${p.drill_name})` : ''}`))
+  return lines.join('\n')
+}
 
 function App() {
   // Auth state
@@ -24,6 +270,11 @@ function App() {
   const [trainingPlan, setTrainingPlan] = useState(null)
   const [loading, setLoading] = useState(false)
   const [planLoading, setPlanLoading] = useState(false)
+  const [planDays, setPlanDays] = useState(5) // ski days this week, for the plan's schedule
+  const [editingValues, setEditingValues] = useState(false) // correcting misread values
+  const [loadedLogId, setLoadedLogId] = useState(null) // the saved session currently open, if any
+  const [showToday, setShowToday] = useState(false) // on-hill phone view of the current plan
+  const [planRuns, setPlanRuns] = useState(10) // runs per ski day
   const [error, setError] = useState(null)
   const fileInputRef = useRef(null)
 
@@ -41,6 +292,8 @@ function App() {
   const [deleteConfirmId, setDeleteConfirmId] = useState(null)
   const [expandedLogId, setExpandedLogId] = useState(null) // For expandable log cards
   const [selectedMetric, setSelectedMetric] = useState('skiIQ') // For chart metric selection
+  const [chartTechnique, setChartTechnique] = useState('all') // chart filter: compare like with like
+  const [chartSnow, setChartSnow] = useState('all')
 
   // Database-backed sessions state
   const [dbSessions, setDbSessions] = useState([])
@@ -57,24 +310,51 @@ function App() {
   const [chatLoading, setChatLoading] = useState(false)
   const chatMessagesEndRef = useRef(null)
 
-  // Check auth on mount
+  // Lets long-running loops (job polling) stop once the component is gone
+  const isMountedRef = useRef(true)
   useEffect(() => {
-    const savedAuth = sessionStorage.getItem(AUTH_KEY)
-    if (savedAuth === 'true') {
-      setIsAuthenticated(true)
-    }
+    isMountedRef.current = true
+    return () => { isMountedRef.current = false }
   }, [])
 
-  // Handle login
-  const handleLogin = (e) => {
+  // Signed in already on this device? (The server still checks the token on every request.)
+  useEffect(() => {
+    try { sessionStorage.removeItem('carv_auth') } catch { /* old browser-only login flag */ }
+    if (readToken()) setIsAuthenticated(true)
+  }, [])
+
+  // Any 401 means the token is missing, expired or the password changed: back to the login screen
+  useEffect(() => {
+    const interceptor = axios.interceptors.response.use(
+      (response) => response,
+      (err) => {
+        if (err.response?.status === 401 && !String(err.config?.url || '').endsWith('/login')) {
+          writeToken(null)
+          setIsAuthenticated(false)
+          setAuthError(err.response.data?.message || 'Please sign in again')
+        }
+        return Promise.reject(err)
+      }
+    )
+    return () => axios.interceptors.response.eject(interceptor)
+  }, [])
+
+  // Handle login: the backend checks the password
+  const [loggingIn, setLoggingIn] = useState(false)
+  const handleLogin = async (e) => {
     e.preventDefault()
-    if (passwordInput === SITE_PASSWORD) {
+    if (!passwordInput || loggingIn) return
+    setLoggingIn(true)
+    try {
+      const response = await axios.post(`${API_BASE_URL}/login`, { password: passwordInput })
+      writeToken(response.data.token)
       setIsAuthenticated(true)
-      sessionStorage.setItem(AUTH_KEY, 'true')
       setAuthError('')
-    } else {
-      setAuthError('Incorrect password')
+    } catch (err) {
+      setAuthError(err.response?.data?.message || 'Cannot reach the server. Please try again.')
+    } finally {
       setPasswordInput('')
+      setLoggingIn(false)
     }
   }
 
@@ -92,6 +372,7 @@ function App() {
       analysis: log.analysis || null,
       trainingPlan: log.trainingPlan || null,
       dbSessionId: log.dbSessionId || null,
+      planSyncPending: !!log.planSyncPending,
       metrics: {
         skiIQ: log.metrics?.skiIQ || null,
         balance: log.metrics?.balance || null,
@@ -165,18 +446,24 @@ function App() {
     }
   }, [progressLogs])
 
-  // Load sessions from database on mount
+  // Load sessions from database on mount and merge them into the progress log,
+  // so a new device or cleared browser still shows every saved session
+  const [dbLoadFailed, setDbLoadFailed] = useState(false)
   useEffect(() => {
     const loadDbSessions = async () => {
       try {
         const response = await axios.get(`${API_BASE_URL}/sessions`)
-        setDbSessions(response.data)
+        const sessions = Array.isArray(response.data) ? response.data : []
+        setDbSessions(sessions)
+        setDbLoadFailed(false)
+        setProgressLogs(prev => mergeDbSessionsIntoLogs(prev, sessions))
       } catch (err) {
         console.log('Could not load sessions from database (may not be configured yet)')
+        setDbLoadFailed(true)
       }
     }
-    loadDbSessions()
-  }, [])
+    if (isAuthenticated) loadDbSessions()
+  }, [isAuthenticated])
 
   // Save session to database
   const saveSessionToDb = async (sessionData) => {
@@ -193,14 +480,18 @@ function App() {
     }
   }
 
-  // Delete session from database
+  // Delete session from database (throws on failure so callers can keep the local copy)
   const deleteSessionFromDb = async (sessionId) => {
     try {
       await axios.delete(`${API_BASE_URL}/sessions/${sessionId}`)
-      setDbSessions(prev => prev.filter(s => s.id !== sessionId))
     } catch (err) {
-      console.error('Failed to delete from database:', err)
+      // Already gone from the database counts as deleted
+      if (err.response?.status !== 404) {
+        console.error('Failed to delete from database:', err)
+        throw err
+      }
     }
+    setDbSessions(prev => prev.filter(s => s.id !== sessionId))
   }
 
   // Migration state
@@ -209,8 +500,9 @@ function App() {
 
   // Migrate localStorage logs to database
   const migrateLogsToDatabase = async () => {
-    if (progressLogs.length === 0) {
-      setMigrationResult({ success: false, message: 'No local logs to migrate' })
+    const unsyncedLogs = progressLogs.filter(log => !log.dbSessionId)
+    if (unsyncedLogs.length === 0) {
+      setMigrationResult({ success: true, message: 'All sessions are already in the cloud' })
       return
     }
 
@@ -220,15 +512,30 @@ function App() {
     let skipped = 0
     let failed = 0
 
-    for (const log of progressLogs) {
-      // Check if already in database (by matching datetime)
-      const alreadyExists = dbSessions.some(s => {
-        const dbDate = new Date(s.session_date).getTime()
-        const logDate = new Date(log.datetime).getTime()
-        return Math.abs(dbDate - logDate) < 60000 // Within 1 minute
-      })
+    // Re-read the database first: if it can't be reached we can't tell what is
+    // already there, and uploading anyway would create duplicates
+    let currentDbSessions
+    try {
+      const response = await axios.get(`${API_BASE_URL}/sessions`)
+      currentDbSessions = Array.isArray(response.data) ? response.data : []
+      setDbSessions(currentDbSessions)
+      setDbLoadFailed(false)
+    } catch (err) {
+      setMigrating(false)
+      setDbLoadFailed(true)
+      setMigrationResult({ success: false, message: 'Cannot reach the cloud database right now, so nothing was uploaded. Please try again shortly.' })
+      return
+    }
 
-      if (alreadyExists) {
+    const linkedIds = {} // local log id -> database session id
+    const claimed = new Set(progressLogs.map(log => log.dbSessionId).filter(Boolean))
+
+    for (const log of unsyncedLogs) {
+      // Already in the database? Link it instead of uploading again
+      const existing = currentDbSessions.find(s => !claimed.has(s.id) && (s.id === log.id || isSameSessionMoment(s, log)))
+      if (existing) {
+        claimed.add(existing.id)
+        linkedIds[log.id] = existing.id
         skipped++
         continue
       }
@@ -248,17 +555,25 @@ function App() {
               performance: log.metrics?.performance
             }
           },
-          training_plan: log.trainingPlan || null
+          training_plan: serializePlan(log.trainingPlan)
         }
 
         const response = await axios.post(`${API_BASE_URL}/sessions`, sessionData)
         setDbSessions(prev => [response.data, ...prev])
+        claimed.add(response.data.id)
+        linkedIds[log.id] = response.data.id
         migrated++
       } catch (err) {
         console.error('Failed to migrate log:', log.id, err)
         failed++
       }
     }
+
+    // Remember which database session each local log belongs to, so later
+    // syncs skip it and deleting it removes the database copy too
+    setProgressLogs(prev => prev.map(log =>
+      linkedIds[log.id] ? { ...log, dbSessionId: linkedIds[log.id] } : log
+    ))
 
     setMigrating(false)
     setMigrationResult({
@@ -332,23 +647,21 @@ function App() {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
 
-      // Find the first datetime from metadata
+      // Find the first datetime from metadata (EXIF/filename times are local wall-clock time)
       if (response.data.metadata) {
         for (const meta of response.data.metadata) {
-          if (meta.datetime) {
-            // Format datetime for input field
-            const dt = new Date(meta.datetime)
-            const formatted = dt.toISOString().slice(0, 16) // Format: YYYY-MM-DDTHH:MM
+          const formatted = normaliseLocalDateTime(meta.datetime)
+          if (formatted) {
             setSessionDateTime(formatted)
             return
           }
         }
       }
-      // If no datetime found, use current time
-      setSessionDateTime(new Date().toISOString().slice(0, 16))
+      // If no datetime found, use current local time
+      setSessionDateTime(toLocalInputValue())
     } catch (e) {
       console.error('Failed to extract metadata:', e)
-      setSessionDateTime(new Date().toISOString().slice(0, 16))
+      setSessionDateTime(toLocalInputValue())
     }
   }
 
@@ -442,6 +755,8 @@ function App() {
     setLoading(true)
     setError(null)
     setAnalysis(null)
+    setLoadedLogId(null)
+    setEditingValues(false)
     setTrainingPlan(null)
 
     try {
@@ -462,23 +777,39 @@ function App() {
       // Poll for results
       const pollInterval = 2000 // 2 seconds
       const maxPolls = 90 // 3 minutes max
+      const maxConsecutiveFailures = 3 // ride out a brief server restart or network blip
       let polls = 0
+      let consecutiveFailures = 0
 
       while (polls < maxPolls) {
         await new Promise(resolve => setTimeout(resolve, pollInterval))
+        if (!isMountedRef.current) return
         polls++
 
-        const statusResponse = await axios.get(`${API_BASE_URL}/job-status/${jobId}`)
+        let statusResponse
+        try {
+          statusResponse = await axios.get(`${API_BASE_URL}/job-status/${jobId}`)
+          consecutiveFailures = 0
+        } catch (pollErr) {
+          // The server no longer knows this job (e.g. it restarted): retrying won't help
+          if (pollErr.response?.status === 404) {
+            setError('The server lost track of this analysis (it may have restarted). Please analyze again.')
+            return
+          }
+          consecutiveFailures++
+          if (consecutiveFailures >= maxConsecutiveFailures) throw pollErr
+          continue
+        }
+        if (!isMountedRef.current) return
         const { status, result, error: jobError } = statusResponse.data
 
         if (status === 'completed') {
           setAnalysis(result)
 
           // Update sessionDateTime from CARV screenshot if available (master timestamp)
-          if (result?.session_overview?.session_datetime) {
-            const carvDateTime = result.session_overview.session_datetime
-            // Format for datetime-local input (YYYY-MM-DDTHH:MM)
-            setSessionDateTime(carvDateTime.slice(0, 16))
+          const carvDateTime = normaliseLocalDateTime(result?.session_overview?.session_datetime)
+          if (carvDateTime) {
+            setSessionDateTime(carvDateTime)
           }
           return
         }
@@ -513,8 +844,15 @@ function App() {
     setError(null)
 
     try {
-      const response = await axios.post(`${API_BASE_URL}/generate-plan`, analysis)
-      setTrainingPlan(response.data.training_plan)
+      // If this analysis is a saved session, don't count it as its own history
+      const savedLog = progressLogs.find(log => log.analysis === analysis)
+      const response = await axios.post(`${API_BASE_URL}/generate-plan`, {
+        ...analysis,
+        days_available: planDays,
+        runs_per_day: planRuns,
+        session_id: savedLog?.dbSessionId || null
+      })
+      setTrainingPlan(parseStoredPlan(response.data.training_plan))
     } catch (err) {
       const errorMessage = err.response?.data?.message ||
                           err.response?.data?.error ||
@@ -593,8 +931,45 @@ function App() {
       lines.push('')
     }
 
-    // Overall Metrics
-    if (analysis.overall_metrics) {
+    // Carv metrics and run details (current analyses)
+    const exportVersion = getSkiIQVersion(analysis, sessionDateTime)
+    if (exportVersion) {
+      lines.push(`Ski:IQ scoring: ${exportVersion === 'stelvio' ? 'Ski:IQ 26 (Stelvio)' : 'Pre-26 (Wasatch)'}`)
+      lines.push('')
+    }
+    const details = analysis.run_details
+    if (details) {
+      lines.push('RUN DETAILS')
+      lines.push(subDivider)
+      const detailLines = [
+        ['Run', details.run_name], ['Based on', details.basis], ['Technique', details.technique],
+        ['Snow surface', details.snow_surface], ['Pitch', details.pitch_deg != null ? `${details.pitch_deg}°` : null],
+        ['Carving turns', details.carving_turns?.count != null ? `${details.carving_turns.count}/${details.carving_turns.of ?? '?'}` : null],
+        ['Tempo', details.tempo_tpm != null ? `${details.tempo_tpm} turns/min` : null],
+        ['Corridor', details.corridor_m != null ? `${details.corridor_m} m` : null],
+        ['Radius', details.radius_m != null ? `${details.radius_m} m` : null],
+        ['Balance', details.balance_rating]
+      ]
+      detailLines.forEach(([label, value]) => { if (value) lines.push(`${label}: ${value}`) })
+      ;(details.skill_highlights || []).forEach(skill => {
+        if (skill?.name) lines.push(`Carv skill${skill.number ? ` ${skill.number}` : ''}: ${skill.name} - ${skill.status || '?'}`)
+      })
+      lines.push('')
+    }
+    if (analysis.carv_metrics) {
+      lines.push('CARV METRICS')
+      lines.push(subDivider)
+      CARV_METRIC_DEFS.forEach(def => {
+        const entry = analysis.carv_metrics[def.key]
+        if (entry?.value == null) return
+        const zone = entry.zone ? ` (${ZONE_LABELS[entry.zone].toLowerCase()})` : ''
+        lines.push(`${def.label}: ${formatMetricValue(entry.value, def.unit)}${zone}`)
+      })
+      lines.push('')
+    }
+
+    // Overall Metrics (older analyses without the Carv metrics list)
+    if (analysis.overall_metrics && !analysis.carv_metrics) {
       lines.push('OVERALL METRICS')
       lines.push(subDivider)
 
@@ -621,8 +996,10 @@ function App() {
       lines.push('TOP 3 STRENGTHS')
       lines.push(subDivider)
       analysis.top_3_strengths.forEach((strength, idx) => {
-        lines.push(`${idx + 1}. ${strength.metric || 'Strength'}`)
-        if (strength.observation) lines.push(`   ${strength.observation}`)
+        const score = strength.score != null ? ` (${strength.score})` : ''
+        lines.push(`${idx + 1}. ${strength.area || strength.metric || 'Strength'}${score}`)
+        const why = strength.why_it_matters || strength.observation
+        if (why) lines.push(`   ${why}`)
         if (strength.impact) lines.push(`   Impact: ${strength.impact}`)
       })
       lines.push('')
@@ -633,7 +1010,12 @@ function App() {
       lines.push('TOP 3 PRIORITIES FOR IMPROVEMENT')
       lines.push(subDivider)
       analysis.top_3_priorities.forEach((priority, idx) => {
-        lines.push(`${idx + 1}. ${priority.metric || 'Priority'}`)
+        lines.push(`${idx + 1}. ${priority.area || priority.metric || 'Priority'}`)
+        if (priority.current_score != null || priority.target_score != null) {
+          lines.push(`   Score: ${priority.current_score ?? '?'} → target ${priority.target_score ?? '?'}`)
+        }
+        if (priority.why_priority) lines.push(`   Why: ${priority.why_priority}`)
+        if (priority.quick_win) lines.push(`   Quick Win: ${priority.quick_win}`)
         if (priority.current_issue) lines.push(`   Current Issue: ${priority.current_issue}`)
         if (priority.root_cause) lines.push(`   Root Cause: ${priority.root_cause}`)
         if (priority.specific_drill) lines.push(`   Drill: ${priority.specific_drill}`)
@@ -647,7 +1029,8 @@ function App() {
       lines.push('RUN-BY-RUN NOTES')
       lines.push(subDivider)
       analysis.run_by_run_notes.forEach((note, idx) => {
-        lines.push(`Run ${idx + 1}:`)
+        lines.push(`Screenshot ${note.screenshot || idx + 1}:`)
+        if (note.key_observation) lines.push(`  ${note.key_observation}`)
         if (note.ski_iq) lines.push(`  Ski:IQ: ${note.ski_iq}`)
         if (note.terrain) lines.push(`  Terrain: ${note.terrain}`)
         if (note.highlight) lines.push(`  Highlight: ${note.highlight}`)
@@ -661,7 +1044,7 @@ function App() {
       lines.push(divider)
       lines.push('TRAINING PLAN')
       lines.push(divider)
-      lines.push(trainingPlan)
+      lines.push(planToText(parseStoredPlan(trainingPlan)))
       lines.push('')
     }
 
@@ -678,10 +1061,8 @@ function App() {
     const link = document.createElement('a')
     link.href = url
 
-    // Generate filename with date
-    const dateStr = analysis.session_overview?.session_datetime
-      ? new Date(analysis.session_overview.session_datetime).toISOString().split('T')[0]
-      : new Date().toISOString().split('T')[0]
+    // Generate filename with the session's local date
+    const dateStr = (normaliseLocalDateTime(analysis.session_overview?.session_datetime) || toLocalInputValue()).slice(0, 10)
     link.download = `carv-analysis-${dateStr}.txt`
 
     document.body.appendChild(link)
@@ -710,8 +1091,12 @@ function App() {
         balance: log.metrics?.balance?.category_average,
         edging: log.metrics?.edging?.category_average,
         rotary: log.metrics?.rotary?.category_average,
-        twr: log.metrics?.balance?.transition_weight_release,
-        edgeAngle: log.metrics?.edging?.edge_angle,
+        twr: getLogMetricValue(log, CARV_METRIC_DEFS.find(d => d.key === 'weight_release')),
+        edgeAngle: getLogMetricValue(log, CARV_METRIC_DEFS.find(d => d.key === 'edge_angle')),
+        skiIQVersion: getSkiIQVersion(log.analysis, log.datetime),
+        technique: log.analysis?.run_details?.technique || null,
+        snowSurface: log.analysis?.run_details?.snow_surface || null,
+        pitch: log.analysis?.run_details?.pitch_deg ?? log.analysis?.carv_metrics?.slope_pitch?.value ?? null,
         notes: log.notes
       })) : null
 
@@ -792,272 +1177,205 @@ function App() {
     )
   }
 
-  // Parse training plan into structured sections
-  const parseTrainingPlan = (text) => {
-    if (!text) return null
+  // Carv's Ski:IQ Metrics list with units and performance-zone position
+  const renderCarvMetrics = (carvMetrics) => {
+    const rows = CARV_METRIC_DEFS.filter(def => carvMetrics?.[def.key]?.value != null)
+    if (rows.length === 0) return null
+    return (
+      <div className="carv-metrics-list">
+        {rows.map(def => {
+          const { value, zone } = carvMetrics[def.key]
+          const showBar = def.unit === '%' && !def.zoneOnly
+          return (
+            <div key={def.key} className="carv-metric-row">
+              <div className="carv-metric-top">
+                <span className="carv-metric-label">{def.label}</span>
+                <span className="carv-metric-value">{formatMetricValue(value, def.unit)}</span>
+              </div>
+              <div className="carv-metric-bottom">
+                {showBar ? (
+                  <div className="carv-metric-bar">
+                    <div className="carv-metric-bar-fill" style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
+                  </div>
+                ) : (
+                  <span className="carv-metric-note">
+                    {def.zoneOnly ? 'Judged against its zone' : ''}
+                  </span>
+                )}
+                {zone && <span className={`zone-chip zone-${zone}`}>{ZONE_LABELS[zone]}</span>}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
 
-    const sections = {
-      title: '',
-      bigPicture: [],
-      immediateFocus: { drill: '', cue: '', details: [] },
-      drills: [], // NEW: 3 key drills
-      dailyPlan: [], // NEW: daily session plan
-      weeklySchedule: [], // NEW: weekly training schedule
-      weekPlan: [],
-      strengths: [],
-      progression: { week1_2: [], week3_4: [] },
-      sessionPlan: [],
-      checkpoints: [],
-      mentalCues: [],
-      traps: [],
-      rawSections: {}
+  // Run details Carv shows around the metrics: technique, snow, rhythm, Carv's own skill verdicts
+  const renderRunDetails = (details) => {
+    if (!details) return null
+    const capitalise = (text) => text ? text.charAt(0).toUpperCase() + text.slice(1) : text
+    const items = [
+      ['Technique', capitalise(details.technique)],
+      ['Snow', capitalise(details.snow_surface)],
+      ['Pitch', details.pitch_deg != null ? `${details.pitch_deg}°` : null],
+      ['Carving turns', details.carving_turns?.count != null ? `${details.carving_turns.count}/${details.carving_turns.of ?? '?'}` : null],
+      ['Tempo', details.tempo_tpm != null ? `${details.tempo_tpm} tpm` : null],
+      ['Corridor', details.corridor_m != null ? `${details.corridor_m} m` : null],
+      ['Radius', details.radius_m != null ? `${details.radius_m} m` : null],
+      ['Balance', details.balance_rating],
+      ['Segment', [details.segment?.time, details.segment?.turns != null ? `${details.segment.turns} turns` : null, details.segment?.vert, details.segment?.distance].filter(Boolean).join(' · ') || null]
+    ].filter(([, value]) => value)
+    const skills = (details.skill_highlights || []).filter(s => s?.name)
+    if (items.length === 0 && skills.length === 0) return null
+    return (
+      <div className="run-details">
+        {details.run_name && <div className="run-details-name">{details.run_name}{details.basis ? ` · ${details.basis}` : ''}</div>}
+        {items.length > 0 && (
+          <div className="run-details-grid">
+            {items.map(([label, value]) => (
+              <div key={label} className="run-detail">
+                <span className="run-detail-label">{label}</span>
+                <span className="run-detail-value">{value}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {skills.length > 0 && (
+          <div className="skill-highlights">
+            <span className="run-detail-label">Carv skill highlights</span>
+            {skills.map((skill, idx) => (
+              <div key={idx} className="skill-highlight">
+                <span>{skill.number ? `Skill ${skill.number}: ` : ''}{skill.name}</span>
+                <span className={`skill-status ${/work on/i.test(skill.status || '') ? 'work-on' : 'nailed'}`}>{skill.status}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // ---- Correcting values the AI misread. Corrected fields are listed in
+  // analysis.user_corrected so later AI calls treat them as ground truth.
+  const markCorrected = (a, path) => ({ ...a, user_corrected: Array.from(new Set([...(a.user_corrected || []), path])) })
+
+  const updateCarvMetric = (key, field, raw) => setAnalysis(prev => {
+    if (!prev) return prev
+    const def = CARV_METRIC_DEFS.find(d => d.key === key)
+    const current = prev.carv_metrics?.[key] || { value: null, unit: def.unit, zone: null }
+    let value = current.value
+    if (field === 'value') {
+      value = raw === '' ? null : Number(raw)
+      if (value !== null && Number.isNaN(value)) return prev
     }
-
-    // Split by main headers
-    const lines = text.split('\n')
-    let currentSection = ''
-    let currentContent = []
-    let currentPriority = null
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-
-      // Main title
-      if (line.startsWith('# ')) {
-        sections.title = line.replace('# ', '').trim()
-        continue
-      }
-
-      // Section headers
-      if (line.startsWith('## ')) {
-        // Save previous section
-        if (currentSection) {
-          sections.rawSections[currentSection] = currentContent.join('\n')
-        }
-        currentSection = line.replace('## ', '').trim()
-        currentContent = []
-        continue
-      }
-
-      // Sub-section headers
-      if (line.startsWith('### ')) {
-        currentContent.push(line)
-        continue
-      }
-
-      currentContent.push(line)
+    const zone = field === 'zone' ? (raw || null) : current.zone
+    const carv = { ...(prev.carv_metrics || {}) }
+    if (value === null) delete carv[key]
+    else carv[key] = { value, unit: def.unit, zone }
+    // Keep the older grouped fields in step (the server recomputes averages when saved)
+    let overall = prev.overall_metrics
+    if (def.legacy) {
+      const [category, legacyKey] = def.legacy
+      overall = { ...(overall || {}), [category]: { ...(overall?.[category] || {}), [legacyKey]: value } }
     }
+    return markCorrected({ ...prev, carv_metrics: carv, overall_metrics: overall }, `carv_metrics.${key}`)
+  })
 
-    // Save last section
-    if (currentSection) {
-      sections.rawSections[currentSection] = currentContent.join('\n')
+  const updateSkiIQValue = (raw) => setAnalysis(prev => {
+    if (!prev) return prev
+    const value = raw === '' ? null : Number(raw)
+    if (value !== null && Number.isNaN(value)) return prev
+    return markCorrected({
+      ...prev,
+      session_overview: { ...(prev.session_overview || {}), ski_iq_range: { lowest: value, highest: value, average: value } }
+    }, 'ski_iq')
+  })
+
+  const updateRunDetail = (key, raw, numeric = false) => setAnalysis(prev => {
+    if (!prev) return prev
+    let value = raw === '' ? null : raw
+    if (numeric && value !== null) {
+      value = Number(value)
+      if (Number.isNaN(value)) return prev
     }
+    return markCorrected({ ...prev, run_details: { ...(prev.run_details || {}), [key]: value } }, `run_details.${key}`)
+  })
 
-    // Parse specific sections
-    Object.keys(sections.rawSections).forEach(key => {
-      const content = sections.rawSections[key]
-      const keyLower = key.toLowerCase()
+  const updateSessionDateValue = (raw) => {
+    setSessionDateTime(raw)
+    setAnalysis(prev => prev ? markCorrected({
+      ...prev,
+      session_overview: { ...(prev.session_overview || {}), session_datetime: raw ? `${raw}:00` : null, session_date_display: null }
+    }, 'session_datetime') : prev)
+  }
 
-      if (keyLower.includes('big picture')) {
-        sections.bigPicture = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
+  // Inputs for every value Carv shows, so misread or missing values can be fixed
+  const renderValueEditor = () => {
+    const details = analysis?.run_details || {}
+    const range = analysis?.session_overview?.ski_iq_range || {}
+    return (
+      <section className="metrics-section value-editor">
+        <h2>Correct the values</h2>
+        <p className="value-editor-note">Fix anything the AI misread from your screenshots. Corrected values are marked so coaching treats them as right. Save the session afterwards to keep them.</p>
+        <div className="value-editor-grid">
+          <label>Ski:IQ
+            <input type="number" inputMode="numeric" value={range.average ?? ''} onChange={(e) => updateSkiIQValue(e.target.value)} />
+          </label>
+          <label>Date and time
+            <input type="datetime-local" value={normaliseLocalDateTime(analysis?.session_overview?.session_datetime) || sessionDateTime || ''} onChange={(e) => updateSessionDateValue(e.target.value)} />
+          </label>
+          <label>Technique
+            <select value={details.technique || ''} onChange={(e) => updateRunDetail('technique', e.target.value)}>
+              <option value="">Unknown</option>
+              <option value="carving">Carving</option>
+              <option value="short turns">Short turns</option>
+              <option value="parallel">Parallel</option>
+            </select>
+          </label>
+          <label>Snow surface
+            <input type="text" value={details.snow_surface || ''} placeholder="e.g. Smooth" onChange={(e) => updateRunDetail('snow_surface', e.target.value)} />
+          </label>
+          <label>Pitch (°)
+            <input type="number" inputMode="decimal" value={details.pitch_deg ?? ''} onChange={(e) => updateRunDetail('pitch_deg', e.target.value, true)} />
+          </label>
+          <label>Balance
+            <select value={details.balance_rating || ''} onChange={(e) => updateRunDetail('balance_rating', e.target.value)}>
+              <option value="">Unknown</option>
+              <option value="Ok">Ok</option>
+              <option value="Good">Good</option>
+              <option value="Great">Great</option>
+            </select>
+          </label>
+        </div>
+        <div className="value-editor-metrics">
+          {CARV_METRIC_DEFS.map(def => {
+            const entry = analysis?.carv_metrics?.[def.key]
+            return (
+              <div key={def.key} className="value-editor-row">
+                <span className="carv-metric-label">{def.label} ({def.unit})</span>
+                <input type="number" inputMode="decimal" step={def.unit === 'g' ? '0.1' : '1'} value={entry?.value ?? ''}
+                  onChange={(e) => updateCarvMetric(def.key, 'value', e.target.value)} aria-label={`${def.label} value`} />
+                <select value={entry?.zone || ''} onChange={(e) => updateCarvMetric(def.key, 'zone', e.target.value)} aria-label={`${def.label} zone`}>
+                  <option value="">Zone ?</option>
+                  <option value="below">Below zone</option>
+                  <option value="in">In zone</option>
+                  <option value="above">Above zone</option>
+                </select>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+    )
+  }
 
-      if (keyLower.includes('immediate focus')) {
-        const lines = content.split('\n').filter(l => l.trim())
-        sections.immediateFocus.details = lines.map(l => {
-          if (l.includes('Mental cue') || l.includes('mental cue') || l.includes('Cue:')) {
-            sections.immediateFocus.cue = l.replace(/.*?[:"]\s*/, '').replace(/[""]/g, '').trim()
-          }
-          return l.replace(/^-\s*/, '').replace(/^\*\*.*?\*\*:?\s*/, '').trim()
-        }).filter(l => l && !l.startsWith('#'))
-      }
-
-      if (keyLower.includes("week's game plan") || keyLower.includes('week plan') || keyLower.includes('priorities')) {
-        // Parse priority blocks
-        const priorityBlocks = content.split(/###\s*Priority\s*\d+/i).filter(b => b.trim())
-        sections.weekPlan = priorityBlocks.map(block => {
-          const lines = block.split('\n').filter(l => l.trim())
-          const priority = {
-            name: '',
-            current: '',
-            target: '',
-            drill: '',
-            terrain: '',
-            details: []
-          }
-          lines.forEach(line => {
-            if (line.includes('Current:') && line.includes('→')) {
-              const match = line.match(/Current:\s*(\d+).*?→.*?(\d+)/i)
-              if (match) {
-                priority.current = match[1]
-                priority.target = match[2]
-              }
-            }
-            if (line.includes(':')) {
-              const [label, value] = line.split(':').map(s => s.trim())
-              if (label.toLowerCase().includes('drill')) priority.drill = value.replace(/\*\*/g, '')
-              if (label.toLowerCase().includes('terrain')) priority.terrain = value.replace(/\*\*/g, '')
-              if (!priority.name && line.startsWith('###')) {
-                priority.name = line.replace('###', '').replace(/\[.*?\]/g, '').trim()
-              }
-            }
-            priority.details.push(line.replace(/^-\s*/, '').replace(/^\*\*.*?\*\*:?\s*/, '').trim())
-          })
-          if (!priority.name && lines[0]) priority.name = lines[0].replace(/[:\[\]#*]/g, '').trim()
-          return priority
-        }).filter(p => p.name || p.drill)
-      }
-
-      if (keyLower.includes('building on strength')) {
-        sections.strengths = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-
-      // Parse 3 Key Drills
-      if (keyLower.includes('3 key drills') || keyLower.includes('your 3 key drills')) {
-        const drillBlocks = content.split(/###\s*Drill\s*\d+/i).filter(b => b.trim())
-        sections.drills = drillBlocks.map(block => {
-          const lines = block.split('\n').filter(l => l.trim())
-          const drill = {
-            name: '',
-            focus: '',
-            targetMetric: '',
-            why: '',
-            execution: '',
-            runsPerSession: '',
-            turnsPerRun: '',
-            terrain: '',
-            successFeels: '',
-            commonMistake: '',
-            progression: '',
-            videoUrl: ''
-          }
-          lines.forEach(line => {
-            const cleanLine = line.replace(/^-\s*/, '').replace(/\*\*/g, '')
-            // Check for markdown video link format: [Watch examples](URL)
-            const mdLinkMatch = line.match(/\[Watch[^\]]*\]\((https?:\/\/[^)]+)\)/)
-            if (mdLinkMatch) {
-              drill.videoUrl = mdLinkMatch[1]
-            }
-            if (line.includes(':')) {
-              const colonIdx = cleanLine.indexOf(':')
-              const label = cleanLine.substring(0, colonIdx).toLowerCase()
-              const value = cleanLine.substring(colonIdx + 1).trim()
-
-              if (label.includes('target metric')) drill.targetMetric = value
-              if (label.includes('why this drill')) drill.why = value
-              if (label.includes('execution') || label.includes('how to do it')) drill.execution = value
-              if (label.includes('runs per session') || (label.includes('runs') && !label.includes('run'))) drill.runsPerSession = value
-              if (label.includes('turns per run')) drill.turnsPerRun = value
-              if (label.includes('terrain')) drill.terrain = value
-              if (label.includes('success feels')) drill.successFeels = value
-              if (label.includes('common mistake')) drill.commonMistake = value
-              if (label.includes('make it harder') || label.includes('progression')) drill.progression = value
-              if (label.includes('video') || label.includes('watch')) {
-                const urlMatch = value.match(/https?:\/\/[^\s\])]+ /)?.[0]?.trim() || value.match(/https?:\/\/[^\s\])]+/)?.[0] || ''
-                drill.videoUrl = urlMatch || value.replace(/[\[\]()]/g, '').trim()
-              }
-            }
-            // Get drill name from first line or header remnant
-            if (!drill.name && lines.indexOf(line) === 0) {
-              drill.name = cleanLine.replace(/[:\-–]/g, ' ').replace(/Primary Focus|Secondary Focus|Integration|Refinement/gi, '').trim()
-              const focusMatch = line.match(/(Primary Focus|Secondary Focus|Integration|Refinement)/i)
-              if (focusMatch) drill.focus = focusMatch[1]
-            }
-          })
-          return drill
-        }).filter(d => d.name || d.execution)
-      }
-
-      // Parse Daily Session Plan
-      if (keyLower.includes('daily session plan') || keyLower.includes('daily plan')) {
-        const runBlocks = content.split(/\*\*Run\s*[\d-]+/i).filter(b => b.trim())
-        sections.dailyPlan = []
-        const runMatches = content.match(/\*\*Run\s*[\d-]+[^*]*\*\*/gi) || []
-        runMatches.forEach((runHeader, idx) => {
-          const runMatch = runHeader.match(/Run\s*([\d-]+)/i)
-          const phaseMatch = runHeader.match(/:\s*([^*]+)/i)
-          const blockContent = runBlocks[idx + 1] || ''
-          const details = blockContent.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-
-          sections.dailyPlan.push({
-            runs: runMatch ? runMatch[1] : '',
-            phase: phaseMatch ? phaseMatch[1].trim() : '',
-            details: details
-          })
-        })
-      }
-
-      // Parse Weekly Training Schedule
-      if (keyLower.includes('weekly training schedule') || keyLower.includes('weekly schedule')) {
-        const dayBlocks = content.split(/###\s*Day\s*\d+/i).filter(b => b.trim())
-        sections.weeklySchedule = dayBlocks.map((block, idx) => {
-          const lines = block.split('\n').filter(l => l.trim())
-          const day = {
-            dayNum: idx + 1,
-            name: '',
-            primaryFocus: '',
-            secondary: '',
-            terrain: '',
-            goal: '',
-            details: []
-          }
-          lines.forEach(line => {
-            const cleanLine = line.replace(/^-\s*/, '').replace(/\*\*/g, '')
-            if (line.includes(':')) {
-              const colonIdx = cleanLine.indexOf(':')
-              const label = cleanLine.substring(0, colonIdx).toLowerCase()
-              const value = cleanLine.substring(colonIdx + 1).trim()
-
-              if (label.includes('primary focus')) day.primaryFocus = value
-              if (label.includes('secondary')) day.secondary = value
-              if (label.includes('terrain')) day.terrain = value
-              if (label.includes('goal')) day.goal = value
-              if (label.includes('add')) day.details.push('Add: ' + value)
-            }
-            // Get day name from first line
-            if (!day.name && lines.indexOf(line) === 0) {
-              day.name = cleanLine.replace(/[:\-–]/g, ' ').trim()
-            }
-          })
-          return day
-        }).filter(d => d.name || d.primaryFocus)
-      }
-
-      if (keyLower.includes('progression') || keyLower.includes('4-week')) {
-        const week1Match = content.match(/###\s*Week\s*1[-–]2[\s\S]*?(?=###|$)/i)
-        const week3Match = content.match(/###\s*Week\s*3[-–]4[\s\S]*?(?=###|$)/i)
-        if (week1Match) {
-          sections.progression.week1_2 = week1Match[0].split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-        }
-        if (week3Match) {
-          sections.progression.week3_4 = week3Match[0].split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-        }
-      }
-
-      if (keyLower.includes('session plan') || keyLower.includes('sample session')) {
-        sections.sessionPlan = content.split('\n').filter(l => l.trim().startsWith('**') || l.trim().startsWith('Run')).map(l => {
-          const match = l.match(/\*\*(Run\s*[\d-]+)\*\*:?\s*(.*)/i) || l.match(/(Run\s*[\d-]+):?\s*(.*)/i)
-          if (match) {
-            return { run: match[1], activity: match[2].replace(/\*\*/g, '') }
-          }
-          return { run: '', activity: l.replace(/\*\*/g, '').trim() }
-        }).filter(s => s.activity)
-      }
-
-      if (keyLower.includes('checkpoint') || keyLower.includes('progress')) {
-        sections.checkpoints = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-
-      if (keyLower.includes('mental cue')) {
-        sections.mentalCues = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-
-      if (keyLower.includes('trap') || keyLower.includes('avoid')) {
-        sections.traps = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-    })
-
-    return sections
+  // Set the Ski:IQ scoring version on the current analysis (Carv rescored with Ski:IQ 26)
+  const setAnalysisSkiIQVersion = (version) => {
+    setAnalysis(prev => prev ? {
+      ...prev,
+      session_overview: { ...(prev.session_overview || {}), ski_iq_version: version }
+    } : prev)
   }
 
   // Extract search query from YouTube URL and build embed URL
@@ -1070,6 +1388,21 @@ function App() {
       return null
     }
   }
+
+  // Light markdown for chat replies and older text plans: headings, bullets, **bold**
+  const renderInlineBold = (line) => line.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+    part.startsWith('**') && part.endsWith('**') ? <strong key={i}>{part.slice(2, -2)}</strong> : part
+  )
+  const renderTextLines = (text, keyPrefix = '') => text.split('\n').map((line, i) => {
+    const key = `${keyPrefix}${i}`
+    const trimmed = line.trim()
+    if (trimmed === '') return <br key={key} />
+    const heading = trimmed.match(/^(#{1,4})\s+(.*)$/)
+    if (heading) return <p key={key} className={`md-heading md-h${heading[1].length}`}><strong>{heading[2].replace(/\*\*/g, '')}</strong></p>
+    const bullet = trimmed.match(/^[-*]\s+(.*)$/)
+    if (bullet) return <p key={key} style={{ paddingLeft: '12px' }}>{'• '}{renderInlineBold(bullet[1])}</p>
+    return <p key={key}>{renderInlineBold(line)}</p>
+  })
 
   // Render chat/text content with embedded YouTube videos
   const renderContentWithVideos = (text) => {
@@ -1099,16 +1432,7 @@ function App() {
 
     if (videoLinks.length === 0) {
       // No YouTube links, render as formatted text
-      return text.split('\n').map((line, i) => {
-        if (line.startsWith('**') && line.endsWith('**')) {
-          return <p key={i}><strong>{line.replace(/\*\*/g, '')}</strong></p>
-        }
-        if (line.startsWith('- ')) {
-          return <p key={i} style={{paddingLeft: '12px'}}>{'• ' + line.slice(2)}</p>
-        }
-        if (line.trim() === '') return <br key={i} />
-        return <p key={i}>{line.replace(/\*\*([^*]+)\*\*/g, (_, text) => text)}</p>
-      })
+      return renderTextLines(text)
     }
 
     // Split the text and insert video embeds
@@ -1119,10 +1443,7 @@ function App() {
     allMatches.forEach((m, i) => {
       const before = text.slice(lastIndex, m.index)
       if (before) {
-        parts.push(<span key={`t${i}`}>{before.split('\n').map((line, li) => {
-          if (line.trim() === '') return <br key={li} />
-          return <span key={li}>{line}{li < before.split('\n').length - 1 ? <br/> : null}</span>
-        })}</span>)
+        parts.push(<div key={`t${i}`}>{renderTextLines(before.replace(/\[$/, ''), `t${i}-`)}</div>)
       }
       const url = m[2] || m[3]
       const query = getYouTubeSearchQuery(url)
@@ -1148,448 +1469,426 @@ function App() {
 
     const remaining = text.slice(lastIndex)
     if (remaining) {
-      parts.push(<span key="end">{remaining.split('\n').map((line, li) => {
-        if (line.trim() === '') return <br key={li} />
-        return <span key={li}>{line}{li < remaining.split('\n').length - 1 ? <br/> : null}</span>
-      })}</span>)
+      parts.push(<div key="end">{renderTextLines(remaining, 'end-')}</div>)
     }
 
     return <>{parts}</>
   }
 
-  // Render structured training plan
-  const renderTrainingPlan = (planText) => {
-    const plan = parseTrainingPlan(planText)
-    if (!plan) return <div className="training-plan-raw"><pre>{planText}</pre></div>
+  // ---- Drill tracking: progress is stored in the plan (plan.drill_log) and saved with the session.
+  // The saved session the current analysis belongs to, if any
+  const getCurrentLog = () => (loadedLogId && progressLogs.find(l => l.id === loadedLogId)) ||
+    progressLogs.find(l => l.analysis === analysis) || null
 
-    // Check if we actually parsed any meaningful content
-    const hasContent = plan.drills.length > 0 || plan.bigPicture.length > 0 ||
-      plan.immediateFocus.details.length > 0 || plan.dailyPlan.length > 0 ||
-      plan.weekPlan.length > 0 || plan.weeklySchedule.length > 0
-    if (!hasContent) {
-      // Fallback: render as formatted text with video links
-      return <div className="training-plan-raw">{renderContentWithVideos(planText)}</div>
+  // One save at a time per session; a change made while a save is in flight is sent right after it
+  const syncingPlans = useRef(new Set())
+  const latestPlans = useRef(new Map()) // logId -> newest plan to send
+  const [planSyncFailed, setPlanSyncFailed] = useState(false)
+  const syncPlanToDb = async (logId, dbSessionId, plan) => {
+    latestPlans.current.set(logId, plan)
+    if (syncingPlans.current.has(logId)) return
+    syncingPlans.current.add(logId)
+    try {
+      let sent = null
+      while (latestPlans.current.get(logId) !== sent) {
+        sent = latestPlans.current.get(logId)
+        await axios.put(`${API_BASE_URL}/sessions/${dbSessionId}`, { training_plan: serializePlan(sent) })
+      }
+      latestPlans.current.delete(logId)
+      setPlanSyncFailed(false)
+      setProgressLogs(prev => prev.map(l => l.id === logId && l.trainingPlan === sent ? { ...l, planSyncPending: false } : l))
+    } catch (err) {
+      console.warn('Drill progress kept on this device; will retry', err)
+      setPlanSyncFailed(true)
+    } finally {
+      syncingPlans.current.delete(logId)
     }
+  }
+
+  const updateDrillLog = (drillId, patch) => {
+    const plan = parseStoredPlan(trainingPlan)
+    if (!isStructuredPlan(plan)) return
+    const entry = { ...(plan.drill_log?.[drillId] || {}), ...patch, updated_at: new Date().toISOString() }
+    const newPlan = { ...plan, drill_log: { ...(plan.drill_log || {}), [drillId]: entry } }
+    setTrainingPlan(newPlan)
+    const log = getCurrentLog()
+    if (!log) return // not saved yet: progress is saved with the session
+    setProgressLogs(prev => prev.map(l => l.id === log.id ? { ...l, trainingPlan: newPlan, planSyncPending: !!l.dbSessionId } : l))
+    if (log.dbSessionId) syncPlanToDb(log.id, log.dbSessionId, newPlan)
+  }
+
+  // Retry drill progress that couldn't be sent (e.g. no signal on the hill) once the server is reachable
+  useEffect(() => {
+    if (!isAuthenticated || dbLoadFailed) return
+    progressLogs
+      .filter(l => l.planSyncPending && l.dbSessionId && isStructuredPlan(parseStoredPlan(l.trainingPlan)))
+      .forEach(l => syncPlanToDb(l.id, l.dbSessionId, parseStoredPlan(l.trainingPlan)))
+  }, [dbSessions, isAuthenticated, dbLoadFailed])
+
+  // Done / runs / how it felt / note for one drill
+  const renderDrillTracker = (drill, plan) => {
+    const entry = plan.drill_log?.[drill.drill_id] || {}
+    const feelings = [[1, 'Hard'], [2, 'Getting it'], [3, 'Clicked']]
+    return (
+      <div className="drill-tracker">
+        <label className="tracker-done">
+          <input type="checkbox" checked={!!entry.done} onChange={(e) => updateDrillLog(drill.drill_id, { done: e.target.checked })} />
+          Done today
+        </label>
+        <div className="tracker-runs">
+          <span>Runs</span>
+          <button type="button" aria-label="One run fewer" onClick={() => updateDrillLog(drill.drill_id, { runs_done: Math.max(0, (entry.runs_done || 0) - 1) })}>-</button>
+          <span className="tracker-count">{entry.runs_done || 0}/{drill.runs || '?'}</span>
+          <button type="button" aria-label="One more run" onClick={() => updateDrillLog(drill.drill_id, { runs_done: (entry.runs_done || 0) + 1 })}>+</button>
+        </div>
+        <div className="tracker-felt" role="group" aria-label="How it felt">
+          {feelings.map(([value, label]) => (
+            <button key={value} type="button" className={entry.felt === value ? 'active' : ''}
+              onClick={() => updateDrillLog(drill.drill_id, { felt: entry.felt === value ? null : value })}>{label}</button>
+          ))}
+        </div>
+        <input className="tracker-note" type="text" placeholder="Note (optional)" defaultValue={entry.note || ''}
+          key={`${drill.drill_id}-${entry.updated_at || ''}-note`}
+          onBlur={(e) => { if ((e.target.value || '') !== (entry.note || '')) updateDrillLog(drill.drill_id, { note: e.target.value }) }} />
+      </div>
+    )
+  }
+
+  // On-hill view: one column, big targets, the day's run order and the three drills
+  const renderTodayView = () => {
+    const plan = parseStoredPlan(trainingPlan)
+    if (!isStructuredPlan(plan)) return null
+    const schedule = buildDailySchedule(plan)
+    const log = getCurrentLog()
+    return (
+      <div className="today-view" role="dialog" aria-label="Today's drills">
+        <div className="today-header">
+          <div>
+            <div className="today-title">Today on the hill</div>
+            <div className="today-sub">{plan.immediate_focus?.cue ? `"${plan.immediate_focus.cue}"` : plan.biggest_limiter}</div>
+          </div>
+          <button type="button" className="today-close" onClick={() => setShowToday(false)} aria-label="Close">×</button>
+        </div>
+        {!log && <div className="today-warning">Save this session to keep your drill progress.</div>}
+        {log?.planSyncPending && (planSyncFailed || dbLoadFailed) && <div className="today-warning">Progress saved on this phone. It will sync when you're back online.</div>}
+        <div className="today-drills">
+          {plan.drills.map((drill, idx) => (
+            <div key={drill.drill_id} className="today-drill">
+              <div className="today-drill-head">
+                <span className="drill-number">{idx + 1}</span>
+                <div>
+                  <div className="today-drill-name">{drillName(drill)}</div>
+                  <div className="today-drill-meta">{drill.focused_turns} focused turns · {drill.runs} runs{drill.reference?.terrain ? ` · ${drill.reference.terrain}` : ''}</div>
+                </div>
+              </div>
+              {drill.mental_cue && <div className="today-cue">"{drill.mental_cue}"</div>}
+              {drill.steps?.length > 0 && (
+                <ol className="today-steps">{drill.steps.map((step, sIdx) => <li key={sIdx}>{step}</li>)}</ol>
+              )}
+              {drill.reference?.video_url && (
+                <a className="today-video" href={drill.reference.video_url} target="_blank" rel="noopener noreferrer">Watch examples</a>
+              )}
+              {renderDrillTracker(drill, plan)}
+            </div>
+          ))}
+        </div>
+        <div className="today-schedule">
+          <div className="today-section-title">Run order</div>
+          {schedule.map((phase, idx) => (
+            <div key={idx} className="today-run"><span>Run {phase.runs}</span><strong>{phase.phase}</strong></div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  // Render a training plan: structured plans as sections, older markdown plans as formatted text
+  const renderTrainingPlan = (storedPlan) => {
+    const plan = parseStoredPlan(storedPlan)
+    if (!plan) return null
+    if (!isStructuredPlan(plan)) {
+      return <div className="training-plan-raw">{renderContentWithVideos(plan)}</div>
+    }
+
+    const icon = (children) => (
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">{children}</svg>
+    )
+    const dailySchedule = buildDailySchedule(plan)
+    const weeklySchedule = buildWeeklySchedule(plan)
+    const focusDrill = plan.immediate_focus?.reference
+    const cues = [
+      ['Primary', plan.mental_cues?.primary],
+      ['Transition', plan.mental_cues?.transition],
+      ['Confidence', plan.mental_cues?.confidence]
+    ].filter(([, cue]) => cue)
 
     return (
       <div className="training-plan-structured">
-        {/* Plan Header */}
-        {plan.title && (
-          <div className="plan-header">
-            <div className="plan-header-icon">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
-                <polyline points="14 2 14 8 20 8"/>
-                <line x1="16" y1="13" x2="8" y2="13"/>
-                <line x1="16" y1="17" x2="8" y2="17"/>
-                <line x1="10" y1="9" x2="8" y2="9"/>
-              </svg>
-            </div>
-            <h1>{plan.title}</h1>
+        <div className="plan-header">
+          <div className="plan-header-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
           </div>
-        )}
+          <h1>Training Plan{plan.ski_iq ? ` for Ski:IQ ${Math.round(plan.ski_iq)}` : ''}</h1>
+          <button type="button" className="today-open-btn" onClick={() => setShowToday(true)}>On the hill view</button>
+        </div>
 
-        {/* Big Picture Summary */}
-        {plan.bigPicture.length > 0 && (
-          <div className="plan-section big-picture-section">
-            <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="11" cy="11" r="8"/>
-                  <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                  <circle cx="11" cy="11" r="3"/>
-                </svg>
-              </span>
-              <h2>The Big Picture</h2>
-            </div>
-            <div className="big-picture-content">
-              {plan.bigPicture.map((item, idx) => (
-                <p key={idx}>{item}</p>
-              ))}
-            </div>
+        {/* The Big Picture */}
+        <div className="plan-section big-picture-section">
+          <div className="section-header">
+            <span className="section-icon">{icon(<><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></>)}</span>
+            <h2>The Big Picture</h2>
+            {plan.level && <span className="section-badge">{plan.level}</span>}
           </div>
-        )}
+          <div className="big-picture-content">
+            {plan.summary && <p>{plan.summary}</p>}
+            {plan.biggest_limiter && <p><strong>Biggest limiter:</strong> {plan.biggest_limiter}</p>}
+            {plan.carv_alignment && <p><strong>Carv's view:</strong> {plan.carv_alignment}</p>}
+            {plan.changes_since_last && <p><strong>Since last time:</strong> {plan.changes_since_last}</p>}
+          </div>
+        </div>
 
-        {/* Immediate Focus - Hero Card */}
-        {plan.immediateFocus.details.length > 0 && (
+        {/* Immediate Focus */}
+        {plan.immediate_focus?.issue && (
           <div className="plan-section immediate-focus-section">
             <div className="section-header">
-              <span className="section-icon focus-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <circle cx="12" cy="12" r="6"/>
-                  <circle cx="12" cy="12" r="2"/>
-                </svg>
-              </span>
+              <span className="section-icon focus-icon">{icon(<><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></>)}</span>
               <h2>Immediate Focus</h2>
               <span className="section-badge">Next 1-3 Runs</span>
             </div>
             <div className="focus-card">
-              {plan.immediateFocus.cue && (
+              {plan.immediate_focus.cue && (
                 <div className="mental-cue-hero">
                   <span className="cue-label">Your Mantra</span>
-                  <span className="cue-text">"{plan.immediateFocus.cue}"</span>
+                  <span className="cue-text">"{plan.immediate_focus.cue}"</span>
                 </div>
               )}
               <ul className="focus-details">
-                {plan.immediateFocus.details.slice(0, 5).map((detail, idx) => (
-                  <li key={idx}>{detail}</li>
-                ))}
+                <li>{plan.immediate_focus.issue}</li>
+                {focusDrill && <li>Drill: {focusDrill.name}{focusDrill.execution ? ` - ${focusDrill.execution}` : ''}</li>}
+                {plan.immediate_focus.what_success_feels_like && <li>Success feels like: {plan.immediate_focus.what_success_feels_like}</li>}
               </ul>
             </div>
           </div>
         )}
 
         {/* 3 Key Drills */}
-        {plan.drills.length > 0 && (
-          <div className="plan-section drills-section">
-            <div className="section-header">
-              <span className="section-icon drills-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-                </svg>
-              </span>
-              <h2>Your 3 Key Drills</h2>
-              <span className="section-badge drill-badge">Master These</span>
-            </div>
-            <div className="drills-grid">
-              {plan.drills.map((drill, idx) => (
-                <div key={idx} className={`drill-card drill-${idx + 1}`}>
-                  <div className="drill-header">
-                    <span className="drill-number">{idx + 1}</span>
-                    <div className="drill-title">
-                      <h3>{drill.name}</h3>
-                      {drill.focus && <span className="drill-focus-tag">{drill.focus}</span>}
-                    </div>
+        <div className="plan-section drills-section">
+          <div className="section-header">
+            <span className="section-icon drills-icon">{icon(<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>)}</span>
+            <h2>Your 3 Key Drills</h2>
+            <span className="section-badge drill-badge">Master These</span>
+          </div>
+          <div className="drills-grid">
+            {plan.drills.map((drill, idx) => (
+              <div key={drill.drill_id + idx} className={`drill-card drill-${idx + 1}`}>
+                <div className="drill-header">
+                  <span className="drill-number">{idx + 1}</span>
+                  <div className="drill-title">
+                    <h3>{drillName(drill)}</h3>
+                    {drill.role && <span className="drill-focus-tag">{drill.role.charAt(0).toUpperCase() + drill.role.slice(1)}</span>}
                   </div>
-                  {drill.targetMetric && (
-                    <div className="drill-metric">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <circle cx="12" cy="12" r="10"/>
-                        <circle cx="12" cy="12" r="3"/>
+                </div>
+                {drill.target_metric && (
+                  <div className="drill-metric">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
+                    <span>Target: {drill.target_metric}</span>
+                  </div>
+                )}
+                {drill.why && <p className="drill-why">{drill.why}</p>}
+                {drill.steps?.length > 0 && (
+                  <div className="drill-execution">
+                    <strong>How to do it:</strong>
+                    <ol className="drill-steps">
+                      {drill.steps.map((step, sIdx) => <li key={sIdx}>{step}</li>)}
+                    </ol>
+                  </div>
+                )}
+                <div className="drill-stats">
+                  <div className="drill-stat">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                    <span>{drill.runs} run{drill.runs === 1 ? '' : 's'} a day</span>
+                  </div>
+                  <div className="drill-stat">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    <span>{drill.focused_turns} focused turns per run</span>
+                  </div>
+                  {(drill.reference?.terrain || drill.reference?.duration) && (
+                    <div className="drill-stat terrain">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 17l6-6 4 4 8-8"/></svg>
+                      <span>{drill.reference.terrain || drill.reference.duration}</span>
+                    </div>
+                  )}
+                </div>
+                {drill.success_feels_like && (
+                  <div className="drill-success">
+                    <span className="success-label">Success feels like:</span>
+                    <span className="success-text">"{drill.success_feels_like}"</span>
+                  </div>
+                )}
+                {drill.mental_cue && (
+                  <div className="drill-success">
+                    <span className="success-label">Cue:</span>
+                    <span className="success-text">"{drill.mental_cue}"</span>
+                  </div>
+                )}
+                {(drill.common_mistakes || []).map((m, mIdx) => (
+                  <div key={mIdx} className="drill-warning">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                    <span>Watch out: {m.mistake}{m.fix ? `. Fix: ${m.fix}` : ''}</span>
+                  </div>
+                ))}
+                {drill.make_it_harder && <p className="drill-why"><strong>Make it harder:</strong> {drill.make_it_harder}</p>}
+                {renderDrillTracker(drill, plan)}
+                {drill.reference?.video_url && (
+                  <div className="drill-video-section">
+                    <a href={drill.reference.video_url} target="_blank" rel="noopener noreferrer" className="drill-video-btn">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                        <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
                       </svg>
-                      <span>Target: {drill.targetMetric}</span>
-                    </div>
-                  )}
-                  {drill.why && (
-                    <p className="drill-why">{drill.why}</p>
-                  )}
-                  {drill.execution && (
-                    <div className="drill-execution">
-                      <strong>How to do it:</strong>
-                      <p>{drill.execution}</p>
-                    </div>
-                  )}
-                  <div className="drill-stats">
-                    {drill.runsPerSession && (
-                      <div className="drill-stat">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                          <circle cx="9" cy="7" r="4"/>
-                        </svg>
-                        <span>{drill.runsPerSession}</span>
-                      </div>
-                    )}
-                    {drill.turnsPerRun && (
-                      <div className="drill-stat">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <polyline points="23 4 23 10 17 10"/>
-                          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-                        </svg>
-                        <span>{drill.turnsPerRun}</span>
-                      </div>
-                    )}
-                    {drill.terrain && (
-                      <div className="drill-stat terrain">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M3 17l6-6 4 4 8-8"/>
-                        </svg>
-                        <span>{drill.terrain}</span>
-                      </div>
-                    )}
+                      Watch Examples
+                    </a>
                   </div>
-                  {drill.successFeels && (
-                    <div className="drill-success">
-                      <span className="success-label">Success feels like:</span>
-                      <span className="success-text">"{drill.successFeels}"</span>
-                    </div>
-                  )}
-                  {drill.commonMistake && (
-                    <div className="drill-warning">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <circle cx="12" cy="12" r="10"/>
-                        <line x1="12" y1="8" x2="12" y2="12"/>
-                        <line x1="12" y1="16" x2="12.01" y2="16"/>
-                      </svg>
-                      <span>Watch out: {drill.commonMistake}</span>
-                    </div>
-                  )}
-                  {drill.videoUrl && (
-                    <div className="drill-video-section">
-                      <a
-                        href={drill.videoUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="drill-video-btn"
-                      >
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-                          <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
-                        </svg>
-                        Watch Examples
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="external-icon">
-                          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                          <polyline points="15 3 21 3 21 9"/>
-                          <line x1="10" y1="14" x2="21" y2="3"/>
-                        </svg>
-                      </a>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
+                )}
+              </div>
+            ))}
           </div>
-        )}
+        </div>
 
-        {/* Daily Session Plan */}
-        {plan.dailyPlan.length > 0 && (
-          <div className="plan-section daily-plan-section">
-            <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <polyline points="12 6 12 12 16 14"/>
-                </svg>
-              </span>
-              <h2>Daily Session Plan</h2>
-              <span className="section-badge">10 Runs</span>
-            </div>
-            <div className="daily-timeline">
-              {plan.dailyPlan.map((phase, idx) => (
-                <div key={idx} className={`daily-phase phase-${idx + 1}`}>
-                  <div className="phase-marker">
-                    <div className="phase-dot"></div>
-                    {idx < plan.dailyPlan.length - 1 && <div className="phase-line"></div>}
-                  </div>
-                  <div className="phase-content">
-                    <div className="phase-header">
-                      <span className="phase-runs">Run {phase.runs}</span>
-                      <span className="phase-name">{phase.phase}</span>
-                    </div>
-                    {phase.details.length > 0 && (
-                      <ul className="phase-details">
-                        {phase.details.map((detail, dIdx) => (
-                          <li key={dIdx}>{detail}</li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
+        {/* Daily Session Plan, built from the three drills */}
+        <div className="plan-section daily-plan-section">
+          <div className="section-header">
+            <span className="section-icon">{icon(<><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>)}</span>
+            <h2>Daily Session Plan</h2>
+            <span className="section-badge">{plan.runs_per_day || 10} Runs</span>
           </div>
-        )}
-
-        {/* Weekly Training Schedule */}
-        {plan.weeklySchedule.length > 0 && (
-          <div className="plan-section weekly-schedule-section">
-            <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
-                  <line x1="16" y1="2" x2="16" y2="6"/>
-                  <line x1="8" y1="2" x2="8" y2="6"/>
-                  <line x1="3" y1="10" x2="21" y2="10"/>
-                </svg>
-              </span>
-              <h2>Weekly Training Schedule</h2>
-            </div>
-            <div className="weekly-grid">
-              {plan.weeklySchedule.map((day, idx) => (
-                <div key={idx} className={`day-card day-${idx + 1}`}>
-                  <div className="day-header">
-                    <span className="day-number">Day {day.dayNum}</span>
-                    <span className="day-name">{day.name}</span>
-                  </div>
-                  <div className="day-content">
-                    {day.primaryFocus && (
-                      <div className="day-focus primary">
-                        <span className="focus-label">Primary:</span>
-                        <span className="focus-value">{day.primaryFocus}</span>
-                      </div>
-                    )}
-                    {day.secondary && (
-                      <div className="day-focus secondary">
-                        <span className="focus-label">Secondary:</span>
-                        <span className="focus-value">{day.secondary}</span>
-                      </div>
-                    )}
-                    {day.terrain && (
-                      <div className="day-terrain">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M3 17l6-6 4 4 8-8"/>
-                        </svg>
-                        {day.terrain}
-                      </div>
-                    )}
-                    {day.goal && (
-                      <div className="day-goal">
-                        <span className="goal-label">Goal:</span>
-                        <span className="goal-value">{day.goal}</span>
-                      </div>
-                    )}
-                  </div>
+          <div className="daily-timeline">
+            {dailySchedule.map((phase, idx) => (
+              <div key={idx} className={`daily-phase phase-${idx + 1}`}>
+                <div className="phase-marker">
+                  <div className="phase-dot"></div>
+                  {idx < dailySchedule.length - 1 && <div className="phase-line"></div>}
                 </div>
-              ))}
-            </div>
+                <div className="phase-content">
+                  <div className="phase-header">
+                    <span className="phase-runs">Run {phase.runs}</span>
+                    <span className="phase-name">{phase.phase}</span>
+                  </div>
+                  <ul className="phase-details">
+                    {phase.details.map((detail, dIdx) => <li key={dIdx}>{detail}</li>)}
+                  </ul>
+                </div>
+              </div>
+            ))}
           </div>
-        )}
+        </div>
 
-        {/* Weekly Game Plan - Priorities */}
-        {plan.weekPlan.length > 0 && (
+        {/* Weekly Training Schedule, sized to the days available */}
+        <div className="plan-section weekly-schedule-section">
+          <div className="section-header">
+            <span className="section-icon">{icon(<><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></>)}</span>
+            <h2>Weekly Training Schedule</h2>
+            <span className="section-badge">{weeklySchedule.length} Day{weeklySchedule.length === 1 ? '' : 's'}</span>
+          </div>
+          <div className="weekly-grid">
+            {weeklySchedule.map((day, idx) => (
+              <div key={idx} className={`day-card day-${idx + 1}`}>
+                <div className="day-header">
+                  <span className="day-number">Day {day.dayNum}</span>
+                  <span className="day-name">{day.name}</span>
+                </div>
+                <div className="day-content">
+                  <div className="day-focus primary"><span className="focus-label">Primary:</span><span className="focus-value">{day.primaryFocus}</span></div>
+                  <div className="day-focus secondary"><span className="focus-label">Then:</span><span className="focus-value">{day.secondary}</span></div>
+                  <div className="day-terrain">{day.terrain}</div>
+                  <div className="day-goal"><span className="goal-label">Goal:</span><span className="goal-value">{day.goal}</span></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Priorities */}
+        {plan.priorities?.length > 0 && (
           <div className="plan-section week-plan-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-                  <polyline points="22 4 12 14.01 9 11.01"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>)}</span>
               <h2>This Week's Priorities</h2>
             </div>
             <div className="priorities-cards">
-              {plan.weekPlan.map((priority, idx) => (
+              {plan.priorities.map((priority, idx) => (
                 <div key={idx} className={`priority-card priority-${idx + 1}`}>
                   <div className="priority-badge">Priority {idx + 1}</div>
-                  <h3>{priority.name}</h3>
-                  {(priority.current || priority.target) && (
-                    <div className="score-progression">
-                      <span className="current-score">{priority.current}</span>
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <line x1="5" y1="12" x2="19" y2="12"/>
-                        <polyline points="12 5 19 12 12 19"/>
-                      </svg>
-                      <span className="target-score">{priority.target}</span>
-                    </div>
-                  )}
-                  {priority.drill && (
+                  <h3>{priority.metric}</h3>
+                  <div className="score-progression">
+                    <span className="current-score">{priority.current}</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                    <span className="target-score">{priority.target}</span>
+                  </div>
+                  {priority.drill_name && (
                     <div className="drill-tag">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-                      </svg>
-                      {priority.drill}
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                      {priority.drill_name}
                     </div>
                   )}
-                  {priority.terrain && (
-                    <div className="terrain-tag">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                        <circle cx="9" cy="7" r="4"/>
-                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-                        <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                      </svg>
-                      {priority.terrain}
-                    </div>
-                  )}
+                  {priority.note && <p className="drill-why">{priority.note}</p>}
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        {/* Session Structure */}
-        {plan.sessionPlan.length > 0 && (
-          <div className="plan-section session-plan-section">
+        {/* Building on strengths */}
+        {plan.strengths?.length > 0 && (
+          <div className="plan-section checkpoints-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-                </svg>
-              </span>
-              <h2>Session Structure</h2>
+              <span className="section-icon">{icon(<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>)}</span>
+              <h2>Building on Strengths</h2>
             </div>
-            <div className="session-timeline">
-              {plan.sessionPlan.map((session, idx) => (
-                <div key={idx} className="session-item">
-                  <div className="session-marker">
-                    <div className="marker-dot"></div>
-                    {idx < plan.sessionPlan.length - 1 && <div className="marker-line"></div>}
-                  </div>
-                  <div className="session-content">
-                    <span className="session-run">{session.run}</span>
-                    <span className="session-activity">{session.activity}</span>
-                  </div>
-                </div>
+            <div className="checkpoints-list">
+              {plan.strengths.map((s, idx) => (
+                <div key={idx} className="checkpoint-item"><span><strong>{s.strength}:</strong> {s.how_to_use}</span></div>
               ))}
             </div>
           </div>
         )}
 
         {/* 4-Week Progression */}
-        {(plan.progression.week1_2.length > 0 || plan.progression.week3_4.length > 0) && (
+        {(plan.progression?.weeks_1_2?.length > 0 || plan.progression?.weeks_3_4?.length > 0) && (
           <div className="plan-section progression-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="12" y1="20" x2="12" y2="10"/>
-                  <line x1="18" y1="20" x2="18" y2="4"/>
-                  <line x1="6" y1="20" x2="6" y2="16"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></>)}</span>
               <h2>4-Week Progression</h2>
             </div>
             <div className="progression-grid">
-              {plan.progression.week1_2.length > 0 && (
-                <div className="progression-phase">
-                  <div className="phase-header">
-                    <span className="phase-icon">1-2</span>
-                    <h3>Foundation</h3>
-                  </div>
-                  <ul>
-                    {plan.progression.week1_2.map((item, idx) => (
-                      <li key={idx}>{item}</li>
-                    ))}
-                  </ul>
+              {[['1-2', 'Foundation', plan.progression.weeks_1_2, ''], ['3-4', 'Integration', plan.progression.weeks_3_4, ' phase-advanced']].map(([weeks, title, items, extra]) => items?.length > 0 && (
+                <div key={weeks} className={`progression-phase${extra}`}>
+                  <div className="phase-header"><span className="phase-icon">{weeks}</span><h3>{title}</h3></div>
+                  <ul>{items.map((item, idx) => <li key={idx}>{item}</li>)}</ul>
                 </div>
-              )}
-              {plan.progression.week3_4.length > 0 && (
-                <div className="progression-phase phase-advanced">
-                  <div className="phase-header">
-                    <span className="phase-icon">3-4</span>
-                    <h3>Integration</h3>
-                  </div>
-                  <ul>
-                    {plan.progression.week3_4.map((item, idx) => (
-                      <li key={idx}>{item}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              ))}
             </div>
           </div>
         )}
 
         {/* Progress Checkpoints */}
-        {plan.checkpoints.length > 0 && (
+        {plan.checkpoints?.length > 0 && (
           <div className="plan-section checkpoints-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-                  <polyline points="22 4 12 14.01 9 11.01"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>)}</span>
               <h2>Progress Checkpoints</h2>
             </div>
             <div className="checkpoints-list">
               {plan.checkpoints.map((checkpoint, idx) => (
                 <div key={idx} className="checkpoint-item">
                   <div className="checkpoint-icon">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="9 11 12 14 22 4"/>
-                      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
-                    </svg>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
                   </div>
-                  <span>{checkpoint}</span>
+                  <span><strong>{checkpoint.when}:</strong> {checkpoint.expect}</span>
                 </div>
               ))}
             </div>
@@ -1597,23 +1896,18 @@ function App() {
         )}
 
         {/* Mental Cues */}
-        {plan.mentalCues.length > 0 && (
+        {cues.length > 0 && (
           <div className="plan-section cues-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
-                  <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
-                  <line x1="12" y1="22.08" x2="12" y2="12"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>)}</span>
               <h2>Mental Cues</h2>
             </div>
             <div className="cues-grid">
-              {plan.mentalCues.map((cue, idx) => (
-                <div key={idx} className="cue-card">
+              {cues.map(([label, cue]) => (
+                <div key={label} className="cue-card">
                   <span className="cue-quote">"</span>
-                  <p>{cue.replace(/["]/g, '').replace(/^(Primary|Transition|Confidence)\s*Cue:\s*/i, '')}</p>
+                  <p>{cue}</p>
+                  <small>{label}</small>
                 </div>
               ))}
             </div>
@@ -1621,35 +1915,26 @@ function App() {
         )}
 
         {/* Traps to Avoid */}
-        {plan.traps.length > 0 && (
+        {plan.traps?.length > 0 && (
           <div className="plan-section traps-section">
             <div className="section-header">
-              <span className="section-icon warning-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-                  <line x1="12" y1="9" x2="12" y2="13"/>
-                  <line x1="12" y1="17" x2="12.01" y2="17"/>
-                </svg>
-              </span>
+              <span className="section-icon warning-icon">{icon(<><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></>)}</span>
               <h2>Traps to Avoid</h2>
             </div>
             <div className="traps-list">
               {plan.traps.map((trap, idx) => (
                 <div key={idx} className="trap-item">
                   <span className="trap-icon">!</span>
-                  <span>{trap}</span>
+                  <span>{trap.trap}{trap.instead ? `. Instead: ${trap.instead}` : ''}</span>
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        {/* Motivational Footer */}
         <div className="plan-footer">
           <div className="footer-quote">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-            </svg>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
             <p>Perfect practice makes perfect. 10 focused turns beat 100 mindless ones!</p>
           </div>
         </div>
@@ -1661,6 +1946,8 @@ function App() {
   const clearAll = () => {
     setSelectedFiles([])
     setAnalysis(null)
+    setLoadedLogId(null)
+    setEditingValues(false)
     setTrainingPlan(null)
     setError(null)
     if (fileInputRef.current) {
@@ -1688,24 +1975,61 @@ function App() {
       // Use session_datetime from CARV screenshot as master timestamp (priority 1)
       // Fall back to sessionDateTime (from EXIF/filename) (priority 2)
       // Finally fall back to current time (priority 3)
-      const masterDateTime = analysis?.session_overview?.session_datetime ||
-        sessionDateTime ||
-        new Date().toISOString()
+      // All three are local wall-clock times with no timezone, so the database
+      // stores the time shown on the CARV screen rather than a UTC-shifted one
+      const masterDateTime = normaliseLocalDateTime(analysis?.session_overview?.session_datetime) ||
+        normaliseLocalDateTime(sessionDateTime) ||
+        toLocalInputValue()
 
-      // Save to database first (source of truth)
+      // Store the scoring version explicitly so later comparisons don't depend on a guess
+      const analysisToSave = {
+        ...analysis,
+        session_overview: {
+          ...(analysis.session_overview || {}),
+          ski_iq_version: getSkiIQVersion(analysis, masterDateTime)
+        }
+      }
+
+      // Same run saved before (same time and, when known, same location)? The same Carv
+      // run can be screenshotted twice, e.g. before and after the Carv app 10 update.
+      const location = analysis?.session_overview?.location || null
+      // A session opened from history is updated in place, even if its date was corrected
+      const openedLog = loadedLogId ? progressLogs.find(log => log.id === loadedLogId) : null
+      const existingLog = openedLog || progressLogs.find(log =>
+        normaliseLocalDateTime(log.datetime) === masterDateTime &&
+        (!location || !log.analysis?.session_overview?.location || log.analysis.session_overview.location === location)
+      )
+      if (existingLog && !openedLog && !window.confirm(
+        `A session at ${formatDateTime(existingLog.datetime, existingLog.datetimeDisplay)} is already saved. Replace it with this analysis?\n\nOK replaces it. Cancel keeps the existing one and does not save.`
+      )) {
+        setShowSaveDialog(false)
+        return
+      }
+
+      const sessionPayload = {
+        session_date: masterDateTime,
+        location,
+        metrics: analysisToSave,
+        training_plan: serializePlan(trainingPlan),
+        notes: sessionNotes
+      }
+
+      // Save to database first (source of truth): update the existing copy or create a new one
       let dbSession = null
       try {
-        dbSession = await saveSessionToDb({
-          session_date: masterDateTime,
-          location: analysis?.session_overview?.location || null,
-          metrics: analysis,
-          training_plan: trainingPlan,
-          notes: sessionNotes
-        })
+        if (existingLog?.dbSessionId) {
+          const response = await axios.put(`${API_BASE_URL}/sessions/${existingLog.dbSessionId}`, sessionPayload)
+          dbSession = response.data
+          setDbSessions(prev => prev.map(s => s.id === dbSession.id ? dbSession : s))
+        } else {
+          dbSession = await saveSessionToDb(sessionPayload)
+        }
       } catch (err) {
         console.warn('Database save failed, saving to localStorage only:', err)
       }
 
+      // The server's copy has the grouped fields and averages recomputed
+      const savedAnalysis = dbSession?.metrics || analysisToSave
       const logEntry = {
         id: dbSession?.id || `log-${Date.now()}`,
         dbSessionId: dbSession?.id || null,
@@ -1715,19 +2039,23 @@ function App() {
           (sessionDateTime ? 'exif_or_filename' : 'current_time'),
         notes: sessionNotes,
         savedAt: new Date().toISOString(),
-        analysis: analysis,
+        analysis: savedAnalysis,
         trainingPlan: trainingPlan,
         metrics: {
           skiIQ: skiIQ,
-          balance: analysis.overall_metrics?.balance,
-          edging: analysis.overall_metrics?.edging,
-          rotary: analysis.overall_metrics?.rotary,
-          performance: analysis.overall_metrics?.performance
+          balance: savedAnalysis.overall_metrics?.balance,
+          edging: savedAnalysis.overall_metrics?.edging,
+          rotary: savedAnalysis.overall_metrics?.rotary,
+          performance: savedAnalysis.overall_metrics?.performance
         }
       }
 
-      // Save to localStorage as cache (no base64 previews)
-      setProgressLogs(prev => [...prev, logEntry])
+      // Save to localStorage as cache (no base64 previews); a replaced run swaps in place
+      setProgressLogs(prev => existingLog
+        ? prev.map(log => log.id === existingLog.id ? { ...logEntry, id: existingLog.id, dbSessionId: dbSession?.id || existingLog.dbSessionId } : log)
+        : [...prev, logEntry])
+      setAnalysis(savedAnalysis)
+      setLoadedLogId(existingLog ? existingLog.id : logEntry.id)
 
       setShowSaveDialog(false)
       setSessionNotes('')
@@ -1744,21 +2072,24 @@ function App() {
   const deleteProgressLog = async (logId) => {
     const logToDelete = progressLogs.find(log => log.id === logId)
 
+    // Delete the database copy first; if that fails keep the local entry,
+    // otherwise the session would silently come back on the next load
+    const dbId = logToDelete?.dbSessionId
+    if (dbId) {
+      try {
+        await deleteSessionFromDb(dbId)
+      } catch (err) {
+        setError('Could not delete this session from the cloud database, so it has been kept. Please try again.')
+        setDeleteConfirmId(null)
+        return
+      }
+    }
+
     // Remove from localStorage state
     setProgressLogs(prev => prev.filter(log => log.id !== logId))
 
     if (selectedLogForComparison?.id === logId) {
       setSelectedLogForComparison(null)
-    }
-
-    // Remove from database if it has a DB session ID
-    const dbId = logToDelete?.dbSessionId || logId
-    if (dbId) {
-      try {
-        await deleteSessionFromDb(dbId)
-      } catch (err) {
-        console.warn('Failed to delete from database:', err)
-      }
     }
 
     setDeleteConfirmId(null)
@@ -1769,13 +2100,17 @@ function App() {
     // Warn if current analysis hasn't been saved
     if (analysis && !progressLogs.some(l => l.analysis === analysis)) {
       if (!window.confirm('You have an unsaved analysis. Loading a previous session will overwrite it. Continue?')) {
-        return
+        return false
       }
     }
     setAnalysis(log.analysis)
-    setTrainingPlan(log.trainingPlan)
-    setSessionDateTime(log.datetime)
+    setLoadedLogId(log.id)
+    setSessionNotes(log.notes || '') // so saving again keeps the session's notes
+    setEditingValues(false)
+    setTrainingPlan(parseStoredPlan(log.trainingPlan))
+    setSessionDateTime(normaliseLocalDateTime(log.datetime) || '')
     setShowProgressPanel(false)
+    return true
   }
 
   // Get metric value from a log
@@ -1834,24 +2169,28 @@ function App() {
   }
 
   // Render comparison metric row
-  const renderComparisonRow = (label, valueA, valueB, unit = '') => {
-    const diff = valueA !== null && valueB !== null ? valueB - valueA : null
-    const percentChange = valueA && diff ? ((diff / valueA) * 100) : null
+  const renderComparisonRow = (label, valueA, valueB, unit = '', neutral = false) => {
+    const hasA = valueA !== null && valueA !== undefined
+    const hasB = valueB !== null && valueB !== undefined
+    const diff = hasA && hasB ? valueB - valueA : null
+    const percentChange = hasA && valueA !== 0 && diff ? ((diff / valueA) * 100) : null
+    const decimals = unit === 'g' ? 1 : 0
+    const formatDiff = (d) => `${d > 0 ? '+' : ''}${d.toFixed(decimals)}`
     return (
       <div className="comparison-row">
         <span className="comparison-label">{label}</span>
-        <span className="comparison-value old">{valueA !== null ? Math.round(valueA) : '-'}{unit}</span>
-        <span className={`comparison-diff ${diff > 0 ? 'positive' : diff < 0 ? 'negative' : ''}`}>
+        <span className="comparison-value old">{hasA ? formatMetricValue(valueA, unit) : '-'}</span>
+        <span className={`comparison-diff ${neutral ? '' : diff > 0 ? 'positive' : diff < 0 ? 'negative' : ''}`}>
           {diff !== null ? (
             <>
-              {diff > 0 ? '+' : ''}{Math.round(diff)}
+              {formatDiff(diff)}
               {percentChange !== null && Math.abs(percentChange) >= 1 && (
                 <small> ({percentChange > 0 ? '+' : ''}{percentChange.toFixed(1)}%)</small>
               )}
             </>
           ) : '-'}
         </span>
-        <span className="comparison-value new">{valueB !== null ? Math.round(valueB) : '-'}{unit}</span>
+        <span className="comparison-value new">{hasB ? formatMetricValue(valueB, unit) : '-'}</span>
       </div>
     )
   }
@@ -1860,6 +2199,9 @@ function App() {
   const sortedLogs = [...progressLogs].sort((a, b) =>
     new Date(b.datetime) - new Date(a.datetime)
   )
+
+  // Sessions saved only in this browser (not yet in the cloud database)
+  const unsyncedLogCount = progressLogs.filter(log => !log.dbSessionId).length
 
   // Login screen
   if (!isAuthenticated) {
@@ -1883,8 +2225,8 @@ function App() {
               />
             </div>
             {authError && <div className="login-error">{authError}</div>}
-            <button type="submit" className="login-btn">
-              Enter
+            <button type="submit" className="login-btn" disabled={loggingIn}>
+              {loggingIn ? 'Signing in...' : 'Enter'}
             </button>
           </form>
         </div>
@@ -1998,6 +2340,18 @@ function App() {
             </button>
             {analysis && (
               <>
+                <div className="plan-options">
+                  <label>
+                    Ski days
+                    <input type="number" min="1" max="7" value={planDays}
+                      onChange={(e) => setPlanDays(Math.min(7, Math.max(1, Number(e.target.value) || 1)))} />
+                  </label>
+                  <label>
+                    Runs a day
+                    <input type="number" min="4" max="20" value={planRuns}
+                      onChange={(e) => setPlanRuns(Math.min(20, Math.max(4, Number(e.target.value) || 4)))} />
+                  </label>
+                </div>
                 <button
                   className="btn btn-secondary"
                   onClick={generateTrainingPlan}
@@ -2066,6 +2420,25 @@ function App() {
                 )}
                 <div className="session-stats">
                   <div className="stat">
+                    <button type="button" className="edit-values-btn" onClick={() => setEditingValues(v => !v)}>
+                      {editingValues ? 'Done editing' : 'Edit values'}
+                    </button>
+                    {analysis.user_corrected?.length > 0 && <span className="stat-label">Corrected by you</span>}
+                  </div>
+                  <div className="stat">
+                    <label className="version-select-label" htmlFor="ski-iq-version">Scoring</label>
+                    <select
+                      id="ski-iq-version"
+                      className="version-select"
+                      value={getSkiIQVersion(analysis, sessionDateTime) || ''}
+                      onChange={(e) => setAnalysisSkiIQVersion(e.target.value)}
+                      title="Ski:IQ 26 (Stelvio) rescored off-piste runs about 4.5 points higher. Change this if the guess is wrong."
+                    >
+                      <option value="stelvio">Ski:IQ 26 (Stelvio)</option>
+                      <option value="wasatch">Pre-26 (Wasatch)</option>
+                    </select>
+                  </div>
+                  <div className="stat">
                     <span className="stat-value">{analysis.num_screenshots}</span>
                     <span className="stat-label">Screenshots Analyzed</span>
                   </div>
@@ -2084,6 +2457,9 @@ function App() {
                 </div>
               </div>
             </section>
+
+            {/* Value editor sits right under the banner so it's in view when opened */}
+            {editingValues && renderValueEditor()}
 
             {/* Holistic Analysis */}
             {analysis.holistic_analysis && (
@@ -2124,8 +2500,14 @@ function App() {
               </section>
             )}
 
-            {/* Metrics Grid */}
-            {analysis.overall_metrics && (
+            {/* Carv metrics as Carv shows them (current analyses) */}
+            {(analysis.carv_metrics || analysis.run_details) ? (
+              <section className="metrics-section">
+                <h2>Carv Metrics</h2>
+                {renderRunDetails(analysis.run_details)}
+                {renderCarvMetrics(analysis.carv_metrics)}
+              </section>
+            ) : analysis.overall_metrics && (
               <section className="metrics-section">
                 <h2>Overall Metrics</h2>
                 <div className="metrics-grid">
@@ -2323,7 +2705,7 @@ function App() {
             ) : (
               <div className="progress-panel-content">
                 {/* Migration Banner - Show if local logs exist but not all are in DB */}
-                {progressLogs.length > 0 && progressLogs.length > dbSessions.length && (
+                {unsyncedLogCount > 0 && (
                   <div className="migration-banner">
                     <div className="migration-info">
                       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2331,7 +2713,10 @@ function App() {
                         <polyline points="17 8 12 3 7 8"/>
                         <line x1="12" y1="3" x2="12" y2="15"/>
                       </svg>
-                      <span>{progressLogs.length} local session{progressLogs.length !== 1 ? 's' : ''} found</span>
+                      <span>
+                        {unsyncedLogCount} session{unsyncedLogCount !== 1 ? 's' : ''} only on this device
+                        {dbLoadFailed && ' (cloud database unreachable)'}
+                      </span>
                     </div>
                     <button
                       className="migrate-btn"
@@ -2356,7 +2741,7 @@ function App() {
                   <div className="progression-analysis-section">
                     <button
                       className="progression-btn"
-                      onClick={analyzeProgression}
+                      onClick={() => analyzeProgression()}
                       disabled={loadingProgression}
                     >
                       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2377,173 +2762,163 @@ function App() {
                   </div>
                 )}
 
-                {/* Progression Line Chart */}
-                {sortedLogs.length > 1 && (
-                  <div className="progress-chart-container">
-                    <div className="chart-header">
-                      <h3>Progression Over Time</h3>
-                      <div className="metric-selector">
-                        <select
-                          value={selectedMetric}
-                          onChange={(e) => setSelectedMetric(e.target.value)}
-                          className="metric-select"
-                        >
-                          <option value="skiIQ">Ski:IQ</option>
-                          <option value="balance">Balance</option>
-                          <option value="edging">Edging</option>
-                          <option value="rotary">Rotary</option>
-                          <option value="gforce">G-Force</option>
+                {/* Progression chart: Ski:IQ or any Carv metric, filtered to like-for-like sessions */}
+                {sortedLogs.length > 1 && (() => {
+                  const metricDef = CARV_METRIC_DEFS.find(d => d.key === selectedMetric)
+                  const unit = metricDef ? metricDef.unit : ''
+                  const metricLabel = metricDef ? metricDef.label : 'Ski:IQ'
+                  const valueOf = (log) => metricDef ? getLogMetricValue(log, metricDef) : log.metrics?.skiIQ
+                  const techniqueOf = (log) => (log.analysis?.run_details?.technique || '').toLowerCase() || 'unknown'
+                  const snowOf = (log) => (log.analysis?.run_details?.snow_surface || '').toLowerCase() || 'unknown'
+                  const optionsFor = (fn) => [...new Set(sortedLogs.map(fn))].sort((a, b) => (a === 'unknown') - (b === 'unknown') || a.localeCompare(b))
+                  const techniques = optionsFor(techniqueOf)
+                  const snows = optionsFor(snowOf)
+                  const capitalise = (t) => t.charAt(0).toUpperCase() + t.slice(1)
+                  const chartLogs = [...sortedLogs].reverse()
+                    .filter(log => chartTechnique === 'all' || techniqueOf(log) === chartTechnique)
+                    .filter(log => chartSnow === 'all' || snowOf(log) === chartSnow)
+                  const points = chartLogs.map(log => ({ log, val: valueOf(log) })).filter(p => p.val !== null && p.val !== undefined)
+                  const formatVal = (v) => formatMetricValue(v, unit)
+                  const versions = points.map(p => getSkiIQVersion(p.log.analysis, p.log.datetime))
+                  const mixedVersions = selectedMetric === 'skiIQ' && new Set(versions.filter(Boolean)).size > 1
+
+                  let chart = <div className="no-chart-data">Not enough sessions with this metric{chartTechnique !== 'all' || chartSnow !== 'all' ? ' for these filters' : ''} yet</div>
+                  let summary = null
+                  if (points.length >= 2) {
+                    const values = points.map(p => p.val)
+                    const pad = unit === 'g' ? 0.2 : 5
+                    const minVal = Math.min(...values) - pad
+                    const maxVal = Math.max(...values) + pad
+                    const range = maxVal - minVal || 1
+                    const width = 340
+                    const height = 120
+                    const padding = { top: 10, right: 10, bottom: 25, left: 35 }
+                    const chartWidth = width - padding.left - padding.right
+                    const chartHeight = height - padding.top - padding.bottom
+                    const xy = points.map((p, idx) => ({
+                      ...p,
+                      x: padding.left + (idx / (points.length - 1)) * chartWidth,
+                      y: padding.top + chartHeight - ((p.val - minVal) / range) * chartHeight
+                    }))
+                    const pathD = xy.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
+                    const areaD = `${pathD} L ${xy[xy.length - 1].x} ${height - padding.bottom} L ${xy[0].x} ${height - padding.bottom} Z`
+                    const trend = values[values.length - 1] - values[0]
+                    // Turn Closure and Slope Pitch aren't "higher is better", so their trend isn't coloured
+                    const neutral = metricDef && (metricDef.zoneOnly || metricDef.key === 'slope_pitch')
+                    const colour = neutral ? '#667eea' : trend >= 0 ? '#28a745' : '#dc3545'
+                    const boundaryIdx = versions.findIndex((v, i) => i > 0 && v === 'stelvio' && versions[i - 1] === 'wasatch')
+                    const boundaryX = selectedMetric === 'skiIQ' && boundaryIdx > 0 ? (xy[boundaryIdx - 1].x + xy[boundaryIdx].x) / 2 : null
+                    chart = (
+                      <svg viewBox={`0 0 ${width} ${height}`} className="line-chart-svg" role="img" aria-label={`${metricLabel} over time`}>
+                        {[0, 0.25, 0.5, 0.75, 1].map((pct, i) => (
+                          <g key={i}>
+                            <line x1={padding.left} y1={padding.top + chartHeight * pct} x2={width - padding.right} y2={padding.top + chartHeight * pct} stroke="#e0e0e0" strokeWidth="1" />
+                            <text x={padding.left - 5} y={padding.top + chartHeight * pct + 4} textAnchor="end" fontSize="9" fill="#999">
+                              {unit === 'g' ? (maxVal - range * pct).toFixed(1) : Math.round(maxVal - range * pct)}
+                            </text>
+                          </g>
+                        ))}
+                        {boundaryX !== null && (
+                          <g>
+                            <line x1={boundaryX} y1={padding.top} x2={boundaryX} y2={height - padding.bottom} stroke="#667eea" strokeWidth="1" strokeDasharray="3 3" />
+                            <text x={boundaryX + 3} y={padding.top + 8} fontSize="8" fill="#667eea">Ski:IQ 26</text>
+                            <title>Carv changed Ski:IQ scoring here (Ski:IQ 26 Stelvio). Off-piste scores rose about 4.5 points for the same skiing.</title>
+                          </g>
+                        )}
+                        <defs>
+                          <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" stopColor={colour} stopOpacity="0.3" />
+                            <stop offset="100%" stopColor={colour} stopOpacity="0.05" />
+                          </linearGradient>
+                        </defs>
+                        <path d={areaD} fill="url(#chartGradient)" />
+                        <path d={pathD} fill="none" stroke={colour} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                        {xy.map((p, i) => (
+                          <g key={i}>
+                            <circle cx={p.x} cy={p.y} r="5" fill="white" stroke={colour} strokeWidth="2" className="chart-point" />
+                            <title>{`${new Date(p.log.datetime).toLocaleDateString()}: ${formatVal(p.val)}`}</title>
+                            {(i === 0 || i === xy.length - 1 || (xy.length > 4 && i === Math.floor(xy.length / 2))) && (
+                              <text x={p.x} y={height - 5} textAnchor="middle" fontSize="8" fill="#666">
+                                {new Date(p.log.datetime).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                              </text>
+                            )}
+                          </g>
+                        ))}
+                      </svg>
+                    )
+                    const decimals = unit === 'g' ? 1 : 0
+                    summary = (
+                      <>
+                        <span className="summary-label">{metricLabel} trend:</span>
+                        <span className={`summary-value ${neutral ? '' : trend >= 0 ? 'positive' : 'negative'}`}>
+                          {trend >= 0 ? '+' : ''}{trend.toFixed(decimals)}{unit === '' ? ' pts' : unit === 'g' ? ' g' : unit}
+                        </span>
+                        <span className="summary-range">({formatVal(values[0])} → {formatVal(values[values.length - 1])}, {points.length} sessions)</span>
+                        {mixedVersions && (
+                          <span className="summary-note">Includes Ski:IQ 26 rescoring: off-piste scores rose about 4.5 points for the same skiing.</span>
+                        )}
+                      </>
+                    )
+                  }
+
+                  // Left/right: Edging Similarity over the filtered sessions, plus L/R averages
+                  // from turn-by-turn charts when a Metric Details screenshot was analysed
+                  const similarityDef = CARV_METRIC_DEFS.find(d => d.key === 'edging_similarity')
+                  const similarity = chartLogs.map(log => ({ log, val: getLogMetricValue(log, similarityDef) })).filter(p => p.val !== null)
+                  const latestTurnData = [...chartLogs].reverse().find(log => log.analysis?.run_details?.turn_by_turn?.length)
+                  const sideAverages = (latestTurnData?.analysis.run_details.turn_by_turn || []).map(series => {
+                    const side = (s) => series.turns?.filter(t => t.side === s && typeof t.value === 'number') || []
+                    const avg = (list) => list.length ? list.reduce((a, t) => a + t.value, 0) / list.length : null
+                    const def = CARV_METRIC_DEFS.find(d => d.key === series.metric)
+                    return { label: def?.label || series.metric, unit: def?.unit || '', left: avg(side('L')), right: avg(side('R')) }
+                  }).filter(s => s.left !== null && s.right !== null)
+
+                  return (
+                    <div className="progress-chart-container">
+                      <div className="chart-header">
+                        <h3>Progression Over Time</h3>
+                        <div className="metric-selector">
+                          <select value={selectedMetric} onChange={(e) => setSelectedMetric(e.target.value)} className="metric-select" aria-label="Metric">
+                            <option value="skiIQ">Ski:IQ</option>
+                            {CARV_METRIC_DEFS.map(def => <option key={def.key} value={def.key}>{def.label}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                      <div className="chart-filters">
+                        <select value={chartTechnique} onChange={(e) => setChartTechnique(e.target.value)} aria-label="Technique">
+                          <option value="all">All techniques</option>
+                          {techniques.map(t => <option key={t} value={t}>{capitalise(t)}</option>)}
+                        </select>
+                        <select value={chartSnow} onChange={(e) => setChartSnow(e.target.value)} aria-label="Snow">
+                          <option value="all">All snow</option>
+                          {snows.map(t => <option key={t} value={t}>{capitalise(t)}</option>)}
                         </select>
                       </div>
+                      <div className="line-chart-container">{chart}</div>
+                      {summary && <div className="chart-summary">{summary}</div>}
+                      {techniques.includes('unknown') && (
+                        <p className="chart-hint">Older sessions without a technique show as Unknown. Open one and use Edit values to tag it.</p>
+                      )}
+                      {(similarity.length > 0 || sideAverages.length > 0) && (
+                        <div className="lr-panel">
+                          <div className="lr-title">Left / right</div>
+                          {similarity.length > 0 && (
+                            <div className="lr-row">
+                              <span>Edging Similarity</span>
+                              <span className="lr-values">{similarity.slice(-5).map(p => formatMetricValue(p.val, '%')).join(' → ')}</span>
+                            </div>
+                          )}
+                          {sideAverages.map(s => (
+                            <div key={s.label} className="lr-row">
+                              <span>{s.label} (latest turn-by-turn)</span>
+                              <span className="lr-values">L {formatMetricValue(s.left, s.unit)} · R {formatMetricValue(s.right, s.unit)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <div className="line-chart-container">
-                      {(() => {
-                        const chartLogs = [...sortedLogs].reverse()
-                        const getMetricValue = (log) => {
-                          switch(selectedMetric) {
-                            case 'skiIQ': return log.metrics.skiIQ
-                            case 'balance': return log.metrics.balance?.category_average
-                            case 'edging': return log.metrics.edging?.category_average
-                            case 'rotary': return log.metrics.rotary?.category_average
-                            case 'gforce': return log.metrics.performance?.turn_g_force
-                            default: return log.metrics.skiIQ
-                          }
-                        }
-                        const values = chartLogs.map(l => getMetricValue(l)).filter(v => v != null)
-                        if (values.length < 2) return <div className="no-chart-data">Not enough data for chart</div>
-
-                        const minVal = Math.min(...values) - 5
-                        const maxVal = Math.max(...values) + 5
-                        const range = maxVal - minVal || 20
-                        const width = 340
-                        const height = 120
-                        const padding = { top: 10, right: 10, bottom: 25, left: 35 }
-                        const chartWidth = width - padding.left - padding.right
-                        const chartHeight = height - padding.top - padding.bottom
-
-                        const points = chartLogs.map((log, idx) => {
-                          const val = getMetricValue(log)
-                          if (val == null) return null
-                          const x = padding.left + (idx / (chartLogs.length - 1)) * chartWidth
-                          const y = padding.top + chartHeight - ((val - minVal) / range) * chartHeight
-                          return { x, y, val, date: log.datetime, log }
-                        }).filter(Boolean)
-
-                        const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
-                        const areaD = `${pathD} L ${points[points.length-1].x} ${height - padding.bottom} L ${points[0].x} ${height - padding.bottom} Z`
-
-                        // Calculate trend
-                        const firstVal = values[0]
-                        const lastVal = values[values.length - 1]
-                        const trend = lastVal - firstVal
-
-                        return (
-                          <svg viewBox={`0 0 ${width} ${height}`} className="line-chart-svg">
-                            {/* Grid lines */}
-                            {[0, 0.25, 0.5, 0.75, 1].map((pct, i) => (
-                              <g key={i}>
-                                <line
-                                  x1={padding.left}
-                                  y1={padding.top + chartHeight * pct}
-                                  x2={width - padding.right}
-                                  y2={padding.top + chartHeight * pct}
-                                  stroke="#e0e0e0"
-                                  strokeWidth="1"
-                                />
-                                <text
-                                  x={padding.left - 5}
-                                  y={padding.top + chartHeight * pct + 4}
-                                  textAnchor="end"
-                                  fontSize="9"
-                                  fill="#999"
-                                >
-                                  {Math.round(maxVal - (range * pct))}
-                                </text>
-                              </g>
-                            ))}
-
-                            {/* Gradient fill under line */}
-                            <defs>
-                              <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                                <stop offset="0%" stopColor={trend >= 0 ? "#28a745" : "#dc3545"} stopOpacity="0.3"/>
-                                <stop offset="100%" stopColor={trend >= 0 ? "#28a745" : "#dc3545"} stopOpacity="0.05"/>
-                              </linearGradient>
-                            </defs>
-                            <path d={areaD} fill="url(#chartGradient)" />
-
-                            {/* Line */}
-                            <path
-                              d={pathD}
-                              fill="none"
-                              stroke={trend >= 0 ? "#28a745" : "#dc3545"}
-                              strokeWidth="2.5"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            />
-
-                            {/* Data points */}
-                            {points.map((p, i) => (
-                              <g key={i}>
-                                <circle
-                                  cx={p.x}
-                                  cy={p.y}
-                                  r="5"
-                                  fill="white"
-                                  stroke={trend >= 0 ? "#28a745" : "#dc3545"}
-                                  strokeWidth="2"
-                                  className="chart-point"
-                                />
-                                <title>{`${new Date(p.date).toLocaleDateString()}: ${Math.round(p.val)}`}</title>
-                                {/* Date labels for first, middle, last */}
-                                {(i === 0 || i === points.length - 1 || (points.length > 4 && i === Math.floor(points.length / 2))) && (
-                                  <text
-                                    x={p.x}
-                                    y={height - 5}
-                                    textAnchor="middle"
-                                    fontSize="8"
-                                    fill="#666"
-                                  >
-                                    {new Date(p.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                                  </text>
-                                )}
-                              </g>
-                            ))}
-                          </svg>
-                        )
-                      })()}
-                    </div>
-                    <div className="chart-summary">
-                      {(() => {
-                        const getMetricValue = (log) => {
-                          switch(selectedMetric) {
-                            case 'skiIQ': return log.metrics.skiIQ
-                            case 'balance': return log.metrics.balance?.category_average
-                            case 'edging': return log.metrics.edging?.category_average
-                            case 'rotary': return log.metrics.rotary?.category_average
-                            case 'gforce': return log.metrics.performance?.turn_g_force
-                            default: return log.metrics.skiIQ
-                          }
-                        }
-                        const chartLogs = [...sortedLogs].reverse()
-                        const values = chartLogs.map(l => getMetricValue(l)).filter(v => v != null)
-                        if (values.length < 2) return null
-                        const firstVal = values[0]
-                        const lastVal = values[values.length - 1]
-                        const trend = lastVal - firstVal
-                        const metricLabels = { skiIQ: 'Ski:IQ', balance: 'Balance', edging: 'Edging', rotary: 'Rotary', gforce: 'G-Force' }
-                        return (
-                          <>
-                            <span className="summary-label">{metricLabels[selectedMetric]} Trend:</span>
-                            <span className={`summary-value ${trend >= 0 ? 'positive' : 'negative'}`}>
-                              {trend >= 0 ? '+' : ''}{trend.toFixed(1)} pts
-                            </span>
-                            <span className="summary-range">({Math.round(firstVal)} → {Math.round(lastVal)})</span>
-                          </>
-                        )
-                      })()}
-                    </div>
-                  </div>
-                )}
+                  )
+                })()}
 
                 {/* Logs List - All Sessions */}
                 <div className="logs-list">
@@ -2578,6 +2953,16 @@ function App() {
                             </div>
                           </div>
                           <div className="log-header-right">
+                            {(() => {
+                              const version = getSkiIQVersion(log.analysis, log.datetime)
+                              const technique = log.analysis?.run_details?.technique
+                              return (
+                                <>
+                                  {technique && <span className="log-tag">{technique}</span>}
+                                  {version && <span className={`log-tag version-${version}`}>{SKI_IQ_VERSION_LABELS[version]}</span>}
+                                </>
+                              )
+                            })()}
                             <div className="log-skiiq-badge">
                               <span className="skiiq-value">{log.metrics.skiIQ ? Math.round(log.metrics.skiIQ) : '?'}</span>
                               {skiIQChange !== null && (
@@ -2591,7 +2976,8 @@ function App() {
 
                         {isExpanded && (
                           <div className="log-card-body">
-                            {/* Metrics Grid */}
+                            {/* Carv metrics with units for current analyses; grouped bars for older ones */}
+                            {log.analysis?.carv_metrics ? renderCarvMetrics(log.analysis.carv_metrics) : (
                             <div className="log-metrics-expanded">
                               <div className="metric-row">
                                 <span className="metric-name">Balance</span>
@@ -2628,12 +3014,13 @@ function App() {
                                 <div className="metric-bar-container">
                                   <div
                                     className="metric-bar gforce"
-                                    style={{ width: `${log.metrics.performance?.turn_g_force || 0}%` }}
+                                    style={{ width: `${Math.min(100, ((log.metrics.performance?.turn_g_force || 0) / 3) * 100)}%` }}
                                   />
                                 </div>
-                                <span className="metric-val">{log.metrics.performance?.turn_g_force ? Math.round(log.metrics.performance.turn_g_force) : '-'}</span>
+                                <span className="metric-val">{log.metrics.performance?.turn_g_force ? `${Number(log.metrics.performance.turn_g_force).toFixed(1)} g` : '-'}</span>
                               </div>
                             </div>
+                            )}
 
                             {/* Notes */}
                             {log.notes && (
@@ -2655,6 +3042,11 @@ function App() {
                                 </svg>
                                 View Analysis
                               </button>
+                              {isStructuredPlan(parseStoredPlan(log.trainingPlan)) && (
+                                <button className="load-log-btn" onClick={() => { if (loadProgressLog(log)) setShowToday(true) }}>
+                                  On the hill
+                                </button>
+                              )}
                               {sortedLogs.length > 1 && (
                                 <button
                                   className={`compare-log-btn ${selectedLogForComparison?.id === log.id ? 'active' : ''}`}
@@ -2847,68 +3239,35 @@ function App() {
                   <span>Current</span>
                 </div>
                 {renderComparisonRow('Ski:IQ', comparisonLogA.metrics?.skiIQ, comparisonLogB.metrics?.skiIQ)}
+                {getSkiIQVersion(comparisonLogA.analysis, comparisonLogA.datetime) !== getSkiIQVersion(comparisonLogB.analysis, comparisonLogB.datetime) && (
+                  <p className="comparison-note">These sessions were scored with different Ski:IQ versions. Ski:IQ 26 raised off-piste scores by about 4.5 points for the same skiing, so part of any change may be the rescoring.</p>
+                )}
               </div>
 
-              {/* Balance */}
+              {/* Carv metrics (Carv's list and units; older sessions use their saved fields) */}
               <div className="comparison-section">
-                <h3>Balance</h3>
+                <h3>Carv Metrics</h3>
                 <div className="comparison-header-row">
                   <span></span>
                   <span>Baseline</span>
                   <span>Change</span>
                   <span>Current</span>
                 </div>
-                {renderComparisonRow('Category Average', comparisonLogA.metrics?.balance?.category_average, comparisonLogB.metrics?.balance?.category_average)}
-                {renderComparisonRow('Centered Balance', comparisonLogA.metrics?.balance?.centered_balance, comparisonLogB.metrics?.balance?.centered_balance)}
-                {renderComparisonRow('Start of Turn', comparisonLogA.metrics?.balance?.start_of_turn, comparisonLogB.metrics?.balance?.start_of_turn)}
-                {renderComparisonRow('Transition Weight', comparisonLogA.metrics?.balance?.transition_weight_release, comparisonLogB.metrics?.balance?.transition_weight_release)}
-              </div>
-
-              {/* Edging */}
-              <div className="comparison-section">
-                <h3>Edging</h3>
-                <div className="comparison-header-row">
-                  <span></span>
-                  <span>Baseline</span>
-                  <span>Change</span>
-                  <span>Current</span>
-                </div>
-                {renderComparisonRow('Category Average', comparisonLogA.metrics?.edging?.category_average, comparisonLogB.metrics?.edging?.category_average)}
-                {renderComparisonRow('Edge Angle', comparisonLogA.metrics?.edging?.edge_angle, comparisonLogB.metrics?.edging?.edge_angle)}
-                {renderComparisonRow('Early Edging', comparisonLogA.metrics?.edging?.early_edging, comparisonLogB.metrics?.edging?.early_edging)}
-                {renderComparisonRow('Edging Similarity', comparisonLogA.metrics?.edging?.edging_similarity, comparisonLogB.metrics?.edging?.edging_similarity)}
-                {renderComparisonRow('Progressive Edge', comparisonLogA.metrics?.edging?.progressive_edge_build, comparisonLogB.metrics?.edging?.progressive_edge_build)}
-              </div>
-
-              {/* Rotary */}
-              <div className="comparison-section">
-                <h3>Rotary</h3>
-                <div className="comparison-header-row">
-                  <span></span>
-                  <span>Baseline</span>
-                  <span>Change</span>
-                  <span>Current</span>
-                </div>
-                {renderComparisonRow('Category Average', comparisonLogA.metrics?.rotary?.category_average, comparisonLogB.metrics?.rotary?.category_average)}
-                {renderComparisonRow('Parallel Skis', comparisonLogA.metrics?.rotary?.parallel_skis, comparisonLogB.metrics?.rotary?.parallel_skis)}
-                {renderComparisonRow('Turn Shape', comparisonLogA.metrics?.rotary?.turn_shape, comparisonLogB.metrics?.rotary?.turn_shape)}
-              </div>
-
-              {/* Performance */}
-              <div className="comparison-section">
-                <h3>Performance</h3>
-                <div className="comparison-header-row">
-                  <span></span>
-                  <span>Baseline</span>
-                  <span>Change</span>
-                  <span>Current</span>
-                </div>
-                {renderComparisonRow('Turn G-Force', comparisonLogA.metrics?.performance?.turn_g_force, comparisonLogB.metrics?.performance?.turn_g_force)}
+                {CARV_METRIC_DEFS.map(def => {
+                  const valueA = getLogMetricValue(comparisonLogA, def)
+                  const valueB = getLogMetricValue(comparisonLogB, def)
+                  if (valueA === null && valueB === null) return null
+                  // Turn Closure is judged by its zone and pitch is terrain, so neither change is "better" or "worse"
+                  return <div key={def.key}>{renderComparisonRow(def.label, valueA, valueB, def.unit, def.zoneOnly || def.key === 'slope_pitch')}</div>
+                })}
               </div>
             </div>
           </div>
         </div>
       )}
+
+      {/* On-hill view of the current plan */}
+      {showToday && renderTodayView()}
 
       {/* AI Progression Analysis Modal */}
       {showProgressionModal && (

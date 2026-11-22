@@ -4,7 +4,9 @@ services:
     runtime: python
     rootDir: Carvtrainer/backend
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT --timeout 120
+    # One worker with threads: polling for a job isn't blocked by a slow chat or plan request
+    startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 8
+    healthCheckPath: /health
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
@@ -12,6 +14,10 @@ services:
         value: "3.11.0"
       - key: FRONTEND_URL
         sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
       - key: DATABASE_URL
         fromDatabase:
           name: carv-db

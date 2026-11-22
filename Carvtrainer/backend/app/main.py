@@ -5,13 +5,18 @@ Flask server that uses Claude AI to analyze CARV screenshots and generate traini
 
 import os
 import base64
+import copy
+import hmac
+import logging
+import time
 import json
 import re
 import uuid
 import threading
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from anthropic import Anthropic
@@ -19,9 +24,15 @@ from dotenv import load_dotenv
 from PIL import Image
 from PIL.ExifTags import TAGS
 
-# In-memory job store for background processing
-# Format: {job_id: {"status": "pending"|"processing"|"completed"|"failed", "result": {...}, "error": "..."}}
-jobs = {}
+try:  # gunicorn app.main:app (from the backend folder)
+    from app.carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
+    from app.training_plan import (PLAN_TOOL, PlanError, assemble_plan, drills_practised, history_entry, parse_stored_plan,
+                                   system_blocks as plan_system_blocks, user_message as plan_user_message)
+except ImportError:  # python app/main.py
+    from carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
+    from training_plan import (PLAN_TOOL, PlanError, assemble_plan, drills_practised, history_entry, parse_stored_plan,
+                               system_blocks as plan_system_blocks, user_message as plan_user_message)
+
 
 # Load environment variables
 load_dotenv()
@@ -41,12 +52,86 @@ if frontend_url:
 
 CORS(app, origins=allowed_origins)
 
+logging.basicConfig(level=logging.INFO)
+
+# Uploads: up to 10 screenshots of 5MB each, plus form overhead
+MAX_FILES_PER_UPLOAD = 10
+app.config["MAX_CONTENT_LENGTH"] = 55 * 1024 * 1024
+
+# ============================================================================
+# LOGIN - one shared password, checked here rather than in the browser
+# ============================================================================
+# APP_PASSWORD: the site password. SECRET_KEY: signs login tokens (any long random string).
+# Without both, every route except /health refuses requests rather than running unprotected.
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+SECRET_KEY = os.getenv("SECRET_KEY")
+LOGIN_TOKEN_MAX_AGE = 30 * 24 * 3600  # stay signed in on a device for 30 days
+PUBLIC_PATHS = {"/health", "/login"}
+
+_token_signer = URLSafeTimedSerializer(SECRET_KEY, salt="carv-login") if SECRET_KEY else None
+_failed_logins = {}  # ip -> list of failure timestamps (per process; enough to slow guessing)
+MAX_FAILED_LOGINS = 10
+FAILED_LOGIN_WINDOW = 15 * 60
+
+
+def _client_ip():
+    # Render's proxy appends the real client address last; earlier entries can be faked by the client
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[-1].strip() or request.remote_addr or "unknown"
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    if not APP_PASSWORD or not _token_signer:
+        return jsonify({"error": "Login not configured", "message": "The server has no APP_PASSWORD or SECRET_KEY set."}), 503
+
+    ip = _client_ip()
+    now = time.time()
+    recent = [t for t in _failed_logins.get(ip, []) if now - t < FAILED_LOGIN_WINDOW]
+    if len(recent) >= MAX_FAILED_LOGINS:
+        return jsonify({"error": "Too many attempts", "message": "Too many wrong passwords. Please wait 15 minutes."}), 429
+
+    password = str((request.get_json(silent=True) or {}).get("password", ""))
+    if not hmac.compare_digest(password.encode(), APP_PASSWORD.encode()):
+        recent.append(now)
+        _failed_logins[ip] = recent
+        return jsonify({"error": "Incorrect password", "message": "Incorrect password"}), 401
+
+    _failed_logins.pop(ip, None)
+    return jsonify({"token": _token_signer.dumps({"v": 1}), "expires_in": LOGIN_TOKEN_MAX_AGE})
+
+
+@app.before_request
+def require_login():
+    """Every route except /health and /login needs a valid login token."""
+    if request.method == "OPTIONS" or request.path in PUBLIC_PATHS:
+        return None
+    if not APP_PASSWORD or not _token_signer:
+        return jsonify({"error": "Login not configured", "message": "The server has no APP_PASSWORD or SECRET_KEY set."}), 503
+    header = request.headers.get("Authorization", "")
+    token = header[7:] if header.startswith("Bearer ") else ""
+    try:
+        _token_signer.loads(token, max_age=LOGIN_TOKEN_MAX_AGE)
+    except SignatureExpired:
+        return jsonify({"error": "Login expired", "message": "Please sign in again."}), 401
+    except BadSignature:
+        return jsonify({"error": "Not signed in", "message": "Please sign in."}), 401
+    return None
+
+
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify({"error": "Upload too large", "message": "Too much data in one upload. Send fewer or smaller screenshots."}), 413
+
 # Database configuration
 database_url = os.getenv("DATABASE_URL")
 if database_url:
-    # Render uses postgres:// but SQLAlchemy needs postgresql://
-    if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    # Render gives postgres:// or postgresql://. Name the psycopg2 driver explicitly:
+    # SQLAlchemy 2.1 defaults postgresql:// to psycopg 3, which isn't installed.
+    for prefix in ("postgres://", "postgresql://"):
+        if database_url.startswith(prefix):
+            database_url = "postgresql+psycopg2://" + database_url[len(prefix):]
+            break
     app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 else:
     # Fallback to SQLite for local development
@@ -92,17 +177,108 @@ class Session(db.Model):
         }
 
 
-# Create tables on startup
+class Job(db.Model):
+    """A screenshot analysis running in the background. Kept in the database (not in memory)
+    so polling works across workers and a restart leaves a clear 'failed' instead of a 404."""
+    __tablename__ = "analysis_jobs"
+
+    id = db.Column(db.String(36), primary_key=True)
+    status = db.Column(db.String(20), nullable=False, default="pending")  # pending|processing|completed|failed
+    result = db.Column(db.JSON)
+    error = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+JOB_KEEP_SECONDS = 3600       # delete finished jobs after an hour
+JOB_STALE_SECONDS = 10 * 60   # a job not updated for this long was lost (worker restarted)
+
+# Create tables on startup (new tables only; existing ones are left as they are)
 with app.app_context():
     db.create_all()
 
-# Initialize Anthropic client
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+def set_job(job_id, **fields):
+    """Update a job from the background thread (which needs its own app context)."""
+    with app.app_context():
+        job = db.session.get(Job, job_id)
+        if job is None:
+            return
+        for key, value in fields.items():
+            setattr(job, key, value)
+        db.session.commit()
+
+# Initialize Anthropic client. Each attempt is capped so a slow reply fails cleanly:
+# request routes stay inside gunicorn's 120s timeout (55s x 2 attempts), and the
+# background analysis stays inside the frontend's 3-minute polling window.
+client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=55.0, max_retries=1)
+ANALYSIS_TIMEOUT_SECONDS = 80.0
+
+# Screenshot analysis (vision). claude-sonnet-4-20250514, used here before, was retired on 15 June 2026.
+ANALYSIS_MODEL = "claude-sonnet-5-5"
+# Fast model for training plans, chat, progression and comparisons (kept quick for Render's request limits)
+FAST_MODEL = "claude-haiku-4-5-20251001"
+
+
+def create_analysis_message(**kwargs):
+    """
+    Call the analysis model. Medium effort keeps a multi-screenshot analysis well inside the
+    frontend's 3-minute polling window; max_tokens covers thinking as well as the JSON reply.
+    The server-side fallback re-runs the request on another model if this one declines it.
+    """
+    return client.with_options(timeout=ANALYSIS_TIMEOUT_SECONDS).beta.messages.create(
+        model=ANALYSIS_MODEL,
+        max_tokens=16000,
+        output_config={"effort": "medium"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        **kwargs,
+    )
+
+
+def get_reply_text(response):
+    """The reply's text. Newer models put a thinking block first, so never read content[0]."""
+    return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+
+
+class ModelReplyError(Exception):
+    """A model reply that can't be used; the message is safe to show the user."""
+
+
+def request_json_reply(create, attempts=2):
+    """
+    Call `create()` (a function making one model request) and parse the JSON reply.
+    A reply that isn't valid JSON is retried once; refusals and cut-off replies are not.
+    """
+    for attempt in range(attempts):
+        response = create()
+        if response.stop_reason == "refusal":
+            raise ModelReplyError("The AI declined this request. Please try again with CARV screenshots only.")
+        if response.stop_reason == "max_tokens":
+            raise ModelReplyError("The AI reply was too long and got cut off. Try fewer screenshots at once.")
+        try:
+            return json.loads(clean_json_response(get_reply_text(response)))
+        except json.JSONDecodeError:
+            app.logger.warning("Model reply was not valid JSON (attempt %d of %d)", attempt + 1, attempts)
+    raise ModelReplyError("The AI reply wasn't in the expected format. Please try again.")
+
+
+def api_error_message(error):
+    """A user-facing message for an exception from a model call (details go to the log)."""
+    text = str(error).lower()
+    if "api_key" in text or "authentication" in text:
+        return "The server's Anthropic API key is missing or invalid."
+    if "rate_limit" in text:
+        return "Rate limited. Please wait a moment and try again."
+    if "timeout" in text or "timed out" in text:
+        return "The AI took too long to reply. Please try again."
+    return "Analysis failed. Please try again."
 
 # CARV Metrics Context for AI Analysis - Comprehensive Carving Knowledge Base
 CARV_METRICS_CONTEXT = """
 You are an elite ski coach and CARV technology expert with deep knowledge of carving biomechanics.
 Your analysis is based on proven carving principles, not generic skiing advice.
+""" + CURRENT_CARV_GUIDE + """
 
 ## CORE CARVING PHILOSOPHY
 
@@ -121,9 +297,9 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 3. **Rotary Control** - Hip and shoulder alignment relative to skis
 4. **Pressure Management** - How and when you load/unload the ski
 
-## CARV METRICS - DEEP INTERPRETATION
+## CARV METRICS - DEEP INTERPRETATION (older detailed notes; the section above takes precedence)
 
-### Ski:IQ Score (Overall Performance)
+### Ski:IQ Score (Overall Performance) - rough guide only, not Carv's official bands
 - 100 = Average recreational skier
 - 100-115 = Intermediate - developing skills
 - 115-125 = Advanced intermediate - linking carved turns
@@ -131,10 +307,12 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 - 140-155 = Expert - high edge angles, dynamic skiing
 - 155+ = Elite - race-level technique
 
-### BALANCE CATEGORY (Critical for Carving)
+### FORE/AFT BALANCE (coaching concepts - Carv no longer shows these two as scores)
+Evidence today: Carv's Balance rating (Ok / Good / Great), Weight Release, and skis running
+away at the start or end of the turn. Never report a Start of Turn or Centered Balance number.
 
-**1. Start of Turn (Forward Pressure)** - Score 0-100
-- WHAT IT MEASURES: Weight shift to ski tips at turn initiation
+**1. Forward pressure at the start of the turn**
+- WHAT IT IS: Weight shift to ski tips at turn initiation
 - WHY IT MATTERS: Forward pressure engages the front of the ski first, creating early edge grip
 - LOW SCORE INDICATES:
   * Sitting back in the boots (common fear response)
@@ -143,8 +321,8 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 - BIOMECHANICS: Shin pressure against boot tongue, hips forward over toes
 - TARGET FEELING: "Driving the front of the ski into the turn"
 
-**2. Centered Balance** - Score 0-100
-- WHAT IT MEASURES: Maintaining balance over the center of the ski during the turn
+**2. Staying centred through the turn**
+- WHAT IT IS: Maintaining balance over the center of the ski during the turn
 - WHY IT MATTERS: Centered stance allows the whole ski edge to engage
 - LOW SCORE INDICATES:
   * Getting pulled into the backseat mid-turn
@@ -153,9 +331,10 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 - BIOMECHANICS: Ankle flexion, knee drive, hips stacked over feet
 - TARGET FEELING: "Balanced over the arch of the foot"
 
-**3. Transition Weight Release (TWR)** - Score 0-100%
-- WHAT IT MEASURES: Vertical G-force variation throughout the turn cycle. Compares peak forces (end of turn) to minimum forces (transition phase).
-- CALCULATION: TWR = (Peak G-force - Trough G-force) / Peak G-force × 100
+**3. Weight Release** (Carv metric, %; older sessions call it Transition Weight Release / TWR)
+- CARV'S DEFINITION: The percentage of weight you release during the transition between turns.
+- HOW TO THINK ABOUT IT: Compares peak forces (end of turn) to minimum forces (transition phase),
+  roughly (Peak G-force - Trough G-force) / Peak G-force × 100. This formula is a coaching model, not Carv's published method.
 - WHY IT MATTERS: High TWR indicates dynamic skiing with strong pressure buildup AND clean release - the hallmark of expert carving. Clean release allows quick edge change and early new edge engagement.
 - SCORE RANGES:
   * 90-100%: Elite - Full weightlessness achieved in transition. World Cup level dynamics.
@@ -212,7 +391,7 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
   * Stronger toeside vs heelside (or vice versa)
   * One hip less mobile than the other
 
-**4. Progressive Edge Build** - Score 0-100
+**4. Edge Build** (Carv metric, %; older sessions call it Progressive Edge Build)
 - WHAT IT MEASURES: Whether edge angle increases throughout the turn
 - WHY IT MATTERS: Shows controlled, confident carving vs "park and ride"
 - LOW SCORE INDICATES:
@@ -259,7 +438,7 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 
 ## DIAGNOSTIC FRAMEWORK - SYMPTOM TO ROOT CAUSE
 
-### Low Start of Turn Score
+### Weak forward pressure at turn start (Balance rating below Great, skis running away early)
 ROOT CAUSES:
 1. Fear of speed/falling - creates defensive backseat posture
 2. Weak ankle flex - can't drive shins into boot tongue
@@ -282,7 +461,7 @@ ROOT CAUSES:
 3. Sequential movement pattern - one thing at a time instead of simultaneous
 CASCADING EFFECTS: Skidded entry, delayed grip, inconsistent turns
 
-### Low Transition Weight Release Score
+### Low Weight Release Score
 ROOT CAUSE HIERARCHY (diagnose in this order - upstream issues block downstream fixes):
 Level 1 - Fore/Aft Balance (if compromised, blocks everything below):
   * Inside ski tip lifting = aft stance
@@ -301,19 +480,36 @@ DIAGNOSTIC SIGNALS:
   * Low TWR + Low Outside Ski Pressure = Weight transfer issue (Level 2)
 CASCADING EFFECTS: Choppy transitions, loss of flow, fatigue, inability to build dynamic range
 
-### Low Centered Balance Score
+### Pulled back or off-centre mid-turn (Balance rating below Great)
 ROOT CAUSES:
 1. Getting pulled back by G-forces - not anticipating the load
 2. Upper body leaning uphill - defensive "survival" stance
 3. Weak core - can't maintain position under load
 CASCADING EFFECTS: Loss of ski control in bottom half of turn
 
-### Low Progressive Edge Build Score
+### Low Edge Build Score
 ROOT CAUSES:
 1. "Park and ride" habit - set edge angle and hold
 2. Fear of increasing commitment - playing it safe
 3. Lack of dynamic range - don't know how to increase through turn
 CASCADING EFFECTS: Predictable skiing, limited ability on varied terrain
+
+### Turn Closure outside its zone / Carv flags "Smoothly linking turns"
+ROOT CAUSES:
+1. Turns not finished: skis released before they come round across the slope (low closure),
+   often with a narrow Corridor and fast Tempo
+2. Over-finished turns: skidding or braking at the end of the turn (high closure), often a
+   speed-control habit
+3. Late or abrupt transitions: the next turn starts with a pivot rather than a roll onto the new edges
+EVIDENCE TO USE: Tempo (turns/min), Corridor (m), Radius (m), Turn Shape, Weight Release
+CASCADING EFFECTS: Choppy rhythm, inconsistent speed, turns that do not link into one flowing line
+
+### Low Edging Smoothness Score
+ROOT CAUSES:
+1. Edge set abruptly ("click" onto the edge) instead of rolled on progressively
+2. Edge dumped or released suddenly at the end of the turn
+3. Stiff ankles and knees, so edge angle changes in steps rather than continuously
+CASCADING EFFECTS: Skis chatter or lose grip, harder to link turns smoothly
 
 ## SKILL PROGRESSION LEVELS
 
@@ -372,16 +568,19 @@ You are analyzing {num_images} CARV app screenshots from a skier's session. Look
 
 Use this framework to identify ROOT CAUSES, not just symptoms:
 
-**Low Start of Turn** → Root causes: Fear (backseat), weak ankle flex, hip mobility, boot setup
-**Low Centered Balance** → Root causes: G-force pulling back, defensive uphill lean, weak core
+Judge every metric against its dashed performance zone on screen, not against generic numbers.
+
+**Balance rating below Great** → Root causes: Fear (backseat), weak ankle flex, G-force pulling back, defensive uphill lean
 **Low Weight Release** → Root causes: Fear of fall line, Z-turn habit, static body
 **Low Edge Angle** → Root causes: Fear of commitment, no hip angulation, upper body rotation
 **Low Early Edging** → Root causes: Pivot habit, slow weight transfer, sequential movements
+**Low Edging Smoothness** → Root causes: Edge set abruptly, sudden release, stiff ankles/knees
 **Low Edging Similarity** → Root causes: Dominant side, injury compensation, equipment
-**Low Progressive Edge Build** → Root causes: "Park and ride" habit, fear, limited dynamic range
+**Low Edge Build** → Root causes: "Park and ride" habit, fear, limited dynamic range
 **Low Parallel Skis** → Root causes: Stemming, A-frame, inside ski not tipping
 **Low Turn Shape** → Root causes: Pivot-based turning, speed checking, impatience
-**Low G-Force with good edges** → Skidding despite tipping - technique breakdown
+**Turn Closure outside its zone** → Root causes: Turns not finished, or over-finished/braking; check Tempo, Corridor, Radius
+**Low G-Force with good edges** → Skidding despite tipping - but on SHORT TURNS lower G-Force is expected
 
 Analyze these screenshots HOLISTICALLY - treat them as different views of the same ski session or related sessions. Look for:
 - Overall patterns across all screenshots
@@ -405,31 +604,32 @@ Return a JSON object with this EXACT structure:
       "average": <number or null>
     }},
     "terrain_types_seen": ["<list of terrain types visible across all screenshots>"],
-    "total_turns_analyzed": <sum of turns if visible, or null>
+    "total_turns_analyzed": <sum of turns if visible, or null>,
+    "location": "<resort/location as shown, e.g. 'Les Houches (Chamonix), FR', or null>",
+    "ski_iq_version": "<'stelvio' if the screenshots show the Carv app 10 layout (bottom tabs You / Activity / Community / Coaching with a round record button), 'wasatch' if they show the older layout (bottom tabs Home / Coaching / Ski / Community / More), otherwise null>"
   }},
-  "overall_metrics": {{
-    "balance": {{
-      "start_of_turn": <average score 0-100 or null>,
-      "centered_balance": <average score 0-100 or null>,
-      "transition_weight_release": <average score 0-100 or null>,
-      "category_average": <average of all balance metrics>
-    }},
-    "edging": {{
-      "edge_angle": <average score 0-100 or null>,
-      "early_edging": <average score 0-100 or null>,
-      "edging_similarity": <average score 0-100 or null>,
-      "progressive_edge_build": <average score 0-100 or null>,
-      "category_average": <average of all edging metrics>
-    }},
-    "rotary": {{
-      "parallel_skis": <average score 0-100 or null>,
-      "turn_shape": <average score 0-100 or null>,
-      "category_average": <average of all rotary metrics>
-    }},
-    "performance": {{
-      "turn_g_force": <average score 0-100 or null>,
-      "category_average": <same as turn_g_force>
+  "carv_metrics": {{
+    "<one entry per metric visible in the Ski:IQ Metrics list, using these keys only: parallel_skis, turn_shape, turn_closure, early_edging, edging_smoothness, edging_similarity, edge_build, edge_angle, weight_release, g_force, slope_pitch>": {{
+      "value": <the number exactly as shown, without the unit: % metrics as 0-100, edge_angle and slope_pitch in degrees, g_force in g>,
+      "zone": "<'below', 'in' or 'above' - where the value marker sits relative to the dashed performance zone band; null if you cannot tell>"
     }}
+  }},
+  "run_details": {{
+    "run_name": "<run or segment name if shown, e.g. 'Kandahar Supérieur La Cassure', else null>",
+    "technique": "<technique mode chip as shown, e.g. 'carving', 'short turns', 'parallel'; null if not shown>",
+    "basis": "<e.g. 'Top 8 turns' if shown, else null>",
+    "skill_highlights": [{{"number": <skill number shown, e.g. 1>, "name": "<e.g. 'Turning without skidding'>", "status": "<as shown, e.g. 'Nailed it' or 'One to work on'>"}}],
+    "pitch_deg": <number or null>,
+    "snow_surface": "<as shown, e.g. 'Smooth', or null>",
+    "carving_turns": {{"count": <e.g. 8 or null>, "of": <e.g. 8 or null>}},
+    "tempo_tpm": <turns per minute or null>,
+    "corridor_m": <metres or null>,
+    "radius_m": <metres or null>,
+    "balance_rating": "<'Ok', 'Good' or 'Great' - the highlighted level on the Balance bar, or null>",
+    "segment": {{"time": "<as shown, e.g. '1m 52s', or null>", "turns": <number or null>, "vert": "<as shown with unit, e.g. '710 ft', or null>", "distance": "<as shown with unit, e.g. '0.8 mi', or null>"}},
+    "badges": ["<badge names shown, e.g. 'Grim Ripper'>"],
+    "metric_definitions": {{"<metric key>": "<Carv's definition text, only if a Metric Details screen is included>"}},
+    "turn_by_turn": [{{"metric": "<metric key>", "turns": [{{"side": "<'L' or 'R' if marked>", "value": <number>, "counted_in_ski_iq": <true for Ski:IQ turns, false for other turns>}}]}}]
   }},
   "holistic_analysis": {{
     "skiing_style": "<describe their overall skiing style based on all data - are they aggressive, cautious, dynamic, static, etc.>",
@@ -469,605 +669,15 @@ CRITICAL INSTRUCTIONS:
 3. Average metrics where you see the same metric in multiple screenshots
 4. If a metric appears in only some screenshots, still include it
 5. Be specific and actionable in your analysis
-6. The "biggest_limiter" should be the #1 thing to work on
+6. The "biggest_limiter" should be the #1 thing to work on. If Carv's Skill Highlights mark a skill "One to work on", the limiter should match it or explain why it differs
 7. Consider how different screenshots might show different aspects of the same session
+8. Read values exactly as displayed. Never estimate a metric, field or zone that is not visible: use null or leave the key out
+9. Do NOT report Start of Turn or Centered Balance scores; Carv no longer shows them
+10. Coach the technique that was skied (see the technique notes in your instructions), and compare against the performance zones
+11. Screenshots of different runs (different location, date or time) should still be read individually: describe each in run_by_run_notes
 """
 
-TRAINING_PLAN_PROMPT = """
-Based on this COMPREHENSIVE CARV skiing analysis from multiple screenshots, create a personalized training plan.
-
-ANALYSIS DATA:
-{analysis_data}
-
-This analysis represents data from {num_runs} screenshot(s) giving us a complete picture of this skier.
-
-## DRILL LIBRARY - SELECT APPROPRIATE DRILLS BASED ON ISSUES IDENTIFIED
-
-### FOUNDATION DRILLS (Building Blocks)
-
-**1. Thousand Steps**
-- Purpose: Develops balance, weight transfer awareness, edge feel
-- Execution: Make tiny rapid steps from ski to ski while traversing/turning
-- Feel: Dancing on the snow, constant weight shifting
-- Duration: 2-3 runs, green/easy blue terrain
-- Improves: Centered Balance, Weight Release, Edging Similarity
-- Common Mistake: Steps too big - keep them small and quick
-- Video: https://www.youtube.com/results?search_query=1000+steps+ski+drill+carving
-
-**2. Javelin Turns**
-- Purpose: Forces commitment to outside ski, eliminates inside ski dependency
-- Execution: Lift inside ski completely off snow, hold parallel to outside ski during turn
-- Feel: All weight on one ski, total commitment
-- Duration: 5-8 turns each side, moderate blue terrain
-- Improves: Edge Angle, Start of Turn, Centered Balance
-- Common Mistake: Leaning into hill for balance instead of angulating
-- Video: https://www.youtube.com/results?search_query=javelin+turns+ski+drill+carving
-
-**3. Shuffle Turns**
-- Purpose: Builds awareness of fore/aft range of motion and balance
-- Execution: While skiing, shuffle feet forward/back against each other
-- Variants: Straight line shuffle, two-footed shuffle, shuffle while turning
-- Feel: Distinct pressure shifts along foot length, exploring balance range
-- Duration: Full run, green/blue terrain
-- Improves: Fore/Aft Balance awareness, Centered Balance, proprioception
-- Success Criteria: Can feel distinct pressure shifts along foot length
-- Video: https://www.youtube.com/results?search_query=shuffle+turns+ski+drill+balance
-
-**4. Pivot Slips**
-- Purpose: Develops rotary control and edge release ability
-- Execution: From standstill, release edges and pivot 180°, then stop
-- Feel: Controlled sliding, precise edge control
-- Duration: 10 pivots each direction
-- Improves: Transition Weight Release, edge awareness
-- Video: https://www.youtube.com/results?search_query=pivot+slips+ski+drill+edge+control
-
-### EDGE ANGLE DEVELOPMENT DRILLS
-
-**5. Railroad Track Carving**
-- Purpose: Develops pure carving - no skidding
-- Execution: Make turns leaving only two clean pencil lines in snow
-- Feel: Train on tracks, no sideways sliding
-- Duration: Full runs, focus on quality not quantity
-- Improves: Edge Angle, Turn Shape, Progressive Edge Build
-- Common Mistake: Going too fast - start slow, prioritize clean tracks
-- Video: https://www.youtube.com/results?search_query=railroad+track+carving+ski+drill
-
-**6. J-Turns (Edge Lock Drill)**
-- Purpose: Maximizes edge angle commitment
-- Execution: From traverse, commit to fall line, carve hard uphill until stop
-- Feel: Maximum edge engagement, G-force building, ski bending
-- Duration: 5 each direction, moderate pitch
-- Improves: Edge Angle, Progressive Edge Build, commitment
-- Video: https://www.youtube.com/results?search_query=j+turns+edge+lock+ski+drill+carving
-
-**7. Angulation Exaggeration**
-- Purpose: Develops hip angulation for higher edge angles
-- Execution: Touch outside hand to outside boot during turns
-- Feel: Body folding at waist, hips pushing into hill
-- Duration: 4-6 turns each direction
-- Improves: Edge Angle, Centered Balance
-- Common Mistake: Bending at waist instead of creating hip angle
-- Video: https://www.youtube.com/results?search_query=angulation+drill+skiing+hip+angulation
-
-**8. Pole Drag Carving**
-- Purpose: Forces upper body countering and angulation
-- Execution: Drag inside pole tip in snow throughout turn
-- Feel: Upper body stays facing downhill, separation from lower body
-- Duration: Full run
-- Improves: Edge Angle, Turn Shape, upper/lower body separation
-- Video: https://www.youtube.com/results?search_query=pole+drag+carving+ski+drill
-
-### BALANCE & FORE-AFT DRILLS
-
-**9. Shin Banger**
-- Purpose: Develops forward pressure and ankle flex
-- Execution: Feel constant shin pressure on boot tongue throughout turn
-- Feel: Shins pressing forward, never losing contact
-- Duration: Every turn, conscious focus
-- Improves: Start of Turn, Centered Balance
-- Cue: "Crush the tongue"
-- Video: https://www.youtube.com/results?search_query=shin+pressure+boot+tongue+ski+drill+forward+stance
-
-**10. Hands on Knees Turns**
-- Purpose: Forces forward stance and commitment
-- Execution: Ski with hands resting on kneecaps
-- Feel: Stacked, forward, can't sit back
-- Duration: 4-6 turns, easy terrain
-- Improves: Start of Turn, Centered Balance
-- Common Mistake: Bending too much at waist
-- Video: https://www.youtube.com/results?search_query=hands+on+knees+ski+drill+forward+stance
-
-**11. Tall-Small Transitions**
-- Purpose: Develops flexion/retraction timing for dynamic transitions
-- Execution: Build pressure (tall/strong outside leg) through turn, then actively collapse/flex old outside leg at transition to release. Don't push off - just flex and untip.
-- Feel: Hips stay level through transition, significant vertical separation of skis at crossover
-- Duration: Full run, exaggerate the flex/collapse at transition
-- Improves: Transition Weight Release, Pressure Management
-- Key Point: This is a down-unweighting/retraction pattern, not an extension-push pattern. Collapse to release, don't stand up to release.
-- Video: https://www.youtube.com/results?search_query=tall+small+transitions+ski+drill+retraction
-
-**12. Touch the Outside Boot**
-- Purpose: Develops outside ski pressure and forward commitment
-- Execution: Reach down and touch outside boot at turn apex
-- Feel: Weight over outside ski, forward and low
-- Duration: Alternating turns
-- Improves: Start of Turn, Centered Balance, Edge Angle
-- Video: https://www.youtube.com/results?search_query=touch+outside+boot+ski+drill+carving
-
-### TRANSITION & FLOW DRILLS
-
-**13. White Pass Turns**
-- Purpose: Develops early weight transfer and commitment to new turn
-- Execution: Transfer weight to new ski BEFORE releasing old turn
-- Feel: New turn starts before old one ends, overlapping commitment
-- Duration: Focus drill, 6-8 turns
-- Improves: Transition Weight Release, Early Edging
-- Common Mistake: Finishing old turn completely before starting new
-- Video: https://www.youtube.com/results?search_query=white+pass+turns+ski+drill+early+weight+transfer
-
-**14. Crossover Focus**
-- Purpose: Develops positive movement into new turn
-- Execution: Feel center of mass crossing over skis into new turn
-- Feel: Body moving downhill into the new arc, not pulling back
-- Duration: Every transition, conscious awareness
-- Improves: Transition Weight Release, Early Edging
-- Cue: "Fall into the new turn"
-- Video: https://www.youtube.com/results?search_query=crossover+skiing+drill+center+of+mass+transition
-
-**15. No Pole Skiing**
-- Purpose: Develops balance without pole crutch
-- Execution: Remove poles, hands on hips or crossed on chest
-- Feel: Pure balance, can't push off anything
-- Duration: Full runs
-- Improves: Centered Balance, Core engagement
-- Video: https://www.youtube.com/results?search_query=no+pole+skiing+drill+balance
-
-**16. Patience Turns**
-- Purpose: Develops complete turn finish and clean transitions
-- Execution: Let each turn finish completely up the hill before transitioning
-- Feel: No rushing, complete the arc
-- Duration: Focus on slow rhythmic skiing
-- Improves: Turn Shape, Transition Weight Release
-- Video: https://www.youtube.com/results?search_query=patience+turns+ski+drill+complete+turn+shape
-
-### ADVANCED PERFORMANCE DRILLS
-
-**17. Retraction Turns**
-- Purpose: Develops quick edge-to-edge transitions
-- Execution: Pull feet up under body at transition, extend into new turn
-- Feel: Light feet at crossover, snappy transition
-- Duration: Moderate to steep terrain
-- Improves: Transition Weight Release, Early Edging, G-Force
-- Video: https://www.youtube.com/results?search_query=retraction+turns+ski+drill+edge+change
-
-**18. Dolphin Turns**
-- Purpose: Develops dynamic fore/aft cycling through each turn
-- Execution: Pop off ski tails, land on shovels. Back-pedaling motion with feet - push feet forward to pop off tails, pull feet back with heels up to land on shovels
-- Feel: Visible "dolphin" shape to ski trajectory, dynamic fore/aft weight shift
-- Duration: Blue/Black terrain, focus on clean edge change while airborne
-- Improves: Transition Weight Release, Fore/Aft Balance, Dynamic Range
-- Success Criteria: Clean edge change while airborne, visible dolphin trajectory
-- Video: https://www.youtube.com/results?search_query=dolphin+turns+ski+drill+dynamic+fore+aft
-
-**19. Speed Carving**
-- Purpose: Develops trust in edge grip at speed
-- Execution: Increase speed while maintaining pure carved turns
-- Feel: Acceleration through the arc, G-forces building
-- Duration: Open blue/black runs
-- Improves: Edge Angle, Turn G-Force, confidence
-- Video: https://www.youtube.com/results?search_query=speed+carving+ski+high+edge+angle+GS+turns
-
-**20. Variable Radius Carving**
-- Purpose: Develops ability to adjust turn shape
-- Execution: Alternate between long radius and short radius carved turns
-- Feel: Adjustable pressure/edge, ski bending different amounts
-- Duration: Full runs
-- Improves: Progressive Edge Build, Turn Shape, versatility
-- Video: https://www.youtube.com/results?search_query=variable+radius+carving+ski+short+long+turns
-
-### HIGH-PERFORMANCE DRILLS
-
-**21. Hop Transitions**
-- Purpose: Develops explosive edge change
-- Execution: Hop both skis off snow at transition, land on new edges
-- Feel: Explosive, athletic, immediate edge engagement
-- Duration: Steep terrain, short sections
-- Improves: Early Edging, Transition Weight Release, athleticism
-- Video: https://www.youtube.com/results?search_query=hop+transitions+ski+drill+edge+change+carving
-
-**22. One-Ski Carving**
-- Purpose: Ultimate balance and edge control test
-- Execution: Remove one ski, carve turns on single ski
-- Feel: Total commitment, no backup
-- Duration: Easy terrain, 3-4 turns per side
-- Improves: Edge Angle, Centered Balance, balance mastery
-- Video: https://www.youtube.com/results?search_query=one+ski+carving+drill+single+ski+balance
-
-**23. Gate Training Simulation**
-- Purpose: Develops race-timing and line
-- Execution: Visualize gates, commit to apex, accelerate out
-- Feel: Early pressure, round the gate, explode out
-- Duration: Open slope, mark mental gates
-- Improves: All metrics, race application
-- Video: https://www.youtube.com/results?search_query=gate+training+simulation+ski+racing+drill
-
-### TWR-SPECIFIC DRILLS (Organized by Root Cause Level)
-
-#### Level 1: Fore/Aft Balance Drills (Fix First if Balance is Compromised)
-
-**24. Stork Turns**
-- Purpose: Forces forward commitment - cannot execute if aft
-- Execution: Lift inside ski's tail only, keeping tip on snow throughout turn
-- Difficulty: Beginner-Intermediate
-- Terrain: Green/Blue
-- Progression: Start on gentle terrain, increase steepness as competent
-- Improves: Start of Turn, Centered Balance, Transition Weight Release
-- Success Criteria: Can maintain tip contact without losing balance backward
-- Video: https://www.youtube.com/results?search_query=stork+turns+ski+drill+inside+ski+tip
-
-**25. Outside-to-Outside**
-- Purpose: 100% commitment to stance ski, requires forward balance
-- Execution: Lift entire inside ski parallel to snow surface (few inches clearance)
-- Difficulty: Intermediate
-- Terrain: Blue
-- Progression: Start with minimal lift, increase height as balance improves
-- Improves: Outside Ski Pressure, Fore/Aft Balance, Transition Weight Release
-- Common Error: Dragging pole for stability (remove crutch by holding poles at mid-shaft)
-- Success Criteria: Can link 6+ turns with inside ski lifted, no pole assistance
-- Video: https://www.youtube.com/results?search_query=outside+ski+to+outside+ski+drill+carving
-
-**26. Unbuckled Boots**
-- Purpose: Removes boot cuff as balance crutch. Forces standing on feet, not shins.
-- Execution: Ski with boot buckles open
-- Difficulty: Intermediate
-- Terrain: Green/Easy Blue ONLY
-- Improves: Centered Balance, proprioception, stance awareness
-- Caution: Very easy terrain only. Instant feedback when aft.
-- Success Criteria: Can make controlled turns without relying on boot support
-- Video: https://www.youtube.com/results?search_query=unbuckled+boots+ski+drill+balance+proprioception
-
-**27. Range of Motion Turns**
-- Purpose: Exploring full fore/aft range, building proprioceptive awareness
-- Execution: Deliberately ski as far forward as possible, then as far aft as possible
-- Difficulty: Intermediate
-- Terrain: Green/Blue ONLY
-- Improves: Fore/Aft Balance awareness, ability to find centered position
-- Caution: Never above blue groomers
-- Success Criteria: Can identify and feel the "centered" position between extremes
-- Video: https://www.youtube.com/results?search_query=range+of+motion+ski+drill+fore+aft+balance
-
-#### Level 2: Outside Ski Pressure Drills (Fix if Weak Pressure Buildup)
-
-**28. Single Leg Carving (Basic)**
-- Purpose: Proves full commitment to outside ski
-- Execution: Lift inside ski completely after transition is established
-- Difficulty: Intermediate
-- Terrain: Blue
-- Progression: Lift late in turn → lift mid-turn → lift at transition
-- Improves: Outside Ski Pressure, Transition Weight Release, Edge Angle
-- Success Criteria: Can carve clean arcs on single ski through shaping phase
-- Video: https://www.youtube.com/results?search_query=single+leg+carving+outside+ski+drill
-
-**29. Single Leg Carving (Advanced)**
-- Purpose: Early weight transfer to new outside ski
-- Execution: Lift inside ski at or before the transition
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Improves: Transition Weight Release, Early Edging, commitment
-- Success Criteria: Can lift inside ski while still on "wrong" edge, maintain carved arc
-- Video: https://www.youtube.com/results?search_query=advanced+single+ski+carving+early+weight+transfer
-
-**30. Up and Over (Early Stepping)**
-- Purpose: Earliest possible platform on new stance ski
-- Execution: Transfer weight to new outside ski while still on uphill edge (before edge change)
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Reference: Ted Ligety technique, US Ski Team staple drill
-- Improves: Transition Weight Release, Early Edging, Outside Ski Pressure
-- Success Criteria: Weight commits to new outside ski before that ski changes edges
-- Video: https://www.youtube.com/results?search_query=up+and+over+early+stepping+ski+drill+ted+ligety
-
-**31. Skating**
-- Purpose: Learn to tip lower leg to establish edge platform before pushing
-- Execution: Skate on skis without poles
-- Difficulty: Beginner-Intermediate
-- Terrain: Flat/Slight Uphill
-- Best With: Short skis (130cm) or slalom skis
-- Improves: Edge awareness, Outside Ski Pressure, weight transfer timing
-- Success Criteria: Can generate forward momentum through proper edge-then-push sequence
-- Video: https://www.youtube.com/results?search_query=skating+on+skis+drill+edge+platform+weight+transfer
-
-#### Level 3: Transition Mechanics Drills (Fix if Peaks Good but Troughs Shallow)
-
-**32. Hop Drill (Tom Gellie)**
-- Purpose: Building control, lightness, and confidence in unweighting
-- Execution: Hop from one set of edges to the other, exaggerating unweighting
-- Difficulty: Advanced
-- Terrain: Steep Blue/Black (steeper terrain naturally challenges balance, timing, precision)
-- Goal: Skis completely off ground during transition
-- Improves: Transition Weight Release, edge change confidence, athleticism
-- Success Criteria: Can hop cleanly between edge sets with controlled landings
-- Video: https://www.youtube.com/results?search_query=tom+gellie+hop+drill+skiing+edge+change
-
-**33. The Power Release**
-- Purpose: Flexing to release, maintaining low position through transition
-- Execution: Wide stance carving. Long/strong outside leg at apex, then actively collapse/flex that leg while keeping hips level.
-- Mechanics: Collapse old outside leg → pull inside boot up → extend new outside leg passively
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Key Point: Don't push off old outside ski. Just flex and untip.
-- Improves: Transition Weight Release, dynamic range, pressure modulation
-- Success Criteria: Hips stay level through transition, significant vertical separation of skis at crossover
-- Video: https://www.youtube.com/results?search_query=power+release+ski+drill+flex+retraction+transition
-
-**34. Bounce Turns (Powder Variant)**
-- Purpose: Weightless transition feeling, flow development
-- Execution: Short-radius turns focusing on finding bounce rhythm
-- Difficulty: Intermediate-Advanced
-- Terrain: Powder
-- Adjustments: Experiment with stance width and pressure distribution (outside ski focus vs two-footed platform)
-- Improves: Transition Weight Release, rhythm, flow
-- Success Criteria: Rhythmic "float" feeling between turns in powder
-- Video: https://www.youtube.com/results?search_query=bounce+turns+powder+skiing+rhythm+drill
-
-**35. Retraction Practice**
-- Purpose: Down-unweighting, creating weightlessness at transition
-- Execution: At turn's end, actively pull knees toward body
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Contrast With: Extension release where you stand up through transition
-- Improves: Transition Weight Release, edge change speed, lightness
-- Success Criteria: Skis feel light/weightless at transition, clean edge change
-- Video: https://www.youtube.com/results?search_query=retraction+release+skiing+down+unweighting+transition
-
-**36. 3-3-3 Balance Drill**
-- Purpose: Refines sensory awareness, develops ability to relocate balance state on demand
-- Execution: 3 turns FORE, 3 turns AFT, 3 turns CENTERED. Repeat.
-- Difficulty: Intermediate
-- Terrain: Blue
-- Variant: Add FORE-to-AFT within single turn (fore at initiation, aft at completion)
-- Improves: Fore/Aft Balance, Centered Balance, proprioceptive awareness
-- Success Criteria: Can consciously shift between balance states while maintaining turn quality
-- Video: https://www.youtube.com/results?search_query=3-3-3+balance+drill+skiing+fore+aft+centered
-
-## DRILL SELECTION FRAMEWORK
-
-Based on the skier's profile, select drills using this logic:
-
-**For Low START OF TURN scores**: Shin Banger, Hands on Knees, Touch Outside Boot
-**For Low CENTERED BALANCE scores**: Javelin Turns, Thousand Steps, No Pole Skiing
-**For Low TRANSITION WEIGHT RELEASE scores** (diagnose root cause first):
-  - If TWR < 50% AND Edge Angle < 40°: Prioritize Level 1 Fore/Aft drills (Shuffle Turns, Stork Turns, Range of Motion Turns)
-  - If TWR < 50% AND Edge Angle > 40°: Prioritize Level 3 Transition drills (Power Release, Retraction Practice, Hop Drill)
-  - If Outside Ski Pressure < 70%: Prioritize Level 2 drills (Single Leg Carving, Javelin Turns, Up and Over)
-  - If TWR 50-70%: Mix of Level 2 and Level 3 drills (Tall-Small, Dolphin Turns, 3-3-3 Balance)
-**For Low EDGE ANGLE scores**: J-Turns, Angulation Exaggeration, Pole Drag Carving
-**For Low EARLY EDGING scores**: White Pass Turns, Retraction Turns, Hop Transitions
-**For Low EDGING SIMILARITY scores**: Thousand Steps, One-Ski Carving, Javelin Turns (weak side focus)
-**For Low PROGRESSIVE EDGE BUILD scores**: J-Turns, Dolphin Turns, Railroad Track Carving
-**For Low PARALLEL SKIS scores**: Shuffle Turns, Thousand Steps
-**For Low TURN SHAPE scores**: Patience Turns, Railroad Track Carving, Variable Radius
-**For Low G-FORCE with good edge angles**: Speed Carving, Dolphin Turns (indicates skidding despite tipping)
-
-## SESSION STRUCTURE RECOMMENDATIONS
-
-**Warm-up Phase (First 2-3 runs)**
-- Free skiing at 70% effort
-- One foundation drill (Thousand Steps or Shuffle Turns)
-- Activate key movement patterns
-
-**Focus Phase (4-6 runs)**
-- Primary improvement drill (selected for biggest limiter)
-- 3-4 focused turns, then free skiing
-- Rest between attempts
-
-**Integration Phase (2-3 runs)**
-- Free skiing incorporating new feel
-- Higher speed/steeper terrain
-- Don't think, just ski with new patterns
-
-**Cool-down (Final run)**
-- Free skiing, enjoyment focus
-- Notice what felt different today
-
----
-
-Based on this skier's analysis, create a plan following this structure:
-
-# Training Plan for Ski:IQ {ski_iq}
-
-## The Big Picture
-- Summarize this skier in 2-3 sentences based on the holistic analysis
-- Their current progression level (Entry/Development/Performance/High Performance)
-- The ONE biggest limiter holding them back
-
-## Immediate Focus (Next 1-3 Runs)
-Based on their BIGGEST LIMITER:
-- The primary issue to address
-- The single best drill from the library above
-- Detailed execution instructions
-- What success feels like
-- Mental cue (3-5 words)
-
-## Your 3 Key Drills
-
-YOU MUST INCLUDE EXACTLY 3 DRILLS with full details. Select from the Drill Library above based on their weakest metrics.
-
-### Drill 1: [Name] - Primary Focus
-- **Target Metric**: [The CARV metric this improves]
-- **Why This Drill**: [How it addresses their specific weakness]
-- **How To Do It (Step-by-Step)**:
-  1. [Starting position - where to stand, stance width, pole position]
-  2. [The initiation - how to begin the movement]
-  3. [The main movement - what your body does during the drill]
-  4. [The finish - how to complete each rep/turn]
-  5. [Reset - how to prepare for the next rep]
-- **Terrain**: [Green/Blue/Black, groomed, pitch]
-- **Runs**: [X runs], [X focused turns per run, then free ski]
-- **Success Feels Like**: [Specific physical sensations - what you feel in feet, legs, hips]
-- **Mental Cue**: [3-5 word phrase to think while doing it]
-- **Common Mistakes**:
-  - [Mistake 1 and how to fix it]
-  - [Mistake 2 and how to fix it]
-- **Make It Harder**: [How to progress as they improve]
-- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
-
-### Drill 2: [Name] - Secondary Focus
-- **Target Metric**: [The CARV metric this improves]
-- **Why This Drill**: [How it addresses their specific weakness]
-- **How To Do It (Step-by-Step)**:
-  1. [Starting position]
-  2. [The initiation]
-  3. [The main movement]
-  4. [The finish]
-- **Terrain**: [Recommendation]
-- **Runs**: [X runs], [X focused turns per run]
-- **Success Feels Like**: [Specific physical sensations]
-- **Mental Cue**: [3-5 word phrase]
-- **Common Mistakes**:
-  - [Mistake and fix]
-- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
-
-### Drill 3: [Name] - Integration/Refinement
-- **Target Metric**: [The CARV metric this improves]
-- **Why This Drill**: [How it ties everything together]
-- **How To Do It (Step-by-Step)**:
-  1. [Starting position]
-  2. [The initiation]
-  3. [The main movement]
-  4. [The finish]
-- **Terrain**: [Recommendation]
-- **Runs**: [X runs], [X focused turns per run]
-- **Success Feels Like**: [Specific physical sensations]
-- **Mental Cue**: [3-5 word phrase]
-- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
-
-## Daily Session Plan (10 Runs)
-
-Structure each ski day like this:
-
-**Run 1-2: Warm-Up Phase**
-- Free skiing at 70% effort
-- Focus: Get loose, feel the snow
-- Optional: Thousand Steps or Shuffle Turns to activate
-
-**Run 3-4: Drill 1 - [Name]**
-- [X] focused turns, then free ski to bottom
-- Rest at bottom, think about the feel
-- Repeat with intention
-
-**Run 5-6: Drill 2 - [Name]**
-- [X] focused turns, then free ski
-- Connect the feeling to Drill 1
-
-**Run 7-8: Drill 3 - [Name]**
-- [X] focused turns, then free ski
-- Integrate all three concepts
-
-**Run 9: Integration Run**
-- Free skiing at 80% effort
-- Apply all three drill concepts naturally
-- Don't think, just feel
-
-**Run 10: Fun Run**
-- Pure enjoyment skiing
-- Notice what feels different
-- End on a high note
-
-## Weekly Training Schedule
-
-### Day 1: Foundation Day
-- **Primary Focus**: Drill 1 (4 runs)
-- **Secondary**: Drill 2 (2 runs)
-- **Terrain**: Easier runs, perfect technique
-- **Goal**: Establish the movement patterns
-
-### Day 2: Development Day
-- **Primary Focus**: Drill 2 (4 runs)
-- **Secondary**: Drill 1 review (2 runs)
-- **Add**: Drill 3 introduction (2 runs)
-- **Terrain**: Progress to moderate terrain
-- **Goal**: Build on Day 1, add complexity
-
-### Day 3: Integration Day
-- **Primary Focus**: All 3 drills equally (2 runs each)
-- **Integration runs**: 4 runs applying concepts
-- **Terrain**: Varied - test on different pitches
-- **Goal**: Connect everything, build confidence
-
-### Day 4: Challenge Day
-- **Warm-up**: Quick drill review (1 run each)
-- **Challenge**: Apply to steeper/faster terrain
-- **Focus**: Maintain technique under pressure
-- **Goal**: Test limits, find new baseline
-
-### Day 5: Recovery & Assessment
-- **Light Focus**: Favorite drill only (2-3 runs)
-- **Mostly**: Free skiing with awareness
-- **End**: Take CARV screenshots for comparison
-- **Goal**: Consolidate gains, measure progress
-
-## This Week's Priorities
-
-### Priority 1: [Biggest Limiter]
-- Current: [score] → Target: [realistic target]
-- Primary Drill: Drill 1
-- Runs needed: 15-20 runs this week
-- Expected improvement: +5-8 points
-
-### Priority 2: [Second Issue]
-- Current: [score] → Target: [target]
-- Primary Drill: Drill 2
-- Runs needed: 10-15 runs this week
-- How it connects to Priority 1
-
-### Priority 3: [Third Issue]
-- Current: [score] → Target: [target]
-- Primary Drill: Drill 3
-- Runs needed: 8-10 runs this week
-- Integration with other priorities
-
-## Building on Strengths
-How to use their top strengths to accelerate improvement:
-- [Strength 1]: How it helps with [specific weakness]
-- [Strength 2]: How to leverage it
-
-## 4-Week Progression
-
-### Week 1-2: Foundation Building
-- Focus: [Primary limiter]
-- Drills: All 3 as described above
-- Drill Runs: 60% Drill 1, 30% Drill 2, 10% Drill 3
-- Target Metrics: [What CARV scores to watch]
-- Signs of Progress: [What they'll feel/see]
-
-### Week 3-4: Integration & Challenge
-- Progression: Increase terrain difficulty
-- Drill Balance: 40% Drill 1, 35% Drill 2, 25% Drill 3
-- Add Challenge: Speed, steeper terrain, variable snow
-- Target Metrics: [Updated goals]
-
-## Progress Checkpoints
-- After 5 runs: [What should improve first - usually awareness]
-- After 10 runs: [Expected metric changes]
-- After 20 runs: [Target achievements]
-- After 1 week: Take new CARV screenshots
-- After 2 weeks: Compare metrics, adjust drill focus
-
-## Mental Cues for This Skier
-Based on their specific pattern:
-- Primary Cue: "[3-5 words for their main focus]"
-- Transition Cue: "[For moving between turns]"
-- Confidence Cue: "[When they need to commit more]"
-
-## Common Traps to Avoid
-Based on their profile:
-- [Specific trap #1 they might fall into]
-- [Specific trap #2]
-- [What to do instead]
-
-Remember: Perfect practice makes perfect. 10 focused turns beat 100 mindless ones!
-"""
+# The training plan prompt, schema and drill library live in training_plan.py and drills.py
 
 
 def get_media_type(filename):
@@ -1144,6 +754,11 @@ def extract_metadata():
             }), 400
 
         files = request.files.getlist('images')
+        if len(files) > MAX_FILES_PER_UPLOAD:
+            return jsonify({
+                "error": "Too many files",
+                "message": f"Please upload at most {MAX_FILES_PER_UPLOAD} screenshots at a time"
+            }), 400
         metadata_list = []
 
         for file in files:
@@ -1201,9 +816,10 @@ def extract_metadata():
         })
 
     except Exception as e:
+        app.logger.exception("Metadata extraction failed")
         return jsonify({
             "error": "Metadata extraction failed",
-            "message": str(e)
+            "message": "Could not read the screenshots' dates."
         }), 500
 
 
@@ -1218,193 +834,35 @@ def health_check():
     })
 
 
-@app.route('/analyze', methods=['POST'])
-def analyze_screenshots():
-    """
-    Analyze one or more CARV screenshots holistically using Claude's vision.
-
-    Expects: multipart/form-data with one or more 'images' files
-    Returns: JSON with holistic analysis of all screenshots
-    """
-    try:
-        # Check if image files are present
-        if 'images' not in request.files:
-            return jsonify({
-                "error": "No image files provided",
-                "message": "Please upload at least one CARV screenshot"
-            }), 400
-
-        files = request.files.getlist('images')
-
-        if len(files) == 0 or (len(files) == 1 and files[0].filename == ''):
-            return jsonify({
-                "error": "No files selected",
-                "message": "Please select at least one CARV screenshot to upload"
-            }), 400
-
-        # Process all images
-        image_contents = []
-        filenames = []
-
-        for file in files:
-            if file.filename == '':
-                continue
-
-            # Check file size (max 5MB each)
-            file.seek(0, 2)
-            file_size = file.tell()
-            file.seek(0)
-
-            if file_size > 5 * 1024 * 1024:
-                return jsonify({
-                    "error": "File too large",
-                    "message": f"{file.filename} is larger than 5MB"
-                }), 400
-
-            # Read and encode image
-            image_data = file.read()
-            base64_image = base64.standard_b64encode(image_data).decode('utf-8')
-            media_type = get_media_type(file.filename)
-
-            image_contents.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": base64_image
-                }
-            })
-            filenames.append(file.filename)
-
-        num_images = len(image_contents)
-
-        if num_images == 0:
-            return jsonify({
-                "error": "No valid images",
-                "message": "Please upload at least one valid image file"
-            }), 400
-
-        # Build the message content with all images + prompt
-        message_content = image_contents.copy()
-        message_content.append({
-            "type": "text",
-            "text": HOLISTIC_ANALYSIS_PROMPT.format(num_images=num_images)
-        })
-
-        # Call Claude API with all images
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ],
-            system=CARV_METRICS_CONTEXT
-        )
-
-        # Extract response text
-        response_text = response.content[0].text
-
-        # Clean and parse JSON
-        cleaned_json = clean_json_response(response_text)
-
-        try:
-            analysis_data = json.loads(cleaned_json)
-        except json.JSONDecodeError as e:
-            return jsonify({
-                "error": "Failed to parse AI response",
-                "message": "The AI response wasn't in the expected format. Please try again.",
-                "raw_response": response_text[:500]
-            }), 500
-
-        # Add metadata
-        analysis_data["analyzed_at"] = datetime.now().isoformat()
-        analysis_data["filenames"] = filenames
-        analysis_data["num_screenshots"] = num_images
-
-        return jsonify(analysis_data)
-
-    except Exception as e:
-        error_message = str(e)
-
-        if "api_key" in error_message.lower() or "authentication" in error_message.lower():
-            return jsonify({
-                "error": "API Key Error",
-                "message": "Your Anthropic API key is missing or invalid. Please check your .env file."
-            }), 401
-
-        if "rate_limit" in error_message.lower():
-            return jsonify({
-                "error": "Rate Limited",
-                "message": "Too many requests. Please wait a moment and try again."
-            }), 429
-
-        return jsonify({
-            "error": "Analysis failed",
-            "message": f"Something went wrong during analysis. Error: {error_message}"
-        }), 500
-
-
 def process_analysis_job(job_id, image_contents, filenames, num_images):
-    """Background worker function to process image analysis."""
-    global jobs
-
+    """Background worker: analyse the screenshots and store the result on the job."""
     try:
-        jobs[job_id]["status"] = "processing"
+        set_job(job_id, status="processing")
 
-        # Build the message content with all images + prompt
-        message_content = image_contents.copy()
-        message_content.append({
+        message_content = image_contents + [{
             "type": "text",
             "text": HOLISTIC_ANALYSIS_PROMPT.format(num_images=num_images)
-        })
+        }]
+        analysis_data = request_json_reply(lambda: create_analysis_message(
+            messages=[{"role": "user", "content": message_content}],
+            system=CARV_METRICS_CONTEXT,
+        ))
+        if not isinstance(analysis_data, dict):
+            raise ModelReplyError("The AI reply wasn't in the expected format. Please try again.")
 
-        # Call Claude API with all images
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ],
-            system=CARV_METRICS_CONTEXT
-        )
-
-        # Extract response text
-        response_text = response.content[0].text
-
-        # Clean and parse JSON
-        cleaned_json = clean_json_response(response_text)
-
-        try:
-            analysis_data = json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = "Failed to parse AI response. Please try again."
-            return
-
-        # Add metadata
+        # Units, legacy fields, category averages and Ski:IQ version
+        normalise_analysis(analysis_data)
         analysis_data["analyzed_at"] = datetime.now().isoformat()
         analysis_data["filenames"] = filenames
         analysis_data["num_screenshots"] = num_images
 
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["result"] = analysis_data
+        set_job(job_id, status="completed", result=analysis_data)
 
+    except ModelReplyError as e:
+        set_job(job_id, status="failed", error=str(e))
     except Exception as e:
-        jobs[job_id]["status"] = "failed"
-        error_message = str(e)
-
-        if "api_key" in error_message.lower() or "authentication" in error_message.lower():
-            jobs[job_id]["error"] = "API key is missing or invalid."
-        elif "rate_limit" in error_message.lower():
-            jobs[job_id]["error"] = "Rate limited. Please wait and try again."
-        else:
-            jobs[job_id]["error"] = f"Analysis failed: {error_message}"
+        app.logger.error("Analysis job %s failed: %s", job_id, e)
+        set_job(job_id, status="failed", error=api_error_message(e))
 
 
 @app.route('/analyze-async', methods=['POST'])
@@ -1422,6 +880,11 @@ def analyze_screenshots_async():
             }), 400
 
         files = request.files.getlist('images')
+        if len(files) > MAX_FILES_PER_UPLOAD:
+            return jsonify({
+                "error": "Too many files",
+                "message": f"Please upload at most {MAX_FILES_PER_UPLOAD} screenshots at a time"
+            }), 400
 
         if len(files) == 0 or (len(files) == 1 and files[0].filename == ''):
             return jsonify({
@@ -1471,9 +934,12 @@ def analyze_screenshots_async():
                 "message": "Please upload at least one valid image file"
             }), 400
 
-        # Create job and return immediately
+        # Create the job (and clear out old ones), then return immediately
         job_id = str(uuid.uuid4())
-        jobs[job_id] = {"status": "pending", "result": None, "error": None}
+        cutoff = datetime.utcnow() - timedelta(seconds=JOB_KEEP_SECONDS)
+        Job.query.filter(Job.created_at < cutoff).delete()
+        db.session.add(Job(id=job_id, status="pending"))
+        db.session.commit()
 
         # Start background thread for processing
         thread = threading.Thread(
@@ -1490,9 +956,10 @@ def analyze_screenshots_async():
         })
 
     except Exception as e:
+        app.logger.exception("Failed to start analysis")
         return jsonify({
             "error": "Failed to start analysis",
-            "message": str(e)
+            "message": "Could not start the analysis. Please try again."
         }), 500
 
 
@@ -1502,132 +969,120 @@ def get_job_status(job_id):
     Get the status of an async analysis job.
     Returns status and result (if completed) or error (if failed).
     """
-    if job_id not in jobs:
+    job = db.session.get(Job, job_id)
+    if job is None:
         return jsonify({
             "error": "Job not found",
-            "message": f"No job found with ID: {job_id}"
+            "message": "This analysis is no longer available. Please analyze again."
         }), 404
 
-    job = jobs[job_id]
+    # A job nobody has updated for a while was lost when its worker restarted
+    if job.status in ("pending", "processing") and job.updated_at and \
+            (datetime.utcnow() - job.updated_at).total_seconds() > JOB_STALE_SECONDS:
+        job.status = "failed"
+        job.error = "The server restarted during this analysis. Please analyze again."
+        db.session.commit()
 
-    response = {
-        "job_id": job_id,
-        "status": job["status"]
-    }
-
-    if job["status"] == "completed":
-        response["result"] = job["result"]
-        # Clean up completed job after returning
-        # (Keep it for a bit in case of retry, but could add TTL cleanup)
-    elif job["status"] == "failed":
-        response["error"] = job["error"]
-
+    response = {"job_id": job.id, "status": job.status}
+    if job.status == "completed":
+        response["result"] = job.result
+    elif job.status == "failed":
+        response["error"] = job.error
     return jsonify(response)
 
 
 @app.route('/generate-plan', methods=['POST'])
 def generate_training_plan():
     """
-    Generate a personalized training plan based on holistic analysis results.
+    Generate a personalised training plan from an analysis.
 
-    Expects: JSON with analysis data
-    Returns: Markdown formatted training plan
+    Expects JSON: the analysis object (as returned by /analyze-async), optionally with
+    "days_available" (1-7, default 5), "runs_per_day" (4-20, default 10) and "session_id"
+    (a saved session to exclude from history).
+    Returns: {"training_plan": <structured plan>, ...}
     """
-    try:
-        data = request.get_json()
-
-        if not data:
-            return jsonify({
-                "error": "No analysis data provided",
-                "message": "Please analyze screenshots first before generating a training plan"
-            }), 400
-
-        # Extract key info for the prompt
-        ski_iq = "Unknown"
-        num_runs = data.get('num_screenshots', 1)
-
-        # Try to get Ski:IQ from session_overview
-        if 'session_overview' in data:
-            ski_iq_range = data['session_overview'].get('ski_iq_range', {})
-            avg_iq = ski_iq_range.get('average')
-            if avg_iq:
-                ski_iq = avg_iq
-
-        # Format analysis data for the prompt
-        analysis_json = json.dumps(data, indent=2)
-
-        # Create the prompt
-        prompt = TRAINING_PLAN_PROMPT.format(
-            analysis_data=analysis_json,
-            ski_iq=ski_iq,
-            num_runs=num_runs
-        )
-
-        # Call Claude API for training plan (using Haiku for speed on Render's 30s timeout)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=6000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            system="""You are an elite ski coach with deep expertise in carving biomechanics and CARV technology.
-
-Your knowledge is based on proven carving principles:
-- A carved turn means the ski tail follows the exact arc of the tip (train on tracks)
-- The 4 pillars: Edge Angle, Fore/Aft Balance, Rotary Control, Pressure Management
-- G-force is a RESULT of good technique, not the goal itself
-- Clean edge lock leaves a single thin line in snow
-
-When creating training plans:
-1. ALWAYS select drills from the provided Drill Library - these are proven, specific exercises
-2. Match drills to the specific metric deficiencies identified
-3. Use the Drill Selection Framework to pick appropriate drills
-4. Include detailed execution instructions, not vague suggestions
-5. Provide specific mental cues (3-5 words max)
-6. Be encouraging but honest about what needs work
-7. Use actual scores from the analysis
-8. Structure sessions: Warm-up → Focus Phase → Integration → Cool-down
-9. For EVERY drill recommended, include the YouTube video search link from the drill's Video field as a clickable reference (format: [Watch examples](URL))
-
-Key principles:
-- Quality over quantity (10 perfect turns beat 100 sloppy ones)
-- One focus at a time during practice
-- Progress from easy terrain to challenging
-- Build on strengths to fix weaknesses
-- Address root causes, not just symptoms"""
-        )
-
-        training_plan = response.content[0].text
-
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not (data.get('carv_metrics') or data.get('overall_metrics') or data.get('holistic_analysis')):
         return jsonify({
-            "training_plan": training_plan,
-            "generated_at": datetime.now().isoformat(),
-            "based_on_ski_iq": ski_iq,
-            "based_on_screenshots": num_runs
-        })
+            "error": "No analysis data provided",
+            "message": "Please analyze screenshots first before generating a training plan"
+        }), 400
 
+    def bounded_int(value, default, low, high):
+        try:
+            return max(low, min(high, int(value)))
+        except (TypeError, ValueError):
+            return default
+
+    days_available = bounded_int(data.pop('days_available', None), 5, 1, 7)
+    runs_per_day = bounded_int(data.pop('runs_per_day', None), 10, 4, 20)
+    exclude_session_id = data.pop('session_id', None)
+
+    analysis = normalise_analysis(copy.deepcopy(data))
+    overview = analysis.get('session_overview') or {}
+    ski_iq = (overview.get('ski_iq_range') or {}).get('average')
+
+    # The three most recent saved sessions before this one, so the plan can build on them
+    history = []
+    try:
+        query = Session.query
+        session_dt = overview.get('session_datetime')
+        if session_dt:
+            try:
+                query = query.filter(Session.session_date < datetime.fromisoformat(str(session_dt).replace('Z', '+00:00')))
+            except ValueError:
+                pass
+        if exclude_session_id:
+            query = query.filter(Session.id != exclude_session_id)
+        history = [history_entry(s) for s in query.order_by(Session.session_date.desc()).limit(3).all()]
+    except Exception as e:  # history is a bonus; never block a plan on it
+        app.logger.warning("Could not load session history for plan: %s", e)
+
+    try:
+        response = client.messages.create(
+            model=FAST_MODEL,  # fast model keeps plan generation inside Render's request limits
+            max_tokens=8000,
+            system=plan_system_blocks(CARV_METRICS_CONTEXT),
+            tools=[PLAN_TOOL],
+            tool_choice={"type": "tool", "name": PLAN_TOOL["name"]},
+            messages=[{"role": "user", "content": plan_user_message(analysis, history, days_available, runs_per_day)}],
+        )
     except Exception as e:
         error_message = str(e)
-
+        app.logger.error("Plan generation failed: %s", error_message)
         if "api_key" in error_message.lower() or "authentication" in error_message.lower():
-            return jsonify({
-                "error": "API Key Error",
-                "message": "Your Anthropic API key is missing or invalid. Please check your .env file."
-            }), 401
-
+            return jsonify({"error": "API Key Error", "message": "The Anthropic API key is missing or invalid."}), 401
         if "rate_limit" in error_message.lower():
-            return jsonify({
-                "error": "Rate Limited",
-                "message": "Too many requests. Please wait a moment and try again."
-            }), 429
+            return jsonify({"error": "Rate Limited", "message": "Too many requests. Please wait a moment and try again."}), 429
+        return jsonify({"error": "Plan generation failed", "message": "Something went wrong generating your training plan. Please try again."}), 500
 
-        return jsonify({
-            "error": "Plan generation failed",
-            "message": f"Something went wrong generating your training plan. Error: {error_message}"
-        }), 500
+    if response.stop_reason == "max_tokens":
+        return jsonify({"error": "Plan cut off", "message": "The training plan was too long and got cut off. Please try again."}), 502
+
+    tool_input = next((block.input for block in response.content if getattr(block, "type", None) == "tool_use"), None)
+    try:
+        plan = assemble_plan(
+            tool_input,
+            ski_iq=ski_iq,
+            days_available=days_available,
+            runs_per_day=runs_per_day,
+            generated_at=datetime.now().isoformat(),
+        )
+    except PlanError as e:
+        return jsonify({"error": "Plan generation failed", "message": f"{e} Please try again."}), 502
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        app.logger.info("Plan tokens: input %s, cache read %s, cache write %s, output %s",
+                        usage.input_tokens, getattr(usage, "cache_read_input_tokens", None),
+                        getattr(usage, "cache_creation_input_tokens", None), usage.output_tokens)
+
+    return jsonify({
+        "training_plan": plan,
+        "generated_at": plan["generated_at"],
+        "based_on_ski_iq": ski_iq,
+        "based_on_sessions": len(history),
+    })
 
 
 @app.route('/chat', methods=['POST'])
@@ -1679,8 +1134,12 @@ def chat():
                 if so.get('session_date_display'):
                     session_context += f"**Session Date:** {so['session_date_display']}\n"
 
-            # Overall metrics (Balance, Edging, Rotary, Performance)
-            if 'overall_metrics' in analysis_data:
+            # Carv metrics with their real units, zones and run details (current analyses)
+            if analysis_data.get('carv_metrics') or analysis_data.get('run_details'):
+                session_context += "\n**Carv Metrics and Run Details:**\n" + describe_metrics(analysis_data) + "\n"
+
+            # Overall metrics (Balance, Edging, Rotary, Performance) - older saved analyses
+            elif 'overall_metrics' in analysis_data:
                 om = analysis_data['overall_metrics']
                 session_context += "\n**Metric Scores:**\n"
 
@@ -1763,11 +1222,15 @@ def chat():
             for i, session in enumerate(session_history):
                 session_context += f"**Session {i+1}** ({session.get('date', 'unknown date')}):\n"
                 if session.get('skiIQ'):
-                    session_context += f"  Ski:IQ: {session['skiIQ']}\n"
+                    version = session.get('skiIQVersion')
+                    version_note = {'stelvio': ' (Ski:IQ 26 scoring)', 'wasatch': ' (pre-26 scoring)'}.get(version, '')
+                    session_context += f"  Ski:IQ: {session['skiIQ']}{version_note}\n"
+                if session.get('technique') or session.get('snowSurface') or session.get('pitch') is not None:
+                    session_context += f"  Technique: {session.get('technique') or '?'}, snow: {session.get('snowSurface') or '?'}, pitch: {session.get('pitch') if session.get('pitch') is not None else '?'}°\n"
                 if session.get('balance') is not None:
                     session_context += f"  Balance: {session['balance']}/100\n"
                 if session.get('twr') is not None:
-                    session_context += f"  TWR: {session['twr']}/100\n"
+                    session_context += f"  Weight Release: {session['twr']}%\n"
                 if session.get('edging') is not None:
                     session_context += f"  Edging: {session['edging']}/100\n"
                 if session.get('edgeAngle') is not None:
@@ -1800,7 +1263,7 @@ def chat():
 
         # Call Claude API
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",  # Fast for chat
+            model=FAST_MODEL,  # Fast for chat
             max_tokens=1500,
             messages=messages,
             system=f"""You are Coach Carv, an elite ski coach and carving expert with decades of experience training recreational skiers to advanced racers. You have deep knowledge of CARV technology and biomechanics.
@@ -1839,7 +1302,7 @@ def chat():
 You're having a friendly, expert conversation with Patrick. Be personable but professional."""
         )
 
-        ai_response = response.content[0].text
+        ai_response = get_reply_text(response)
 
         return jsonify({
             "response": ai_response,
@@ -1861,9 +1324,10 @@ You're having a friendly, expert conversation with Patrick. Be personable but pr
                 "message": "Too many requests. Please wait a moment and try again."
             }), 429
 
+        app.logger.error("Chat failed: %s", error_message)
         return jsonify({
             "error": "Chat failed",
-            "message": f"Something went wrong. Error: {error_message}"
+            "message": "Something went wrong. Please try again."
         }), 500
 
 
@@ -1892,16 +1356,17 @@ def create_session():
 
         # Extract Ski:IQ from metrics if available
         ski_iq = None
-        metrics = data.get('metrics', {})
-        if metrics:
+        metrics = data.get('metrics') or {}
+        if isinstance(metrics, dict) and metrics:
+            normalise_analysis(metrics)
             session_overview = metrics.get('session_overview', {})
             ski_iq_range = session_overview.get('ski_iq_range', {})
             # Try 'average' first, then calculate from 'lowest'/'highest' (AI response keys)
-            if ski_iq_range.get('average'):
+            if ski_iq_range.get('average') is not None:
                 ski_iq = ski_iq_range['average']
-            elif ski_iq_range.get('lowest') and ski_iq_range.get('highest'):
+            elif ski_iq_range.get('lowest') is not None and ski_iq_range.get('highest') is not None:
                 ski_iq = (ski_iq_range['lowest'] + ski_iq_range['highest']) / 2
-            elif ski_iq_range.get('min') and ski_iq_range.get('max'):
+            elif ski_iq_range.get('min') is not None and ski_iq_range.get('max') is not None:
                 ski_iq = (ski_iq_range['min'] + ski_iq_range['max']) / 2
 
         session = Session(
@@ -1920,7 +1385,8 @@ def create_session():
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to save session: {str(e)}"}), 500
+        app.logger.exception("Failed to save session")
+        return jsonify({"error": "Failed to save session", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions', methods=['GET'])
@@ -1930,30 +1396,34 @@ def list_sessions():
         sessions = Session.query.order_by(Session.session_date.desc()).all()
         return jsonify([s.to_dict() for s in sessions])
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch sessions: {str(e)}"}), 500
+        app.logger.exception("Failed to fetch sessions")
+        return jsonify({"error": "Failed to fetch sessions", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['GET'])
 def get_session(session_id):
     """Get a single session by ID."""
     try:
-        session = Session.query.get(session_id)
+        session = db.session.get(Session, session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
         return jsonify(session.to_dict())
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch session: {str(e)}"}), 500
+        app.logger.exception("Failed to fetch session")
+        return jsonify({"error": "Failed to fetch session", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['PUT'])
 def update_session(session_id):
     """Update a session (e.g., add notes or training plan)."""
     try:
-        session = Session.query.get(session_id)
+        session = db.session.get(Session, session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
 
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "No data provided"}), 400
 
         if 'location' in data:
             session.location = data['location']
@@ -1961,19 +1431,31 @@ def update_session(session_id):
             session.notes = data['notes']
         if 'training_plan' in data:
             session.training_plan = data['training_plan']
+        if 'session_date' in data and data['session_date']:
+            try:
+                session.session_date = datetime.fromisoformat(str(data['session_date']).replace('Z', '+00:00'))
+            except ValueError:
+                return jsonify({"error": "Invalid session_date"}), 400
+        if isinstance(data.get('metrics'), dict):
+            metrics = normalise_analysis(data['metrics'])
+            session.metrics = metrics
+            ski_iq_range = (metrics.get('session_overview') or {}).get('ski_iq_range') or {}
+            if ski_iq_range.get('average') is not None:
+                session.ski_iq = ski_iq_range['average']
 
         db.session.commit()
         return jsonify(session.to_dict())
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to update session: {str(e)}"}), 500
+        app.logger.exception("Failed to update session")
+        return jsonify({"error": "Failed to update session", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['DELETE'])
 def delete_session(session_id):
     """Delete a session."""
     try:
-        session = Session.query.get(session_id)
+        session = db.session.get(Session, session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
 
@@ -1982,7 +1464,8 @@ def delete_session(session_id):
         return jsonify({"message": "Session deleted"})
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to delete session: {str(e)}"}), 500
+        app.logger.exception("Failed to delete session")
+        return jsonify({"error": "Failed to delete session", "message": "Database error. Please try again."}), 500
 
 
 # ============================================================================
@@ -1995,13 +1478,26 @@ You have access to CARV metrics data from each session. Your PRIMARY goal is to 
 ## YOUR TASK
 
 ### 1. EXTRACT ALL METRICS
-For each session, extract EVERY metric value you can find:
-- Ski:IQ (overall score)
-- Balance metrics: outside ski %, fore/aft balance, stance width, weight distribution
-- Edging metrics: edge angle (max/avg), turn shape score, carving %
-- Rotary metrics: rotation separation, hip alignment, counter
-- Performance: G-force, speed, turn radius
-- Any other metrics present
+For each session, use the metrics that are present. Carv's current list is: Parallel Skis,
+Turn Shape, Turn Closure, Early Edging, Edging Smoothness, Edging Similarity, Edge Build,
+Edge Angle (degrees), Weight Release, G-Force (g), Slope Pitch (degrees), plus Ski:IQ and the
+run details (technique, snow surface, pitch, tempo, corridor, radius, balance rating, Carv's
+skill highlights). Older sessions may only have the legacy grouped fields. Never invent a
+metric that is not in the data.
+
+### 1b. COMPARE LIKE WITH LIKE
+- Each session has a ski_iq_version. Ski:IQ 26 (Stelvio) raised off-piste / ungroomed scores by
+  about 4.5 points on the same runs and now credits slope pitch. A change in Ski:IQ across the
+  Wasatch → Stelvio boundary is partly a scoring change: say so explicitly, and do not report it
+  as improvement on its own.
+- Compare sessions with the same technique and similar snow and pitch where you can, and say
+  when a difference may come from terrain rather than technique.
+- Turn Closure is judged against its performance zone, not "higher is better".
+
+### 1c. DRILLS PRACTISED
+Sessions may list the drills from that session's training plan and how the skier logged them
+(done, runs, how it felt, notes). Relate them to how the target metrics moved in the following
+sessions: which drills seem to be working, and which aren't.
 
 ### 2. ANALYZE METRIC CORRELATIONS (MOST IMPORTANT)
 Look for patterns where metrics change TOGETHER:
@@ -2031,15 +1527,14 @@ Return a JSON object with this structure:
         {
             "date": "YYYY-MM-DD",
             "ski_iq": number,
+            "ski_iq_version": "stelvio|wasatch|null",
+            "technique": "string or null",
             "key_metrics": {
-                "edge_angle_max": number,
-                "outside_ski_pressure": number,
-                "balance_score": number,
-                "turn_shape": number,
-                "carving_percentage": number
+                "<carv metric key, e.g. edge_angle>": number
             }
         }
     ],
+    "scoring_change_note": "If sessions span the Wasatch → Stelvio change, explain how that affects the Ski:IQ trend; otherwise null",
     "all_metrics_tracked": ["list of all metric names found across sessions"],
     "metric_correlations": [
         {
@@ -2110,30 +1605,43 @@ def analyze_progression():
         # Build context for Claude - extract key metrics, keep payload lean for speed
         session_data = []
         for s in sessions:
-            metrics = s.metrics or {}
-            overall = metrics.get('overall_metrics', {})
-            overview = metrics.get('session_overview', {})
+            metrics = normalise_analysis(copy.deepcopy(s.metrics or {}))
+            overall = metrics.get('overall_metrics') or {}
+            overview = metrics.get('session_overview') or {}
+            details = metrics.get('run_details') or {}
+            if not overview.get('ski_iq_version') and s.session_date:
+                overview['ski_iq_version'] = default_ski_iq_version(s.session_date.isoformat())
             # Extract just the numerical data and key observations
             session_entry = {
                 "date": s.session_date.strftime("%Y-%m-%d") if s.session_date else "Unknown",
                 "session_id": s.id,
                 "location": s.location,
-                "ski_iq": overview.get('ski_iq_range', {}).get('average') or s.ski_iq,
+                "ski_iq": (overview.get('ski_iq_range') or {}).get('average') or s.ski_iq,
+                "ski_iq_version": overview.get('ski_iq_version'),
                 "terrain": overview.get('terrain_types_seen', []),
                 "turns_analyzed": overview.get('total_turns_analyzed'),
-                "balance": overall.get('balance', {}),
-                "edging": overall.get('edging', {}),
-                "rotary": overall.get('rotary', {}),
-                "performance": overall.get('performance', {}),
-                "top_priorities": [p.get('area') + f" ({p.get('current_score')})" for p in metrics.get('top_3_priorities', []) if p.get('area')],
-                "biggest_limiter": metrics.get('holistic_analysis', {}).get('biggest_limiter', ''),
-                "detailed_observations": metrics.get('detailed_observations', '')[:500]
+                "carv_metrics": metrics.get('carv_metrics'),
+                "run_details": {k: details.get(k) for k in (
+                    'technique', 'snow_surface', 'pitch_deg', 'tempo_tpm', 'corridor_m', 'radius_m',
+                    'balance_rating', 'carving_turns', 'skill_highlights'
+                ) if details.get(k) not in (None, '', [], {})} or None,
+                # Older sessions without carv_metrics still have the grouped fields
+                "legacy_metrics": None if metrics.get('carv_metrics') else {
+                    "balance": overall.get('balance', {}),
+                    "edging": overall.get('edging', {}),
+                    "rotary": overall.get('rotary', {}),
+                    "performance": overall.get('performance', {}),
+                },
+                "drills_practised": drills_practised(parse_stored_plan(s.training_plan)),
+                "top_priorities": [p.get('area') + f" ({p.get('current_score')})" for p in (metrics.get('top_3_priorities') or []) if p.get('area')],
+                "biggest_limiter": (metrics.get('holistic_analysis') or {}).get('biggest_limiter', ''),
+                "detailed_observations": (metrics.get('detailed_observations') or '')[:500]
             }
             session_data.append(session_entry)
 
         # Call Claude for analysis - use Haiku for speed within Render's timeout
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",  # Fast model to stay within Render timeout
+        progression_request = lambda: client.messages.create(
+            model=FAST_MODEL,  # Fast model to stay within Render timeout
             max_tokens=4000,
             messages=[{
                 "role": "user",
@@ -2150,16 +1658,12 @@ Return ONLY valid JSON, no markdown code blocks."""
             system=CARV_METRICS_CONTEXT
         )
 
-        response_text = response.content[0].text
-        cleaned_json = clean_json_response(response_text)
-
         try:
-            progression_data = json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            return jsonify({
-                "error": "Failed to parse progression analysis",
-                "raw_response": response_text[:500]
-            }), 500
+            progression_data = request_json_reply(progression_request)
+        except ModelReplyError as e:
+            return jsonify({"error": "Progression analysis failed", "message": str(e)}), 502
+        if not isinstance(progression_data, dict):
+            return jsonify({"error": "Progression analysis failed", "message": "The AI reply wasn't in the expected format. Please try again."}), 502
 
         progression_data["sessions_analyzed"] = len(sessions)
         progression_data["session_ids_analyzed"] = [s.id for s in sessions]
@@ -2182,83 +1686,8 @@ Return ONLY valid JSON, no markdown code blocks."""
         return jsonify(progression_data)
 
     except Exception as e:
-        return jsonify({"error": f"Progression analysis failed: {str(e)}"}), 500
-
-
-@app.route('/compare', methods=['POST'])
-def compare_sessions():
-    """Compare two specific sessions side-by-side."""
-    try:
-        data = request.get_json()
-
-        if not data or 'session_id_1' not in data or 'session_id_2' not in data:
-            return jsonify({
-                "error": "Missing session IDs",
-                "message": "Provide session_id_1 and session_id_2"
-            }), 400
-
-        session1 = Session.query.get(data['session_id_1'])
-        session2 = Session.query.get(data['session_id_2'])
-
-        if not session1 or not session2:
-            return jsonify({"error": "One or both sessions not found"}), 404
-
-        # Determine which is earlier/later
-        if session1.session_date <= session2.session_date:
-            earlier, later = session1, session2
-        else:
-            earlier, later = session2, session1
-
-        # Call Claude for comparison
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
-            messages=[{
-                "role": "user",
-                "content": f"""Compare these two skiing sessions and describe what changed:
-
-EARLIER SESSION ({earlier.session_date.strftime("%Y-%m-%d") if earlier.session_date else "Unknown"}):
-Location: {earlier.location}
-Ski:IQ: {earlier.ski_iq}
-Metrics: {json.dumps(earlier.metrics, indent=2) if earlier.metrics else "No metrics"}
-
-LATER SESSION ({later.session_date.strftime("%Y-%m-%d") if later.session_date else "Unknown"}):
-Location: {later.location}
-Ski:IQ: {later.ski_iq}
-Metrics: {json.dumps(later.metrics, indent=2) if later.metrics else "No metrics"}
-
-Provide a comparison in JSON format:
-{{
-    "ski_iq_change": {{"from": X, "to": Y, "change": "+/-Z", "assessment": "..."}},
-    "key_improvements": ["..."],
-    "areas_declined": ["..."],
-    "technique_changes": "Plain language description of how technique evolved",
-    "recommendations": "What to focus on next based on this comparison"
-}}
-
-Return ONLY valid JSON."""
-            }],
-            system=CARV_METRICS_CONTEXT
-        )
-
-        response_text = response.content[0].text
-        cleaned_json = clean_json_response(response_text)
-
-        try:
-            comparison_data = json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            return jsonify({
-                "error": "Failed to parse comparison",
-                "raw_response": response_text[:500]
-            }), 500
-
-        comparison_data["session_1"] = earlier.to_dict()
-        comparison_data["session_2"] = later.to_dict()
-
-        return jsonify(comparison_data)
-
-    except Exception as e:
-        return jsonify({"error": f"Comparison failed: {str(e)}"}), 500
+        app.logger.exception("Progression analysis failed")
+        return jsonify({"error": "Progression analysis failed", "message": "Something went wrong analysing your progression. Please try again."}), 500
 
 
 if __name__ == '__main__':
@@ -2274,4 +1703,5 @@ if __name__ == '__main__':
         print("API Key: Configured")
         print("="*60 + "\n")
 
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    # Local development only; production runs under gunicorn. FLASK_DEBUG=1 turns on the debugger.
+    app.run(host='127.0.0.1', port=5001, debug=os.getenv('FLASK_DEBUG') == '1')
