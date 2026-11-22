@@ -43,10 +43,11 @@ app = Flask(__name__)
 allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://carv-analyzer.onrender.com",
+    "https://carv-analyzer-frontend.onrender.com",
 ]
-# Add production frontend URL from environment variable if set
-frontend_url = os.getenv("FRONTEND_URL")
+# Add production frontend URL from environment variable if set.
+# Browsers send the origin without a path or trailing slash, so match that form.
+frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
 if frontend_url:
     allowed_origins.append(frontend_url)
 
