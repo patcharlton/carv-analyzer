@@ -126,9 +126,12 @@ def upload_too_large(_error):
 # Database configuration
 database_url = os.getenv("DATABASE_URL")
 if database_url:
-    # Render uses postgres:// but SQLAlchemy needs postgresql://
-    if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    # Render gives postgres:// or postgresql://. Name the psycopg2 driver explicitly:
+    # SQLAlchemy 2.1 defaults postgresql:// to psycopg 3, which isn't installed.
+    for prefix in ("postgres://", "postgresql://"):
+        if database_url.startswith(prefix):
+            database_url = "postgresql+psycopg2://" + database_url[len(prefix):]
+            break
     app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 else:
     # Fallback to SQLite for local development
