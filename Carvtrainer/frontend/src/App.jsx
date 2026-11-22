@@ -265,6 +265,8 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [planLoading, setPlanLoading] = useState(false)
   const [planDays, setPlanDays] = useState(5) // ski days this week, for the plan's schedule
+  const [editingValues, setEditingValues] = useState(false) // correcting misread values
+  const [loadedLogId, setLoadedLogId] = useState(null) // the saved session currently open, if any
   const [planRuns, setPlanRuns] = useState(10) // runs per ski day
   const [error, setError] = useState(null)
   const fileInputRef = useRef(null)
@@ -743,6 +745,8 @@ function App() {
     setLoading(true)
     setError(null)
     setAnalysis(null)
+    setLoadedLogId(null)
+    setEditingValues(false)
     setTrainingPlan(null)
 
     try {
@@ -1242,6 +1246,120 @@ function App() {
     )
   }
 
+  // ---- Correcting values the AI misread. Corrected fields are listed in
+  // analysis.user_corrected so later AI calls treat them as ground truth.
+  const markCorrected = (a, path) => ({ ...a, user_corrected: Array.from(new Set([...(a.user_corrected || []), path])) })
+
+  const updateCarvMetric = (key, field, raw) => setAnalysis(prev => {
+    if (!prev) return prev
+    const def = CARV_METRIC_DEFS.find(d => d.key === key)
+    const current = prev.carv_metrics?.[key] || { value: null, unit: def.unit, zone: null }
+    let value = current.value
+    if (field === 'value') {
+      value = raw === '' ? null : Number(raw)
+      if (value !== null && Number.isNaN(value)) return prev
+    }
+    const zone = field === 'zone' ? (raw || null) : current.zone
+    const carv = { ...(prev.carv_metrics || {}) }
+    if (value === null) delete carv[key]
+    else carv[key] = { value, unit: def.unit, zone }
+    // Keep the older grouped fields in step (the server recomputes averages when saved)
+    let overall = prev.overall_metrics
+    if (def.legacy) {
+      const [category, legacyKey] = def.legacy
+      overall = { ...(overall || {}), [category]: { ...(overall?.[category] || {}), [legacyKey]: value } }
+    }
+    return markCorrected({ ...prev, carv_metrics: carv, overall_metrics: overall }, `carv_metrics.${key}`)
+  })
+
+  const updateSkiIQValue = (raw) => setAnalysis(prev => {
+    if (!prev) return prev
+    const value = raw === '' ? null : Number(raw)
+    if (value !== null && Number.isNaN(value)) return prev
+    return markCorrected({
+      ...prev,
+      session_overview: { ...(prev.session_overview || {}), ski_iq_range: { lowest: value, highest: value, average: value } }
+    }, 'ski_iq')
+  })
+
+  const updateRunDetail = (key, raw, numeric = false) => setAnalysis(prev => {
+    if (!prev) return prev
+    let value = raw === '' ? null : raw
+    if (numeric && value !== null) {
+      value = Number(value)
+      if (Number.isNaN(value)) return prev
+    }
+    return markCorrected({ ...prev, run_details: { ...(prev.run_details || {}), [key]: value } }, `run_details.${key}`)
+  })
+
+  const updateSessionDateValue = (raw) => {
+    setSessionDateTime(raw)
+    setAnalysis(prev => prev ? markCorrected({
+      ...prev,
+      session_overview: { ...(prev.session_overview || {}), session_datetime: raw ? `${raw}:00` : null, session_date_display: null }
+    }, 'session_datetime') : prev)
+  }
+
+  // Inputs for every value Carv shows, so misread or missing values can be fixed
+  const renderValueEditor = () => {
+    const details = analysis?.run_details || {}
+    const range = analysis?.session_overview?.ski_iq_range || {}
+    return (
+      <section className="metrics-section value-editor">
+        <h2>Correct the values</h2>
+        <p className="value-editor-note">Fix anything the AI misread from your screenshots. Corrected values are marked so coaching treats them as right. Save the session afterwards to keep them.</p>
+        <div className="value-editor-grid">
+          <label>Ski:IQ
+            <input type="number" inputMode="numeric" value={range.average ?? ''} onChange={(e) => updateSkiIQValue(e.target.value)} />
+          </label>
+          <label>Date and time
+            <input type="datetime-local" value={normaliseLocalDateTime(analysis?.session_overview?.session_datetime) || sessionDateTime || ''} onChange={(e) => updateSessionDateValue(e.target.value)} />
+          </label>
+          <label>Technique
+            <select value={details.technique || ''} onChange={(e) => updateRunDetail('technique', e.target.value)}>
+              <option value="">Unknown</option>
+              <option value="carving">Carving</option>
+              <option value="short turns">Short turns</option>
+              <option value="parallel">Parallel</option>
+            </select>
+          </label>
+          <label>Snow surface
+            <input type="text" value={details.snow_surface || ''} placeholder="e.g. Smooth" onChange={(e) => updateRunDetail('snow_surface', e.target.value)} />
+          </label>
+          <label>Pitch (°)
+            <input type="number" inputMode="decimal" value={details.pitch_deg ?? ''} onChange={(e) => updateRunDetail('pitch_deg', e.target.value, true)} />
+          </label>
+          <label>Balance
+            <select value={details.balance_rating || ''} onChange={(e) => updateRunDetail('balance_rating', e.target.value)}>
+              <option value="">Unknown</option>
+              <option value="Ok">Ok</option>
+              <option value="Good">Good</option>
+              <option value="Great">Great</option>
+            </select>
+          </label>
+        </div>
+        <div className="value-editor-metrics">
+          {CARV_METRIC_DEFS.map(def => {
+            const entry = analysis?.carv_metrics?.[def.key]
+            return (
+              <div key={def.key} className="value-editor-row">
+                <span className="carv-metric-label">{def.label} ({def.unit})</span>
+                <input type="number" inputMode="decimal" step={def.unit === 'g' ? '0.1' : '1'} value={entry?.value ?? ''}
+                  onChange={(e) => updateCarvMetric(def.key, 'value', e.target.value)} aria-label={`${def.label} value`} />
+                <select value={entry?.zone || ''} onChange={(e) => updateCarvMetric(def.key, 'zone', e.target.value)} aria-label={`${def.label} zone`}>
+                  <option value="">Zone ?</option>
+                  <option value="below">Below zone</option>
+                  <option value="in">In zone</option>
+                  <option value="above">Above zone</option>
+                </select>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+    )
+  }
+
   // Set the Ski:IQ scoring version on the current analysis (Carv rescored with Ski:IQ 26)
   const setAnalysisSkiIQVersion = (version) => {
     setAnalysis(prev => prev ? {
@@ -1689,6 +1807,8 @@ function App() {
   const clearAll = () => {
     setSelectedFiles([])
     setAnalysis(null)
+    setLoadedLogId(null)
+    setEditingValues(false)
     setTrainingPlan(null)
     setError(null)
     if (fileInputRef.current) {
@@ -1734,11 +1854,13 @@ function App() {
       // Same run saved before (same time and, when known, same location)? The same Carv
       // run can be screenshotted twice, e.g. before and after the Carv app 10 update.
       const location = analysis?.session_overview?.location || null
-      const existingLog = progressLogs.find(log =>
+      // A session opened from history is updated in place, even if its date was corrected
+      const openedLog = loadedLogId ? progressLogs.find(log => log.id === loadedLogId) : null
+      const existingLog = openedLog || progressLogs.find(log =>
         normaliseLocalDateTime(log.datetime) === masterDateTime &&
         (!location || !log.analysis?.session_overview?.location || log.analysis.session_overview.location === location)
       )
-      if (existingLog && !window.confirm(
+      if (existingLog && !openedLog && !window.confirm(
         `A session at ${formatDateTime(existingLog.datetime, existingLog.datetimeDisplay)} is already saved. Replace it with this analysis?\n\nOK replaces it. Cancel keeps the existing one and does not save.`
       )) {
         setShowSaveDialog(false)
@@ -1767,6 +1889,8 @@ function App() {
         console.warn('Database save failed, saving to localStorage only:', err)
       }
 
+      // The server's copy has the grouped fields and averages recomputed
+      const savedAnalysis = dbSession?.metrics || analysisToSave
       const logEntry = {
         id: dbSession?.id || `log-${Date.now()}`,
         dbSessionId: dbSession?.id || null,
@@ -1776,14 +1900,14 @@ function App() {
           (sessionDateTime ? 'exif_or_filename' : 'current_time'),
         notes: sessionNotes,
         savedAt: new Date().toISOString(),
-        analysis: analysisToSave,
+        analysis: savedAnalysis,
         trainingPlan: trainingPlan,
         metrics: {
           skiIQ: skiIQ,
-          balance: analysis.overall_metrics?.balance,
-          edging: analysis.overall_metrics?.edging,
-          rotary: analysis.overall_metrics?.rotary,
-          performance: analysis.overall_metrics?.performance
+          balance: savedAnalysis.overall_metrics?.balance,
+          edging: savedAnalysis.overall_metrics?.edging,
+          rotary: savedAnalysis.overall_metrics?.rotary,
+          performance: savedAnalysis.overall_metrics?.performance
         }
       }
 
@@ -1791,7 +1915,8 @@ function App() {
       setProgressLogs(prev => existingLog
         ? prev.map(log => log.id === existingLog.id ? { ...logEntry, id: existingLog.id, dbSessionId: dbSession?.id || existingLog.dbSessionId } : log)
         : [...prev, logEntry])
-      setAnalysis(analysisToSave)
+      setAnalysis(savedAnalysis)
+      setLoadedLogId(existingLog ? existingLog.id : logEntry.id)
 
       setShowSaveDialog(false)
       setSessionNotes('')
@@ -1840,6 +1965,9 @@ function App() {
       }
     }
     setAnalysis(log.analysis)
+    setLoadedLogId(log.id)
+    setSessionNotes(log.notes || '') // so saving again keeps the session's notes
+    setEditingValues(false)
     setTrainingPlan(parseStoredPlan(log.trainingPlan))
     setSessionDateTime(normaliseLocalDateTime(log.datetime) || '')
     setShowProgressPanel(false)
@@ -2152,6 +2280,12 @@ function App() {
                 )}
                 <div className="session-stats">
                   <div className="stat">
+                    <button type="button" className="edit-values-btn" onClick={() => setEditingValues(v => !v)}>
+                      {editingValues ? 'Done editing' : 'Edit values'}
+                    </button>
+                    {analysis.user_corrected?.length > 0 && <span className="stat-label">Corrected by you</span>}
+                  </div>
+                  <div className="stat">
                     <label className="version-select-label" htmlFor="ski-iq-version">Scoring</label>
                     <select
                       id="ski-iq-version"
@@ -2222,6 +2356,8 @@ function App() {
                 </div>
               </section>
             )}
+
+            {editingValues && renderValueEditor()}
 
             {/* Carv metrics as Carv shows them (current analyses) */}
             {(analysis.carv_metrics || analysis.run_details) ? (

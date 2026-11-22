@@ -220,6 +220,11 @@ Not shown by Carv any more as scores: Start of Turn and Centered Balance. Never 
 estimate them. Fore/aft balance is still a useful coaching idea; use Carv's Balance
 rating (Ok / Good / Great) and Weight Release as the evidence for it.
 
+### Values the skier corrected
+If an analysis has a `user_corrected` list, the skier checked those fields against the Carv
+app and fixed them (for example `carv_metrics.edge_angle` or `ski_iq`). Treat them as correct
+and never second-guess them.
+
 ### Other things on the run screens
 - Technique mode chip (e.g. CARVING). Coach the technique that was skied:
   * Carving on groomed snow: the carving guidance below applies in full.
