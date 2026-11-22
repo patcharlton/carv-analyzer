@@ -292,6 +292,8 @@ function App() {
   const [deleteConfirmId, setDeleteConfirmId] = useState(null)
   const [expandedLogId, setExpandedLogId] = useState(null) // For expandable log cards
   const [selectedMetric, setSelectedMetric] = useState('skiIQ') // For chart metric selection
+  const [chartTechnique, setChartTechnique] = useState('all') // chart filter: compare like with like
+  const [chartSnow, setChartSnow] = useState('all')
 
   // Database-backed sessions state
   const [dbSessions, setDbSessions] = useState([])
@@ -2760,191 +2762,163 @@ function App() {
                   </div>
                 )}
 
-                {/* Progression Line Chart */}
-                {sortedLogs.length > 1 && (
-                  <div className="progress-chart-container">
-                    <div className="chart-header">
-                      <h3>Progression Over Time</h3>
-                      <div className="metric-selector">
-                        <select
-                          value={selectedMetric}
-                          onChange={(e) => setSelectedMetric(e.target.value)}
-                          className="metric-select"
-                        >
-                          <option value="skiIQ">Ski:IQ</option>
-                          <option value="balance">Balance</option>
-                          <option value="edging">Edging</option>
-                          <option value="rotary">Rotary</option>
-                          <option value="gforce">G-Force</option>
+                {/* Progression chart: Ski:IQ or any Carv metric, filtered to like-for-like sessions */}
+                {sortedLogs.length > 1 && (() => {
+                  const metricDef = CARV_METRIC_DEFS.find(d => d.key === selectedMetric)
+                  const unit = metricDef ? metricDef.unit : ''
+                  const metricLabel = metricDef ? metricDef.label : 'Ski:IQ'
+                  const valueOf = (log) => metricDef ? getLogMetricValue(log, metricDef) : log.metrics?.skiIQ
+                  const techniqueOf = (log) => (log.analysis?.run_details?.technique || '').toLowerCase() || 'unknown'
+                  const snowOf = (log) => (log.analysis?.run_details?.snow_surface || '').toLowerCase() || 'unknown'
+                  const optionsFor = (fn) => [...new Set(sortedLogs.map(fn))].sort((a, b) => (a === 'unknown') - (b === 'unknown') || a.localeCompare(b))
+                  const techniques = optionsFor(techniqueOf)
+                  const snows = optionsFor(snowOf)
+                  const capitalise = (t) => t.charAt(0).toUpperCase() + t.slice(1)
+                  const chartLogs = [...sortedLogs].reverse()
+                    .filter(log => chartTechnique === 'all' || techniqueOf(log) === chartTechnique)
+                    .filter(log => chartSnow === 'all' || snowOf(log) === chartSnow)
+                  const points = chartLogs.map(log => ({ log, val: valueOf(log) })).filter(p => p.val !== null && p.val !== undefined)
+                  const formatVal = (v) => formatMetricValue(v, unit)
+                  const versions = points.map(p => getSkiIQVersion(p.log.analysis, p.log.datetime))
+                  const mixedVersions = selectedMetric === 'skiIQ' && new Set(versions.filter(Boolean)).size > 1
+
+                  let chart = <div className="no-chart-data">Not enough sessions with this metric{chartTechnique !== 'all' || chartSnow !== 'all' ? ' for these filters' : ''} yet</div>
+                  let summary = null
+                  if (points.length >= 2) {
+                    const values = points.map(p => p.val)
+                    const pad = unit === 'g' ? 0.2 : 5
+                    const minVal = Math.min(...values) - pad
+                    const maxVal = Math.max(...values) + pad
+                    const range = maxVal - minVal || 1
+                    const width = 340
+                    const height = 120
+                    const padding = { top: 10, right: 10, bottom: 25, left: 35 }
+                    const chartWidth = width - padding.left - padding.right
+                    const chartHeight = height - padding.top - padding.bottom
+                    const xy = points.map((p, idx) => ({
+                      ...p,
+                      x: padding.left + (idx / (points.length - 1)) * chartWidth,
+                      y: padding.top + chartHeight - ((p.val - minVal) / range) * chartHeight
+                    }))
+                    const pathD = xy.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
+                    const areaD = `${pathD} L ${xy[xy.length - 1].x} ${height - padding.bottom} L ${xy[0].x} ${height - padding.bottom} Z`
+                    const trend = values[values.length - 1] - values[0]
+                    // Turn Closure and Slope Pitch aren't "higher is better", so their trend isn't coloured
+                    const neutral = metricDef && (metricDef.zoneOnly || metricDef.key === 'slope_pitch')
+                    const colour = neutral ? '#667eea' : trend >= 0 ? '#28a745' : '#dc3545'
+                    const boundaryIdx = versions.findIndex((v, i) => i > 0 && v === 'stelvio' && versions[i - 1] === 'wasatch')
+                    const boundaryX = selectedMetric === 'skiIQ' && boundaryIdx > 0 ? (xy[boundaryIdx - 1].x + xy[boundaryIdx].x) / 2 : null
+                    chart = (
+                      <svg viewBox={`0 0 ${width} ${height}`} className="line-chart-svg" role="img" aria-label={`${metricLabel} over time`}>
+                        {[0, 0.25, 0.5, 0.75, 1].map((pct, i) => (
+                          <g key={i}>
+                            <line x1={padding.left} y1={padding.top + chartHeight * pct} x2={width - padding.right} y2={padding.top + chartHeight * pct} stroke="#e0e0e0" strokeWidth="1" />
+                            <text x={padding.left - 5} y={padding.top + chartHeight * pct + 4} textAnchor="end" fontSize="9" fill="#999">
+                              {unit === 'g' ? (maxVal - range * pct).toFixed(1) : Math.round(maxVal - range * pct)}
+                            </text>
+                          </g>
+                        ))}
+                        {boundaryX !== null && (
+                          <g>
+                            <line x1={boundaryX} y1={padding.top} x2={boundaryX} y2={height - padding.bottom} stroke="#667eea" strokeWidth="1" strokeDasharray="3 3" />
+                            <text x={boundaryX + 3} y={padding.top + 8} fontSize="8" fill="#667eea">Ski:IQ 26</text>
+                            <title>Carv changed Ski:IQ scoring here (Ski:IQ 26 Stelvio). Off-piste scores rose about 4.5 points for the same skiing.</title>
+                          </g>
+                        )}
+                        <defs>
+                          <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" stopColor={colour} stopOpacity="0.3" />
+                            <stop offset="100%" stopColor={colour} stopOpacity="0.05" />
+                          </linearGradient>
+                        </defs>
+                        <path d={areaD} fill="url(#chartGradient)" />
+                        <path d={pathD} fill="none" stroke={colour} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                        {xy.map((p, i) => (
+                          <g key={i}>
+                            <circle cx={p.x} cy={p.y} r="5" fill="white" stroke={colour} strokeWidth="2" className="chart-point" />
+                            <title>{`${new Date(p.log.datetime).toLocaleDateString()}: ${formatVal(p.val)}`}</title>
+                            {(i === 0 || i === xy.length - 1 || (xy.length > 4 && i === Math.floor(xy.length / 2))) && (
+                              <text x={p.x} y={height - 5} textAnchor="middle" fontSize="8" fill="#666">
+                                {new Date(p.log.datetime).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                              </text>
+                            )}
+                          </g>
+                        ))}
+                      </svg>
+                    )
+                    const decimals = unit === 'g' ? 1 : 0
+                    summary = (
+                      <>
+                        <span className="summary-label">{metricLabel} trend:</span>
+                        <span className={`summary-value ${neutral ? '' : trend >= 0 ? 'positive' : 'negative'}`}>
+                          {trend >= 0 ? '+' : ''}{trend.toFixed(decimals)}{unit === '' ? ' pts' : unit === 'g' ? ' g' : unit}
+                        </span>
+                        <span className="summary-range">({formatVal(values[0])} → {formatVal(values[values.length - 1])}, {points.length} sessions)</span>
+                        {mixedVersions && (
+                          <span className="summary-note">Includes Ski:IQ 26 rescoring: off-piste scores rose about 4.5 points for the same skiing.</span>
+                        )}
+                      </>
+                    )
+                  }
+
+                  // Left/right: Edging Similarity over the filtered sessions, plus L/R averages
+                  // from turn-by-turn charts when a Metric Details screenshot was analysed
+                  const similarityDef = CARV_METRIC_DEFS.find(d => d.key === 'edging_similarity')
+                  const similarity = chartLogs.map(log => ({ log, val: getLogMetricValue(log, similarityDef) })).filter(p => p.val !== null)
+                  const latestTurnData = [...chartLogs].reverse().find(log => log.analysis?.run_details?.turn_by_turn?.length)
+                  const sideAverages = (latestTurnData?.analysis.run_details.turn_by_turn || []).map(series => {
+                    const side = (s) => series.turns?.filter(t => t.side === s && typeof t.value === 'number') || []
+                    const avg = (list) => list.length ? list.reduce((a, t) => a + t.value, 0) / list.length : null
+                    const def = CARV_METRIC_DEFS.find(d => d.key === series.metric)
+                    return { label: def?.label || series.metric, unit: def?.unit || '', left: avg(side('L')), right: avg(side('R')) }
+                  }).filter(s => s.left !== null && s.right !== null)
+
+                  return (
+                    <div className="progress-chart-container">
+                      <div className="chart-header">
+                        <h3>Progression Over Time</h3>
+                        <div className="metric-selector">
+                          <select value={selectedMetric} onChange={(e) => setSelectedMetric(e.target.value)} className="metric-select" aria-label="Metric">
+                            <option value="skiIQ">Ski:IQ</option>
+                            {CARV_METRIC_DEFS.map(def => <option key={def.key} value={def.key}>{def.label}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                      <div className="chart-filters">
+                        <select value={chartTechnique} onChange={(e) => setChartTechnique(e.target.value)} aria-label="Technique">
+                          <option value="all">All techniques</option>
+                          {techniques.map(t => <option key={t} value={t}>{capitalise(t)}</option>)}
+                        </select>
+                        <select value={chartSnow} onChange={(e) => setChartSnow(e.target.value)} aria-label="Snow">
+                          <option value="all">All snow</option>
+                          {snows.map(t => <option key={t} value={t}>{capitalise(t)}</option>)}
                         </select>
                       </div>
+                      <div className="line-chart-container">{chart}</div>
+                      {summary && <div className="chart-summary">{summary}</div>}
+                      {techniques.includes('unknown') && (
+                        <p className="chart-hint">Older sessions without a technique show as Unknown. Open one and use Edit values to tag it.</p>
+                      )}
+                      {(similarity.length > 0 || sideAverages.length > 0) && (
+                        <div className="lr-panel">
+                          <div className="lr-title">Left / right</div>
+                          {similarity.length > 0 && (
+                            <div className="lr-row">
+                              <span>Edging Similarity</span>
+                              <span className="lr-values">{similarity.slice(-5).map(p => formatMetricValue(p.val, '%')).join(' → ')}</span>
+                            </div>
+                          )}
+                          {sideAverages.map(s => (
+                            <div key={s.label} className="lr-row">
+                              <span>{s.label} (latest turn-by-turn)</span>
+                              <span className="lr-values">L {formatMetricValue(s.left, s.unit)} · R {formatMetricValue(s.right, s.unit)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <div className="line-chart-container">
-                      {(() => {
-                        const chartLogs = [...sortedLogs].reverse()
-                        const getMetricValue = (log) => {
-                          switch(selectedMetric) {
-                            case 'skiIQ': return log.metrics.skiIQ
-                            case 'balance': return log.metrics.balance?.category_average
-                            case 'edging': return log.metrics.edging?.category_average
-                            case 'rotary': return log.metrics.rotary?.category_average
-                            case 'gforce': return log.metrics.performance?.turn_g_force
-                            default: return log.metrics.skiIQ
-                          }
-                        }
-                        const values = chartLogs.map(l => getMetricValue(l)).filter(v => v != null)
-                        if (values.length < 2) return <div className="no-chart-data">Not enough data for chart</div>
-
-                        const minVal = Math.min(...values) - 5
-                        const maxVal = Math.max(...values) + 5
-                        const range = maxVal - minVal || 20
-                        const width = 340
-                        const height = 120
-                        const padding = { top: 10, right: 10, bottom: 25, left: 35 }
-                        const chartWidth = width - padding.left - padding.right
-                        const chartHeight = height - padding.top - padding.bottom
-
-                        const points = chartLogs.map((log, idx) => {
-                          const val = getMetricValue(log)
-                          if (val == null) return null
-                          const x = padding.left + (idx / (chartLogs.length - 1)) * chartWidth
-                          const y = padding.top + chartHeight - ((val - minVal) / range) * chartHeight
-                          return { x, y, val, date: log.datetime, log }
-                        }).filter(Boolean)
-
-                        const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
-                        const areaD = `${pathD} L ${points[points.length-1].x} ${height - padding.bottom} L ${points[0].x} ${height - padding.bottom} Z`
-
-                        // Calculate trend
-                        const firstVal = values[0]
-                        const lastVal = values[values.length - 1]
-                        const trend = lastVal - firstVal
-
-                        // Where Ski:IQ scoring switched to Ski:IQ 26 (Stelvio): scores either side aren't directly comparable
-                        const versions = chartLogs.map(l => getSkiIQVersion(l.analysis, l.datetime))
-                        const boundaryIdx = versions.findIndex((v, i) => i > 0 && v === 'stelvio' && versions[i - 1] === 'wasatch')
-                        const boundaryX = selectedMetric === 'skiIQ' && boundaryIdx > 0
-                          ? padding.left + ((boundaryIdx - 0.5) / (chartLogs.length - 1)) * chartWidth
-                          : null
-
-                        return (
-                          <svg viewBox={`0 0 ${width} ${height}`} className="line-chart-svg">
-                            {boundaryX !== null && (
-                              <g>
-                                <line x1={boundaryX} y1={padding.top} x2={boundaryX} y2={height - padding.bottom}
-                                  stroke="#667eea" strokeWidth="1" strokeDasharray="3 3" />
-                                <text x={boundaryX + 3} y={padding.top + 8} fontSize="8" fill="#667eea">Ski:IQ 26</text>
-                                <title>Carv changed Ski:IQ scoring here (Ski:IQ 26 Stelvio). Off-piste scores rose about 4.5 points for the same skiing.</title>
-                              </g>
-                            )}
-                            {/* Grid lines */}
-                            {[0, 0.25, 0.5, 0.75, 1].map((pct, i) => (
-                              <g key={i}>
-                                <line
-                                  x1={padding.left}
-                                  y1={padding.top + chartHeight * pct}
-                                  x2={width - padding.right}
-                                  y2={padding.top + chartHeight * pct}
-                                  stroke="#e0e0e0"
-                                  strokeWidth="1"
-                                />
-                                <text
-                                  x={padding.left - 5}
-                                  y={padding.top + chartHeight * pct + 4}
-                                  textAnchor="end"
-                                  fontSize="9"
-                                  fill="#999"
-                                >
-                                  {Math.round(maxVal - (range * pct))}
-                                </text>
-                              </g>
-                            ))}
-
-                            {/* Gradient fill under line */}
-                            <defs>
-                              <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                                <stop offset="0%" stopColor={trend >= 0 ? "#28a745" : "#dc3545"} stopOpacity="0.3"/>
-                                <stop offset="100%" stopColor={trend >= 0 ? "#28a745" : "#dc3545"} stopOpacity="0.05"/>
-                              </linearGradient>
-                            </defs>
-                            <path d={areaD} fill="url(#chartGradient)" />
-
-                            {/* Line */}
-                            <path
-                              d={pathD}
-                              fill="none"
-                              stroke={trend >= 0 ? "#28a745" : "#dc3545"}
-                              strokeWidth="2.5"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            />
-
-                            {/* Data points */}
-                            {points.map((p, i) => (
-                              <g key={i}>
-                                <circle
-                                  cx={p.x}
-                                  cy={p.y}
-                                  r="5"
-                                  fill="white"
-                                  stroke={trend >= 0 ? "#28a745" : "#dc3545"}
-                                  strokeWidth="2"
-                                  className="chart-point"
-                                />
-                                <title>{`${new Date(p.date).toLocaleDateString()}: ${Math.round(p.val)}`}</title>
-                                {/* Date labels for first, middle, last */}
-                                {(i === 0 || i === points.length - 1 || (points.length > 4 && i === Math.floor(points.length / 2))) && (
-                                  <text
-                                    x={p.x}
-                                    y={height - 5}
-                                    textAnchor="middle"
-                                    fontSize="8"
-                                    fill="#666"
-                                  >
-                                    {new Date(p.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-                                  </text>
-                                )}
-                              </g>
-                            ))}
-                          </svg>
-                        )
-                      })()}
-                    </div>
-                    <div className="chart-summary">
-                      {(() => {
-                        const getMetricValue = (log) => {
-                          switch(selectedMetric) {
-                            case 'skiIQ': return log.metrics.skiIQ
-                            case 'balance': return log.metrics.balance?.category_average
-                            case 'edging': return log.metrics.edging?.category_average
-                            case 'rotary': return log.metrics.rotary?.category_average
-                            case 'gforce': return log.metrics.performance?.turn_g_force
-                            default: return log.metrics.skiIQ
-                          }
-                        }
-                        const chartLogs = [...sortedLogs].reverse()
-                        const values = chartLogs.map(l => getMetricValue(l)).filter(v => v != null)
-                        if (values.length < 2) return null
-                        const firstVal = values[0]
-                        const lastVal = values[values.length - 1]
-                        const trend = lastVal - firstVal
-                        const metricLabels = { skiIQ: 'Ski:IQ', balance: 'Balance', edging: 'Edging', rotary: 'Rotary', gforce: 'G-Force' }
-                        return (
-                          <>
-                            <span className="summary-label">{metricLabels[selectedMetric]} Trend:</span>
-                            <span className={`summary-value ${trend >= 0 ? 'positive' : 'negative'}`}>
-                              {trend >= 0 ? '+' : ''}{trend.toFixed(1)} pts
-                            </span>
-                            <span className="summary-range">({Math.round(firstVal)} → {Math.round(lastVal)})</span>
-                            {selectedMetric === 'skiIQ' && new Set(chartLogs.map(l => getSkiIQVersion(l.analysis, l.datetime)).filter(Boolean)).size > 1 && (
-                              <span className="summary-note">Includes Ski:IQ 26 rescoring: off-piste scores rose about 4.5 points for the same skiing.</span>
-                            )}
-                          </>
-                        )
-                      })()}
-                    </div>
-                  </div>
-                )}
+                  )
+                })()}
 
                 {/* Logs List - All Sessions */}
                 <div className="logs-list">

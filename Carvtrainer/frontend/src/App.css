@@ -5875,3 +5875,56 @@ body {
     justify-content: flex-end;
   }
 }
+
+/* Like-for-like chart filters and the left/right panel */
+.chart-filters {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0 0 0.6rem;
+}
+
+.chart-filters select {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: white;
+}
+
+.chart-hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.lr-panel {
+  margin-top: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: white;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+}
+
+.lr-title {
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+  color: var(--color-text);
+}
+
+.lr-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.2rem 0;
+  color: var(--color-text-light);
+}
+
+.lr-values {
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
