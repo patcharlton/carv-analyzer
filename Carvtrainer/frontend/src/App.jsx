@@ -12,6 +12,78 @@ const AUTH_KEY = 'carv_auth'
 // Simple password protection
 const SITE_PASSWORD = 'Lotus5126'
 
+// Local wall-clock time as "YYYY-MM-DDTHH:MM" (the datetime-local input format).
+// toISOString() would convert to UTC and shift the session by the timezone offset.
+const toLocalInputValue = (date = new Date()) => {
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+// Normalise a datetime string to "YYYY-MM-DDTHH:MM" local time without timezone shifting.
+// Naive strings (from CARV screenshots, EXIF, filenames) are kept as written.
+const normaliseLocalDateTime = (value) => {
+  if (!value) return null
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value) && !/(Z|[+-]\d{2}:?\d{2})$/.test(value)) {
+    return value.slice(0, 16)
+  }
+  const parsed = new Date(value)
+  return isNaN(parsed) ? null : toLocalInputValue(parsed)
+}
+
+// Do a database session and a local log describe the same saved session?
+// Older saves sent UTC ("...Z") times that the backend stored without a timezone,
+// so allow a whole-hour offset when the Ski:IQ also matches.
+const isSameSessionMoment = (dbSession, log) => {
+  const diff = Math.abs(new Date(dbSession.session_date).getTime() - new Date(log.datetime).getTime())
+  if (isNaN(diff)) return false
+  if (diff < 60000) return true
+  const hourMs = 3600000
+  const offByWholeHours = diff <= 14 * hourMs && (diff % hourMs < 60000 || hourMs - (diff % hourMs) < 60000)
+  const sameSkiIQ = dbSession.ski_iq != null && log.metrics?.skiIQ != null &&
+    Math.round(dbSession.ski_iq) === Math.round(log.metrics.skiIQ)
+  return offByWholeHours && sameSkiIQ
+}
+
+// Convert a database session into the progress-log shape used by the UI
+const dbSessionToLog = (session) => {
+  const metrics = session.metrics || {}
+  const overall = metrics.overall_metrics || {}
+  return {
+    id: session.id,
+    dbSessionId: session.id,
+    datetime: session.session_date,
+    datetimeDisplay: metrics.session_overview?.session_date_display || null,
+    datetimeSource: 'database',
+    notes: session.notes || '',
+    savedAt: session.created_at || session.session_date,
+    analysis: session.metrics || null,
+    trainingPlan: session.training_plan || null,
+    metrics: {
+      skiIQ: session.ski_iq ?? metrics.session_overview?.ski_iq_range?.average ?? null,
+      balance: overall.balance || null,
+      edging: overall.edging || null,
+      rotary: overall.rotary || null,
+      performance: overall.performance || null
+    }
+  }
+}
+
+// Link local logs to their database copies and add database sessions missing locally
+const mergeDbSessionsIntoLogs = (localLogs, sessions) => {
+  const claimed = new Set(localLogs.map(log => log.dbSessionId).filter(Boolean))
+  const merged = localLogs.map(log => {
+    if (log.dbSessionId) return log
+    const match = sessions.find(s => !claimed.has(s.id) && (s.id === log.id || isSameSessionMoment(s, log)))
+    if (!match) return log
+    claimed.add(match.id)
+    return { ...log, dbSessionId: match.id }
+  })
+  sessions.forEach(s => {
+    if (!claimed.has(s.id)) merged.push(dbSessionToLog(s))
+  })
+  return merged
+}
+
 function App() {
   // Auth state
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -56,6 +128,13 @@ function App() {
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const chatMessagesEndRef = useRef(null)
+
+  // Lets long-running loops (job polling) stop once the component is gone
+  const isMountedRef = useRef(true)
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => { isMountedRef.current = false }
+  }, [])
 
   // Check auth on mount
   useEffect(() => {
@@ -165,14 +244,20 @@ function App() {
     }
   }, [progressLogs])
 
-  // Load sessions from database on mount
+  // Load sessions from database on mount and merge them into the progress log,
+  // so a new device or cleared browser still shows every saved session
+  const [dbLoadFailed, setDbLoadFailed] = useState(false)
   useEffect(() => {
     const loadDbSessions = async () => {
       try {
         const response = await axios.get(`${API_BASE_URL}/sessions`)
-        setDbSessions(response.data)
+        const sessions = Array.isArray(response.data) ? response.data : []
+        setDbSessions(sessions)
+        setDbLoadFailed(false)
+        setProgressLogs(prev => mergeDbSessionsIntoLogs(prev, sessions))
       } catch (err) {
         console.log('Could not load sessions from database (may not be configured yet)')
+        setDbLoadFailed(true)
       }
     }
     loadDbSessions()
@@ -193,14 +278,18 @@ function App() {
     }
   }
 
-  // Delete session from database
+  // Delete session from database (throws on failure so callers can keep the local copy)
   const deleteSessionFromDb = async (sessionId) => {
     try {
       await axios.delete(`${API_BASE_URL}/sessions/${sessionId}`)
-      setDbSessions(prev => prev.filter(s => s.id !== sessionId))
     } catch (err) {
-      console.error('Failed to delete from database:', err)
+      // Already gone from the database counts as deleted
+      if (err.response?.status !== 404) {
+        console.error('Failed to delete from database:', err)
+        throw err
+      }
     }
+    setDbSessions(prev => prev.filter(s => s.id !== sessionId))
   }
 
   // Migration state
@@ -209,8 +298,9 @@ function App() {
 
   // Migrate localStorage logs to database
   const migrateLogsToDatabase = async () => {
-    if (progressLogs.length === 0) {
-      setMigrationResult({ success: false, message: 'No local logs to migrate' })
+    const unsyncedLogs = progressLogs.filter(log => !log.dbSessionId)
+    if (unsyncedLogs.length === 0) {
+      setMigrationResult({ success: true, message: 'All sessions are already in the cloud' })
       return
     }
 
@@ -220,15 +310,30 @@ function App() {
     let skipped = 0
     let failed = 0
 
-    for (const log of progressLogs) {
-      // Check if already in database (by matching datetime)
-      const alreadyExists = dbSessions.some(s => {
-        const dbDate = new Date(s.session_date).getTime()
-        const logDate = new Date(log.datetime).getTime()
-        return Math.abs(dbDate - logDate) < 60000 // Within 1 minute
-      })
+    // Re-read the database first: if it can't be reached we can't tell what is
+    // already there, and uploading anyway would create duplicates
+    let currentDbSessions
+    try {
+      const response = await axios.get(`${API_BASE_URL}/sessions`)
+      currentDbSessions = Array.isArray(response.data) ? response.data : []
+      setDbSessions(currentDbSessions)
+      setDbLoadFailed(false)
+    } catch (err) {
+      setMigrating(false)
+      setDbLoadFailed(true)
+      setMigrationResult({ success: false, message: 'Cannot reach the cloud database right now, so nothing was uploaded. Please try again shortly.' })
+      return
+    }
 
-      if (alreadyExists) {
+    const linkedIds = {} // local log id -> database session id
+    const claimed = new Set(progressLogs.map(log => log.dbSessionId).filter(Boolean))
+
+    for (const log of unsyncedLogs) {
+      // Already in the database? Link it instead of uploading again
+      const existing = currentDbSessions.find(s => !claimed.has(s.id) && (s.id === log.id || isSameSessionMoment(s, log)))
+      if (existing) {
+        claimed.add(existing.id)
+        linkedIds[log.id] = existing.id
         skipped++
         continue
       }
@@ -253,12 +358,20 @@ function App() {
 
         const response = await axios.post(`${API_BASE_URL}/sessions`, sessionData)
         setDbSessions(prev => [response.data, ...prev])
+        claimed.add(response.data.id)
+        linkedIds[log.id] = response.data.id
         migrated++
       } catch (err) {
         console.error('Failed to migrate log:', log.id, err)
         failed++
       }
     }
+
+    // Remember which database session each local log belongs to, so later
+    // syncs skip it and deleting it removes the database copy too
+    setProgressLogs(prev => prev.map(log =>
+      linkedIds[log.id] ? { ...log, dbSessionId: linkedIds[log.id] } : log
+    ))
 
     setMigrating(false)
     setMigrationResult({
@@ -332,23 +445,21 @@ function App() {
         headers: { 'Content-Type': 'multipart/form-data' }
       })
 
-      // Find the first datetime from metadata
+      // Find the first datetime from metadata (EXIF/filename times are local wall-clock time)
       if (response.data.metadata) {
         for (const meta of response.data.metadata) {
-          if (meta.datetime) {
-            // Format datetime for input field
-            const dt = new Date(meta.datetime)
-            const formatted = dt.toISOString().slice(0, 16) // Format: YYYY-MM-DDTHH:MM
+          const formatted = normaliseLocalDateTime(meta.datetime)
+          if (formatted) {
             setSessionDateTime(formatted)
             return
           }
         }
       }
-      // If no datetime found, use current time
-      setSessionDateTime(new Date().toISOString().slice(0, 16))
+      // If no datetime found, use current local time
+      setSessionDateTime(toLocalInputValue())
     } catch (e) {
       console.error('Failed to extract metadata:', e)
-      setSessionDateTime(new Date().toISOString().slice(0, 16))
+      setSessionDateTime(toLocalInputValue())
     }
   }
 
@@ -462,23 +573,39 @@ function App() {
       // Poll for results
       const pollInterval = 2000 // 2 seconds
       const maxPolls = 90 // 3 minutes max
+      const maxConsecutiveFailures = 3 // ride out a brief server restart or network blip
       let polls = 0
+      let consecutiveFailures = 0
 
       while (polls < maxPolls) {
         await new Promise(resolve => setTimeout(resolve, pollInterval))
+        if (!isMountedRef.current) return
         polls++
 
-        const statusResponse = await axios.get(`${API_BASE_URL}/job-status/${jobId}`)
+        let statusResponse
+        try {
+          statusResponse = await axios.get(`${API_BASE_URL}/job-status/${jobId}`)
+          consecutiveFailures = 0
+        } catch (pollErr) {
+          // The server no longer knows this job (e.g. it restarted): retrying won't help
+          if (pollErr.response?.status === 404) {
+            setError('The server lost track of this analysis (it may have restarted). Please analyze again.')
+            return
+          }
+          consecutiveFailures++
+          if (consecutiveFailures >= maxConsecutiveFailures) throw pollErr
+          continue
+        }
+        if (!isMountedRef.current) return
         const { status, result, error: jobError } = statusResponse.data
 
         if (status === 'completed') {
           setAnalysis(result)
 
           // Update sessionDateTime from CARV screenshot if available (master timestamp)
-          if (result?.session_overview?.session_datetime) {
-            const carvDateTime = result.session_overview.session_datetime
-            // Format for datetime-local input (YYYY-MM-DDTHH:MM)
-            setSessionDateTime(carvDateTime.slice(0, 16))
+          const carvDateTime = normaliseLocalDateTime(result?.session_overview?.session_datetime)
+          if (carvDateTime) {
+            setSessionDateTime(carvDateTime)
           }
           return
         }
@@ -621,8 +748,10 @@ function App() {
       lines.push('TOP 3 STRENGTHS')
       lines.push(subDivider)
       analysis.top_3_strengths.forEach((strength, idx) => {
-        lines.push(`${idx + 1}. ${strength.metric || 'Strength'}`)
-        if (strength.observation) lines.push(`   ${strength.observation}`)
+        const score = strength.score != null ? ` (${strength.score})` : ''
+        lines.push(`${idx + 1}. ${strength.area || strength.metric || 'Strength'}${score}`)
+        const why = strength.why_it_matters || strength.observation
+        if (why) lines.push(`   ${why}`)
         if (strength.impact) lines.push(`   Impact: ${strength.impact}`)
       })
       lines.push('')
@@ -633,7 +762,12 @@ function App() {
       lines.push('TOP 3 PRIORITIES FOR IMPROVEMENT')
       lines.push(subDivider)
       analysis.top_3_priorities.forEach((priority, idx) => {
-        lines.push(`${idx + 1}. ${priority.metric || 'Priority'}`)
+        lines.push(`${idx + 1}. ${priority.area || priority.metric || 'Priority'}`)
+        if (priority.current_score != null || priority.target_score != null) {
+          lines.push(`   Score: ${priority.current_score ?? '?'} → target ${priority.target_score ?? '?'}`)
+        }
+        if (priority.why_priority) lines.push(`   Why: ${priority.why_priority}`)
+        if (priority.quick_win) lines.push(`   Quick Win: ${priority.quick_win}`)
         if (priority.current_issue) lines.push(`   Current Issue: ${priority.current_issue}`)
         if (priority.root_cause) lines.push(`   Root Cause: ${priority.root_cause}`)
         if (priority.specific_drill) lines.push(`   Drill: ${priority.specific_drill}`)
@@ -647,7 +781,8 @@ function App() {
       lines.push('RUN-BY-RUN NOTES')
       lines.push(subDivider)
       analysis.run_by_run_notes.forEach((note, idx) => {
-        lines.push(`Run ${idx + 1}:`)
+        lines.push(`Screenshot ${note.screenshot || idx + 1}:`)
+        if (note.key_observation) lines.push(`  ${note.key_observation}`)
         if (note.ski_iq) lines.push(`  Ski:IQ: ${note.ski_iq}`)
         if (note.terrain) lines.push(`  Terrain: ${note.terrain}`)
         if (note.highlight) lines.push(`  Highlight: ${note.highlight}`)
@@ -678,10 +813,8 @@ function App() {
     const link = document.createElement('a')
     link.href = url
 
-    // Generate filename with date
-    const dateStr = analysis.session_overview?.session_datetime
-      ? new Date(analysis.session_overview.session_datetime).toISOString().split('T')[0]
-      : new Date().toISOString().split('T')[0]
+    // Generate filename with the session's local date
+    const dateStr = (normaliseLocalDateTime(analysis.session_overview?.session_datetime) || toLocalInputValue()).slice(0, 10)
     link.download = `carv-analysis-${dateStr}.txt`
 
     document.body.appendChild(link)
@@ -1688,9 +1821,11 @@ function App() {
       // Use session_datetime from CARV screenshot as master timestamp (priority 1)
       // Fall back to sessionDateTime (from EXIF/filename) (priority 2)
       // Finally fall back to current time (priority 3)
-      const masterDateTime = analysis?.session_overview?.session_datetime ||
-        sessionDateTime ||
-        new Date().toISOString()
+      // All three are local wall-clock times with no timezone, so the database
+      // stores the time shown on the CARV screen rather than a UTC-shifted one
+      const masterDateTime = normaliseLocalDateTime(analysis?.session_overview?.session_datetime) ||
+        normaliseLocalDateTime(sessionDateTime) ||
+        toLocalInputValue()
 
       // Save to database first (source of truth)
       let dbSession = null
@@ -1744,21 +1879,24 @@ function App() {
   const deleteProgressLog = async (logId) => {
     const logToDelete = progressLogs.find(log => log.id === logId)
 
+    // Delete the database copy first; if that fails keep the local entry,
+    // otherwise the session would silently come back on the next load
+    const dbId = logToDelete?.dbSessionId
+    if (dbId) {
+      try {
+        await deleteSessionFromDb(dbId)
+      } catch (err) {
+        setError('Could not delete this session from the cloud database, so it has been kept. Please try again.')
+        setDeleteConfirmId(null)
+        return
+      }
+    }
+
     // Remove from localStorage state
     setProgressLogs(prev => prev.filter(log => log.id !== logId))
 
     if (selectedLogForComparison?.id === logId) {
       setSelectedLogForComparison(null)
-    }
-
-    // Remove from database if it has a DB session ID
-    const dbId = logToDelete?.dbSessionId || logId
-    if (dbId) {
-      try {
-        await deleteSessionFromDb(dbId)
-      } catch (err) {
-        console.warn('Failed to delete from database:', err)
-      }
     }
 
     setDeleteConfirmId(null)
@@ -1774,7 +1912,7 @@ function App() {
     }
     setAnalysis(log.analysis)
     setTrainingPlan(log.trainingPlan)
-    setSessionDateTime(log.datetime)
+    setSessionDateTime(normaliseLocalDateTime(log.datetime) || '')
     setShowProgressPanel(false)
   }
 
@@ -1860,6 +1998,9 @@ function App() {
   const sortedLogs = [...progressLogs].sort((a, b) =>
     new Date(b.datetime) - new Date(a.datetime)
   )
+
+  // Sessions saved only in this browser (not yet in the cloud database)
+  const unsyncedLogCount = progressLogs.filter(log => !log.dbSessionId).length
 
   // Login screen
   if (!isAuthenticated) {
@@ -2323,7 +2464,7 @@ function App() {
             ) : (
               <div className="progress-panel-content">
                 {/* Migration Banner - Show if local logs exist but not all are in DB */}
-                {progressLogs.length > 0 && progressLogs.length > dbSessions.length && (
+                {unsyncedLogCount > 0 && (
                   <div className="migration-banner">
                     <div className="migration-info">
                       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2331,7 +2472,10 @@ function App() {
                         <polyline points="17 8 12 3 7 8"/>
                         <line x1="12" y1="3" x2="12" y2="15"/>
                       </svg>
-                      <span>{progressLogs.length} local session{progressLogs.length !== 1 ? 's' : ''} found</span>
+                      <span>
+                        {unsyncedLogCount} session{unsyncedLogCount !== 1 ? 's' : ''} only on this device
+                        {dbLoadFailed && ' (cloud database unreachable)'}
+                      </span>
                     </div>
                     <button
                       className="migrate-btn"
@@ -2356,7 +2500,7 @@ function App() {
                   <div className="progression-analysis-section">
                     <button
                       className="progression-btn"
-                      onClick={analyzeProgression}
+                      onClick={() => analyzeProgression()}
                       disabled={loadingProgression}
                     >
                       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
