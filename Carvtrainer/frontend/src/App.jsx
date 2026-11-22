@@ -7,10 +7,25 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || '/api'
 
 // Storage key for progress logs
 const STORAGE_KEY = 'carv_progress_logs'
-const AUTH_KEY = 'carv_auth'
 
-// Simple password protection
-const SITE_PASSWORD = 'Lotus5126'
+// Login: the backend checks the password and returns a token, kept on this device for 30 days
+const TOKEN_KEY = 'carv_login_token'
+const readToken = () => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } }
+const writeToken = (token) => {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    // storage unavailable (private mode): the token lasts until reload
+  }
+}
+
+// Send the login token with every API request
+axios.interceptors.request.use((config) => {
+  const token = readToken()
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
 
 // Local wall-clock time as "YYYY-MM-DDTHH:MM" (the datetime-local input format).
 // toISOString() would convert to UTC and shift the session by the timezone offset.
@@ -291,24 +306,44 @@ function App() {
     return () => { isMountedRef.current = false }
   }, [])
 
-  // Check auth on mount
+  // Signed in already on this device? (The server still checks the token on every request.)
   useEffect(() => {
-    const savedAuth = sessionStorage.getItem(AUTH_KEY)
-    if (savedAuth === 'true') {
-      setIsAuthenticated(true)
-    }
+    try { sessionStorage.removeItem('carv_auth') } catch { /* old browser-only login flag */ }
+    if (readToken()) setIsAuthenticated(true)
   }, [])
 
-  // Handle login
-  const handleLogin = (e) => {
+  // Any 401 means the token is missing, expired or the password changed: back to the login screen
+  useEffect(() => {
+    const interceptor = axios.interceptors.response.use(
+      (response) => response,
+      (err) => {
+        if (err.response?.status === 401 && !String(err.config?.url || '').endsWith('/login')) {
+          writeToken(null)
+          setIsAuthenticated(false)
+          setAuthError(err.response.data?.message || 'Please sign in again')
+        }
+        return Promise.reject(err)
+      }
+    )
+    return () => axios.interceptors.response.eject(interceptor)
+  }, [])
+
+  // Handle login: the backend checks the password
+  const [loggingIn, setLoggingIn] = useState(false)
+  const handleLogin = async (e) => {
     e.preventDefault()
-    if (passwordInput === SITE_PASSWORD) {
+    if (!passwordInput || loggingIn) return
+    setLoggingIn(true)
+    try {
+      const response = await axios.post(`${API_BASE_URL}/login`, { password: passwordInput })
+      writeToken(response.data.token)
       setIsAuthenticated(true)
-      sessionStorage.setItem(AUTH_KEY, 'true')
       setAuthError('')
-    } else {
-      setAuthError('Incorrect password')
+    } catch (err) {
+      setAuthError(err.response?.data?.message || 'Cannot reach the server. Please try again.')
+    } finally {
       setPasswordInput('')
+      setLoggingIn(false)
     }
   }
 
@@ -415,8 +450,8 @@ function App() {
         setDbLoadFailed(true)
       }
     }
-    loadDbSessions()
-  }, [])
+    if (isAuthenticated) loadDbSessions()
+  }, [isAuthenticated])
 
   // Save session to database
   const saveSessionToDb = async (sessionData) => {
@@ -1922,8 +1957,8 @@ function App() {
               />
             </div>
             {authError && <div className="login-error">{authError}</div>}
-            <button type="submit" className="login-btn">
-              Enter
+            <button type="submit" className="login-btn" disabled={loggingIn}>
+              {loggingIn ? 'Signing in...' : 'Enter'}
             </button>
           </form>
         </div>

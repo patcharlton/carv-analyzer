@@ -6,6 +6,9 @@ Flask server that uses Claude AI to analyze CARV screenshots and generate traini
 import os
 import base64
 import copy
+import hmac
+import logging
+import time
 import json
 import re
 import uuid
@@ -13,6 +16,7 @@ import threading
 from io import BytesIO
 from datetime import datetime
 from flask import Flask, request, jsonify
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from anthropic import Anthropic
@@ -50,6 +54,77 @@ if frontend_url:
     allowed_origins.append(frontend_url)
 
 CORS(app, origins=allowed_origins)
+
+logging.basicConfig(level=logging.INFO)
+
+# Uploads: up to 10 screenshots of 5MB each, plus form overhead
+MAX_FILES_PER_UPLOAD = 10
+app.config["MAX_CONTENT_LENGTH"] = 55 * 1024 * 1024
+
+# ============================================================================
+# LOGIN - one shared password, checked here rather than in the browser
+# ============================================================================
+# APP_PASSWORD: the site password. SECRET_KEY: signs login tokens (any long random string).
+# Without both, every route except /health refuses requests rather than running unprotected.
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+SECRET_KEY = os.getenv("SECRET_KEY")
+LOGIN_TOKEN_MAX_AGE = 30 * 24 * 3600  # stay signed in on a device for 30 days
+PUBLIC_PATHS = {"/health", "/login"}
+
+_token_signer = URLSafeTimedSerializer(SECRET_KEY, salt="carv-login") if SECRET_KEY else None
+_failed_logins = {}  # ip -> list of failure timestamps (per process; enough to slow guessing)
+MAX_FAILED_LOGINS = 10
+FAILED_LOGIN_WINDOW = 15 * 60
+
+
+def _client_ip():
+    # Render's proxy appends the real client address last; earlier entries can be faked by the client
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[-1].strip() or request.remote_addr or "unknown"
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    if not APP_PASSWORD or not _token_signer:
+        return jsonify({"error": "Login not configured", "message": "The server has no APP_PASSWORD or SECRET_KEY set."}), 503
+
+    ip = _client_ip()
+    now = time.time()
+    recent = [t for t in _failed_logins.get(ip, []) if now - t < FAILED_LOGIN_WINDOW]
+    if len(recent) >= MAX_FAILED_LOGINS:
+        return jsonify({"error": "Too many attempts", "message": "Too many wrong passwords. Please wait 15 minutes."}), 429
+
+    password = str((request.get_json(silent=True) or {}).get("password", ""))
+    if not hmac.compare_digest(password.encode(), APP_PASSWORD.encode()):
+        recent.append(now)
+        _failed_logins[ip] = recent
+        return jsonify({"error": "Incorrect password", "message": "Incorrect password"}), 401
+
+    _failed_logins.pop(ip, None)
+    return jsonify({"token": _token_signer.dumps({"v": 1}), "expires_in": LOGIN_TOKEN_MAX_AGE})
+
+
+@app.before_request
+def require_login():
+    """Every route except /health and /login needs a valid login token."""
+    if request.method == "OPTIONS" or request.path in PUBLIC_PATHS:
+        return None
+    if not APP_PASSWORD or not _token_signer:
+        return jsonify({"error": "Login not configured", "message": "The server has no APP_PASSWORD or SECRET_KEY set."}), 503
+    header = request.headers.get("Authorization", "")
+    token = header[7:] if header.startswith("Bearer ") else ""
+    try:
+        _token_signer.loads(token, max_age=LOGIN_TOKEN_MAX_AGE)
+    except SignatureExpired:
+        return jsonify({"error": "Login expired", "message": "Please sign in again."}), 401
+    except BadSignature:
+        return jsonify({"error": "Not signed in", "message": "Please sign in."}), 401
+    return None
+
+
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify({"error": "Upload too large", "message": "Too much data in one upload. Send fewer or smaller screenshots."}), 413
 
 # Database configuration
 database_url = os.getenv("DATABASE_URL")
@@ -615,6 +690,11 @@ def extract_metadata():
             }), 400
 
         files = request.files.getlist('images')
+        if len(files) > MAX_FILES_PER_UPLOAD:
+            return jsonify({
+                "error": "Too many files",
+                "message": f"Please upload at most {MAX_FILES_PER_UPLOAD} screenshots at a time"
+            }), 400
         metadata_list = []
 
         for file in files:
@@ -672,9 +752,10 @@ def extract_metadata():
         })
 
     except Exception as e:
+        app.logger.exception("Metadata extraction failed")
         return jsonify({
             "error": "Metadata extraction failed",
-            "message": str(e)
+            "message": "Could not read the screenshots' dates."
         }), 500
 
 
@@ -706,6 +787,11 @@ def analyze_screenshots():
             }), 400
 
         files = request.files.getlist('images')
+        if len(files) > MAX_FILES_PER_UPLOAD:
+            return jsonify({
+                "error": "Too many files",
+                "message": f"Please upload at most {MAX_FILES_PER_UPLOAD} screenshots at a time"
+            }), 400
 
         if len(files) == 0 or (len(files) == 1 and files[0].filename == ''):
             return jsonify({
@@ -784,8 +870,7 @@ def analyze_screenshots():
         except json.JSONDecodeError as e:
             return jsonify({
                 "error": "Failed to parse AI response",
-                "message": "The AI response wasn't in the expected format. Please try again.",
-                "raw_response": response_text[:500]
+                "message": "The AI response wasn't in the expected format. Please try again."
             }), 500
 
         # Units, legacy fields, category averages and Ski:IQ version
@@ -804,7 +889,7 @@ def analyze_screenshots():
         if "api_key" in error_message.lower() or "authentication" in error_message.lower():
             return jsonify({
                 "error": "API Key Error",
-                "message": "Your Anthropic API key is missing or invalid. Please check your .env file."
+                "message": "The server's Anthropic API key is missing or invalid."
             }), 401
 
         if "rate_limit" in error_message.lower():
@@ -813,9 +898,10 @@ def analyze_screenshots():
                 "message": "Too many requests. Please wait a moment and try again."
             }), 429
 
+        app.logger.error("Analysis failed: %s", error_message)
         return jsonify({
             "error": "Analysis failed",
-            "message": f"Something went wrong during analysis. Error: {error_message}"
+            "message": "Something went wrong during analysis. Please try again."
         }), 500
 
 
@@ -887,7 +973,8 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
         elif "rate_limit" in error_message.lower():
             jobs[job_id]["error"] = "Rate limited. Please wait and try again."
         else:
-            jobs[job_id]["error"] = f"Analysis failed: {error_message}"
+            app.logger.error("Analysis job %s failed: %s", job_id, error_message)
+            jobs[job_id]["error"] = "Analysis failed. Please try again."
 
 
 @app.route('/analyze-async', methods=['POST'])
@@ -905,6 +992,11 @@ def analyze_screenshots_async():
             }), 400
 
         files = request.files.getlist('images')
+        if len(files) > MAX_FILES_PER_UPLOAD:
+            return jsonify({
+                "error": "Too many files",
+                "message": f"Please upload at most {MAX_FILES_PER_UPLOAD} screenshots at a time"
+            }), 400
 
         if len(files) == 0 or (len(files) == 1 and files[0].filename == ''):
             return jsonify({
@@ -973,9 +1065,10 @@ def analyze_screenshots_async():
         })
 
     except Exception as e:
+        app.logger.exception("Failed to start analysis")
         return jsonify({
             "error": "Failed to start analysis",
-            "message": str(e)
+            "message": "Could not start the analysis. Please try again."
         }), 500
 
 
@@ -1341,9 +1434,10 @@ You're having a friendly, expert conversation with Patrick. Be personable but pr
                 "message": "Too many requests. Please wait a moment and try again."
             }), 429
 
+        app.logger.error("Chat failed: %s", error_message)
         return jsonify({
             "error": "Chat failed",
-            "message": f"Something went wrong. Error: {error_message}"
+            "message": "Something went wrong. Please try again."
         }), 500
 
 
@@ -1401,7 +1495,8 @@ def create_session():
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to save session: {str(e)}"}), 500
+        app.logger.exception("Failed to save session")
+        return jsonify({"error": "Failed to save session", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions', methods=['GET'])
@@ -1411,7 +1506,8 @@ def list_sessions():
         sessions = Session.query.order_by(Session.session_date.desc()).all()
         return jsonify([s.to_dict() for s in sessions])
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch sessions: {str(e)}"}), 500
+        app.logger.exception("Failed to fetch sessions")
+        return jsonify({"error": "Failed to fetch sessions", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['GET'])
@@ -1423,7 +1519,8 @@ def get_session(session_id):
             return jsonify({"error": "Session not found"}), 404
         return jsonify(session.to_dict())
     except Exception as e:
-        return jsonify({"error": f"Failed to fetch session: {str(e)}"}), 500
+        app.logger.exception("Failed to fetch session")
+        return jsonify({"error": "Failed to fetch session", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['PUT'])
@@ -1460,7 +1557,8 @@ def update_session(session_id):
         return jsonify(session.to_dict())
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to update session: {str(e)}"}), 500
+        app.logger.exception("Failed to update session")
+        return jsonify({"error": "Failed to update session", "message": "Database error. Please try again."}), 500
 
 
 @app.route('/sessions/<session_id>', methods=['DELETE'])
@@ -1476,7 +1574,8 @@ def delete_session(session_id):
         return jsonify({"message": "Session deleted"})
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": f"Failed to delete session: {str(e)}"}), 500
+        app.logger.exception("Failed to delete session")
+        return jsonify({"error": "Failed to delete session", "message": "Database error. Please try again."}), 500
 
 
 # ============================================================================
@@ -1671,7 +1770,7 @@ Return ONLY valid JSON, no markdown code blocks."""
         except json.JSONDecodeError:
             return jsonify({
                 "error": "Failed to parse progression analysis",
-                "raw_response": response_text[:500]
+                "message": "The AI reply wasn't in the expected format. Please try again."
             }), 500
 
         progression_data["sessions_analyzed"] = len(sessions)
@@ -1695,7 +1794,8 @@ Return ONLY valid JSON, no markdown code blocks."""
         return jsonify(progression_data)
 
     except Exception as e:
-        return jsonify({"error": f"Progression analysis failed: {str(e)}"}), 500
+        app.logger.exception("Progression analysis failed")
+        return jsonify({"error": "Progression analysis failed", "message": "Something went wrong analysing your progression. Please try again."}), 500
 
 
 @app.route('/compare', methods=['POST'])
@@ -1762,7 +1862,7 @@ Return ONLY valid JSON."""
         except json.JSONDecodeError:
             return jsonify({
                 "error": "Failed to parse comparison",
-                "raw_response": response_text[:500]
+                "message": "The AI reply wasn't in the expected format. Please try again."
             }), 500
 
         comparison_data["session_1"] = earlier.to_dict()
@@ -1771,7 +1871,8 @@ Return ONLY valid JSON."""
         return jsonify(comparison_data)
 
     except Exception as e:
-        return jsonify({"error": f"Comparison failed: {str(e)}"}), 500
+        app.logger.exception("Comparison failed")
+        return jsonify({"error": "Comparison failed", "message": "Something went wrong comparing these sessions. Please try again."}), 500
 
 
 if __name__ == '__main__':
@@ -1787,4 +1888,5 @@ if __name__ == '__main__':
         print("API Key: Configured")
         print("="*60 + "\n")
 
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    # Local development only; production runs under gunicorn. FLASK_DEBUG=1 turns on the debugger.
+    app.run(host='127.0.0.1', port=5001, debug=os.getenv('FLASK_DEBUG') == '1')
