@@ -96,3 +96,23 @@ def test_saved_structured_plan_feeds_history(app_module):
     assert [d["drill_id"] for d in entry["previous_drills"]] == ["patience_turns", "crossover_focus", "variable_radius_carving"]
     old = app_module.Session(session_date=app_module.datetime(2026, 2, 2), metrics={}, training_plan="# Old markdown plan")
     assert "previous_drills" not in history_entry(old)
+
+
+def test_drill_log_reaches_progression(client, auth_headers, app_module, monkeypatch):
+    plan = assemble_plan(plan_input(), ski_iq=151, days_available=5, runs_per_day=10, generated_at="now")
+    plan["drill_log"] = {"patience_turns": {"done": True, "runs_done": 3, "felt": 3, "note": "Finally finishing turns"}}
+    for date, iq, stored_plan in (("2026-02-02T10:23", 151, json.dumps(plan)), ("2026-02-05T10:43", 154, None)):
+        client.post("/sessions", headers=auth_headers, json={
+            "session_date": date, "training_plan": stored_plan,
+            "metrics": {"session_overview": {"ski_iq_range": {"average": iq}}, "carv_metrics": {"turn_closure": {"value": 50}}}})
+    sent = {}
+
+    def fake_create(**kwargs):
+        sent.update(kwargs)
+        return fake_reply('{"summary": "ok"}')
+
+    monkeypatch.setattr(app_module.client.messages, "create", fake_create)
+    response = client.post("/progression", headers=auth_headers, json={})
+    assert response.status_code == 200
+    prompt = sent["messages"][0]["content"]
+    assert '"felt": "clicked"' in prompt and "Finally finishing turns" in prompt

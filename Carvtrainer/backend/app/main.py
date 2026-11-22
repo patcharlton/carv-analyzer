@@ -26,11 +26,11 @@ from PIL.ExifTags import TAGS
 
 try:  # gunicorn app.main:app (from the backend folder)
     from app.carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
-    from app.training_plan import (PLAN_TOOL, PlanError, assemble_plan, history_entry,
+    from app.training_plan import (PLAN_TOOL, PlanError, assemble_plan, drills_practised, history_entry, parse_stored_plan,
                                    system_blocks as plan_system_blocks, user_message as plan_user_message)
 except ImportError:  # python app/main.py
     from carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
-    from training_plan import (PLAN_TOOL, PlanError, assemble_plan, history_entry,
+    from training_plan import (PLAN_TOOL, PlanError, assemble_plan, drills_practised, history_entry, parse_stored_plan,
                                system_blocks as plan_system_blocks, user_message as plan_user_message)
 
 
@@ -1491,6 +1491,11 @@ metric that is not in the data.
   when a difference may come from terrain rather than technique.
 - Turn Closure is judged against its performance zone, not "higher is better".
 
+### 1c. DRILLS PRACTISED
+Sessions may list the drills from that session's training plan and how the skier logged them
+(done, runs, how it felt, notes). Relate them to how the target metrics moved in the following
+sessions: which drills seem to be working, and which aren't.
+
 ### 2. ANALYZE METRIC CORRELATIONS (MOST IMPORTANT)
 Look for patterns where metrics change TOGETHER:
 - When metric A improved, did metric B also improve/decline?
@@ -1624,6 +1629,7 @@ def analyze_progression():
                     "rotary": overall.get('rotary', {}),
                     "performance": overall.get('performance', {}),
                 },
+                "drills_practised": drills_practised(parse_stored_plan(s.training_plan)),
                 "top_priorities": [p.get('area') + f" ({p.get('current_score')})" for p in (metrics.get('top_3_priorities') or []) if p.get('area')],
                 "biggest_limiter": (metrics.get('holistic_analysis') or {}).get('biggest_limiter', ''),
                 "detailed_observations": (metrics.get('detailed_observations') or '')[:500]

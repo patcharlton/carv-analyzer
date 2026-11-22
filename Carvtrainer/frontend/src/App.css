@@ -5624,3 +5624,254 @@ body {
   width: 100%;
   box-sizing: border-box;
 }
+
+/* Drill tracking (in drill cards and the on-hill view) */
+.drill-tracker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.9rem;
+  padding-top: 0.9rem;
+  border-top: 1px dashed var(--color-border);
+}
+
+.tracker-done {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--color-text);
+}
+
+.tracker-done input {
+  width: 1.2rem;
+  height: 1.2rem;
+}
+
+.tracker-runs {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--color-text-light);
+}
+
+.tracker-runs button,
+.tracker-felt button {
+  font: inherit;
+  min-width: 2.25rem;
+  min-height: 2.25rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: white;
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.tracker-count {
+  font-weight: 700;
+  color: var(--color-text);
+  min-width: 2.5rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.tracker-felt {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.tracker-felt button {
+  padding: 0 0.6rem;
+  font-size: 0.8rem;
+}
+
+.tracker-felt button.active {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: white;
+}
+
+.tracker-note {
+  flex: 1 1 160px;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+
+.today-open-btn {
+  margin-left: auto;
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0.5rem 0.9rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--primary-gradient);
+  color: white;
+  cursor: pointer;
+}
+
+/* On-hill view: full screen, one column, large tap targets */
+.today-view {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  overflow-y: auto;
+  background: #f4f5fb;
+  color: var(--color-text);
+  padding: 0 16px 32px;
+}
+
+.today-header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0 -16px;
+  padding: 14px 16px;
+  background: var(--primary-gradient);
+  color: white;
+}
+
+.today-title {
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+.today-sub {
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+
+.today-close {
+  font-size: 1.8rem;
+  line-height: 1;
+  width: 2.75rem;
+  height: 2.75rem;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+  cursor: pointer;
+}
+
+.today-warning {
+  margin: 12px 0 0;
+  padding: 0.6rem 0.8rem;
+  border-radius: var(--radius-sm);
+  background: var(--color-warning-bg);
+  color: #8a6100;
+  font-size: 0.85rem;
+}
+
+.today-drills {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 14px auto 0;
+  max-width: 640px;
+}
+
+.today-drill {
+  background: white;
+  border-radius: var(--radius-md);
+  padding: 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.today-drill-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.today-drill-name {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.today-drill-meta {
+  font-size: 0.85rem;
+  color: var(--color-text-light);
+}
+
+.today-cue {
+  margin: 0.75rem 0 0;
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: var(--color-primary);
+}
+
+.today-steps {
+  margin: 0.6rem 0 0 1.2rem;
+  padding: 0;
+  font-size: 0.95rem;
+  line-height: 1.45;
+}
+
+.today-video {
+  display: inline-block;
+  margin-top: 0.6rem;
+  font-weight: 600;
+  color: #c4302b;
+}
+
+.today-schedule {
+  max-width: 640px;
+  margin: 18px auto 0;
+  background: white;
+  border-radius: var(--radius-md);
+  padding: 14px;
+}
+
+.today-section-title {
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.today-run {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px solid #f0f0f0;
+  font-size: 0.95rem;
+}
+
+.today-run:last-child {
+  border-bottom: none;
+}
+
+.today-drill .drill-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  background: var(--primary-gradient);
+  color: white;
+  font-weight: 700;
+}
+
+/* Phone widths: history card tags drop below the date instead of squeezing it */
+@media (max-width: 480px) {
+  .log-card-header {
+    flex-wrap: wrap;
+    row-gap: 0.4rem;
+  }
+
+  .log-header-right {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}

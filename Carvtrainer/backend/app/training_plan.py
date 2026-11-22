@@ -162,7 +162,7 @@ def system_blocks(coach_context):
     ]
 
 
-def _parse_stored_plan(text):
+def parse_stored_plan(text):
     """A saved training_plan column value as a structured plan dict, or None for old markdown plans."""
     if not text or not isinstance(text, str) or not text.lstrip().startswith("{"):
         return None
@@ -171,6 +171,25 @@ def _parse_stored_plan(text):
     except ValueError:
         return None
     return plan if isinstance(plan, dict) and plan.get("format") == PLAN_FORMAT else None
+
+
+def drills_practised(plan):
+    """The plan's drills with how the skier logged them (for progression analysis)."""
+    if not plan:
+        return None
+    log = plan.get("drill_log") or {}
+    out = []
+    for drill in plan.get("drills", []):
+        entry = log.get(drill.get("drill_id")) or {}
+        out.append({
+            "drill": (drill.get("reference") or {}).get("name") or drill.get("drill_id"),
+            "target_metric": drill.get("target_metric"),
+            "done": entry.get("done"),
+            "runs_done": entry.get("runs_done"),
+            "felt": {1: "hard", 2: "getting it", 3: "clicked"}.get(entry.get("felt")),
+            "note": entry.get("note") or None,
+        })
+    return out
 
 
 def history_entry(session):
@@ -185,7 +204,7 @@ def history_entry(session):
     }
     if overview.get("ski_iq_version"):
         entry["ski_iq_version"] = overview["ski_iq_version"]
-    plan = _parse_stored_plan(session.training_plan)
+    plan = parse_stored_plan(session.training_plan)
     if plan:
         entry["previous_drills"] = [
             {k: d.get(k) for k in ("drill_id", "role", "target_metric")} for d in plan.get("drills", [])

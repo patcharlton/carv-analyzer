@@ -86,8 +86,14 @@ const dbSessionToLog = (session) => {
 // Link local logs to their database copies and add database sessions missing locally
 const mergeDbSessionsIntoLogs = (localLogs, sessions) => {
   const claimed = new Set(localLogs.map(log => log.dbSessionId).filter(Boolean))
+  const byId = new Map(sessions.map(s => [s.id, s]))
   const merged = localLogs.map(log => {
-    if (log.dbSessionId) return log
+    if (log.dbSessionId) {
+      // The database copy wins (it may have been updated on another device),
+      // unless this device has drill progress waiting to be sent
+      const dbCopy = byId.get(log.dbSessionId)
+      return dbCopy && !log.planSyncPending ? { ...dbSessionToLog(dbCopy), id: log.id } : log
+    }
     const match = sessions.find(s => !claimed.has(s.id) && (s.id === log.id || isSameSessionMoment(s, log)))
     if (!match) return log
     claimed.add(match.id)
@@ -267,6 +273,7 @@ function App() {
   const [planDays, setPlanDays] = useState(5) // ski days this week, for the plan's schedule
   const [editingValues, setEditingValues] = useState(false) // correcting misread values
   const [loadedLogId, setLoadedLogId] = useState(null) // the saved session currently open, if any
+  const [showToday, setShowToday] = useState(false) // on-hill phone view of the current plan
   const [planRuns, setPlanRuns] = useState(10) // runs per ski day
   const [error, setError] = useState(null)
   const fileInputRef = useRef(null)
@@ -363,6 +370,7 @@ function App() {
       analysis: log.analysis || null,
       trainingPlan: log.trainingPlan || null,
       dbSessionId: log.dbSessionId || null,
+      planSyncPending: !!log.planSyncPending,
       metrics: {
         skiIQ: log.metrics?.skiIQ || null,
         balance: log.metrics?.balance || null,
@@ -1465,6 +1473,133 @@ function App() {
     return <>{parts}</>
   }
 
+  // ---- Drill tracking: progress is stored in the plan (plan.drill_log) and saved with the session.
+  // The saved session the current analysis belongs to, if any
+  const getCurrentLog = () => (loadedLogId && progressLogs.find(l => l.id === loadedLogId)) ||
+    progressLogs.find(l => l.analysis === analysis) || null
+
+  // One save at a time per session; a change made while a save is in flight is sent right after it
+  const syncingPlans = useRef(new Set())
+  const latestPlans = useRef(new Map()) // logId -> newest plan to send
+  const [planSyncFailed, setPlanSyncFailed] = useState(false)
+  const syncPlanToDb = async (logId, dbSessionId, plan) => {
+    latestPlans.current.set(logId, plan)
+    if (syncingPlans.current.has(logId)) return
+    syncingPlans.current.add(logId)
+    try {
+      let sent = null
+      while (latestPlans.current.get(logId) !== sent) {
+        sent = latestPlans.current.get(logId)
+        await axios.put(`${API_BASE_URL}/sessions/${dbSessionId}`, { training_plan: serializePlan(sent) })
+      }
+      latestPlans.current.delete(logId)
+      setPlanSyncFailed(false)
+      setProgressLogs(prev => prev.map(l => l.id === logId && l.trainingPlan === sent ? { ...l, planSyncPending: false } : l))
+    } catch (err) {
+      console.warn('Drill progress kept on this device; will retry', err)
+      setPlanSyncFailed(true)
+    } finally {
+      syncingPlans.current.delete(logId)
+    }
+  }
+
+  const updateDrillLog = (drillId, patch) => {
+    const plan = parseStoredPlan(trainingPlan)
+    if (!isStructuredPlan(plan)) return
+    const entry = { ...(plan.drill_log?.[drillId] || {}), ...patch, updated_at: new Date().toISOString() }
+    const newPlan = { ...plan, drill_log: { ...(plan.drill_log || {}), [drillId]: entry } }
+    setTrainingPlan(newPlan)
+    const log = getCurrentLog()
+    if (!log) return // not saved yet: progress is saved with the session
+    setProgressLogs(prev => prev.map(l => l.id === log.id ? { ...l, trainingPlan: newPlan, planSyncPending: !!l.dbSessionId } : l))
+    if (log.dbSessionId) syncPlanToDb(log.id, log.dbSessionId, newPlan)
+  }
+
+  // Retry drill progress that couldn't be sent (e.g. no signal on the hill) once the server is reachable
+  useEffect(() => {
+    if (!isAuthenticated || dbLoadFailed) return
+    progressLogs
+      .filter(l => l.planSyncPending && l.dbSessionId && isStructuredPlan(parseStoredPlan(l.trainingPlan)))
+      .forEach(l => syncPlanToDb(l.id, l.dbSessionId, parseStoredPlan(l.trainingPlan)))
+  }, [dbSessions, isAuthenticated, dbLoadFailed])
+
+  // Done / runs / how it felt / note for one drill
+  const renderDrillTracker = (drill, plan) => {
+    const entry = plan.drill_log?.[drill.drill_id] || {}
+    const feelings = [[1, 'Hard'], [2, 'Getting it'], [3, 'Clicked']]
+    return (
+      <div className="drill-tracker">
+        <label className="tracker-done">
+          <input type="checkbox" checked={!!entry.done} onChange={(e) => updateDrillLog(drill.drill_id, { done: e.target.checked })} />
+          Done today
+        </label>
+        <div className="tracker-runs">
+          <span>Runs</span>
+          <button type="button" aria-label="One run fewer" onClick={() => updateDrillLog(drill.drill_id, { runs_done: Math.max(0, (entry.runs_done || 0) - 1) })}>-</button>
+          <span className="tracker-count">{entry.runs_done || 0}/{drill.runs || '?'}</span>
+          <button type="button" aria-label="One more run" onClick={() => updateDrillLog(drill.drill_id, { runs_done: (entry.runs_done || 0) + 1 })}>+</button>
+        </div>
+        <div className="tracker-felt" role="group" aria-label="How it felt">
+          {feelings.map(([value, label]) => (
+            <button key={value} type="button" className={entry.felt === value ? 'active' : ''}
+              onClick={() => updateDrillLog(drill.drill_id, { felt: entry.felt === value ? null : value })}>{label}</button>
+          ))}
+        </div>
+        <input className="tracker-note" type="text" placeholder="Note (optional)" defaultValue={entry.note || ''}
+          key={`${drill.drill_id}-${entry.updated_at || ''}-note`}
+          onBlur={(e) => { if ((e.target.value || '') !== (entry.note || '')) updateDrillLog(drill.drill_id, { note: e.target.value }) }} />
+      </div>
+    )
+  }
+
+  // On-hill view: one column, big targets, the day's run order and the three drills
+  const renderTodayView = () => {
+    const plan = parseStoredPlan(trainingPlan)
+    if (!isStructuredPlan(plan)) return null
+    const schedule = buildDailySchedule(plan)
+    const log = getCurrentLog()
+    return (
+      <div className="today-view" role="dialog" aria-label="Today's drills">
+        <div className="today-header">
+          <div>
+            <div className="today-title">Today on the hill</div>
+            <div className="today-sub">{plan.immediate_focus?.cue ? `"${plan.immediate_focus.cue}"` : plan.biggest_limiter}</div>
+          </div>
+          <button type="button" className="today-close" onClick={() => setShowToday(false)} aria-label="Close">×</button>
+        </div>
+        {!log && <div className="today-warning">Save this session to keep your drill progress.</div>}
+        {log?.planSyncPending && (planSyncFailed || dbLoadFailed) && <div className="today-warning">Progress saved on this phone. It will sync when you're back online.</div>}
+        <div className="today-drills">
+          {plan.drills.map((drill, idx) => (
+            <div key={drill.drill_id} className="today-drill">
+              <div className="today-drill-head">
+                <span className="drill-number">{idx + 1}</span>
+                <div>
+                  <div className="today-drill-name">{drillName(drill)}</div>
+                  <div className="today-drill-meta">{drill.focused_turns} focused turns · {drill.runs} runs{drill.reference?.terrain ? ` · ${drill.reference.terrain}` : ''}</div>
+                </div>
+              </div>
+              {drill.mental_cue && <div className="today-cue">"{drill.mental_cue}"</div>}
+              {drill.steps?.length > 0 && (
+                <ol className="today-steps">{drill.steps.map((step, sIdx) => <li key={sIdx}>{step}</li>)}</ol>
+              )}
+              {drill.reference?.video_url && (
+                <a className="today-video" href={drill.reference.video_url} target="_blank" rel="noopener noreferrer">Watch examples</a>
+              )}
+              {renderDrillTracker(drill, plan)}
+            </div>
+          ))}
+        </div>
+        <div className="today-schedule">
+          <div className="today-section-title">Run order</div>
+          {schedule.map((phase, idx) => (
+            <div key={idx} className="today-run"><span>Run {phase.runs}</span><strong>{phase.phase}</strong></div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   // Render a training plan: structured plans as sections, older markdown plans as formatted text
   const renderTrainingPlan = (storedPlan) => {
     const plan = parseStoredPlan(storedPlan)
@@ -1497,6 +1632,7 @@ function App() {
             </svg>
           </div>
           <h1>Training Plan{plan.ski_iq ? ` for Ski:IQ ${Math.round(plan.ski_iq)}` : ''}</h1>
+          <button type="button" className="today-open-btn" onClick={() => setShowToday(true)}>On the hill view</button>
         </div>
 
         {/* The Big Picture */}
@@ -1605,6 +1741,7 @@ function App() {
                   </div>
                 ))}
                 {drill.make_it_harder && <p className="drill-why"><strong>Make it harder:</strong> {drill.make_it_harder}</p>}
+                {renderDrillTracker(drill, plan)}
                 {drill.reference?.video_url && (
                   <div className="drill-video-section">
                     <a href={drill.reference.video_url} target="_blank" rel="noopener noreferrer" className="drill-video-btn">
@@ -1961,7 +2098,7 @@ function App() {
     // Warn if current analysis hasn't been saved
     if (analysis && !progressLogs.some(l => l.analysis === analysis)) {
       if (!window.confirm('You have an unsaved analysis. Loading a previous session will overwrite it. Continue?')) {
-        return
+        return false
       }
     }
     setAnalysis(log.analysis)
@@ -1971,6 +2108,7 @@ function App() {
     setTrainingPlan(parseStoredPlan(log.trainingPlan))
     setSessionDateTime(normaliseLocalDateTime(log.datetime) || '')
     setShowProgressPanel(false)
+    return true
   }
 
   // Get metric value from a log
@@ -2318,6 +2456,9 @@ function App() {
               </div>
             </section>
 
+            {/* Value editor sits right under the banner so it's in view when opened */}
+            {editingValues && renderValueEditor()}
+
             {/* Holistic Analysis */}
             {analysis.holistic_analysis && (
               <section className="holistic-section">
@@ -2356,8 +2497,6 @@ function App() {
                 </div>
               </section>
             )}
-
-            {editingValues && renderValueEditor()}
 
             {/* Carv metrics as Carv shows them (current analyses) */}
             {(analysis.carv_metrics || analysis.run_details) ? (
@@ -2929,6 +3068,11 @@ function App() {
                                 </svg>
                                 View Analysis
                               </button>
+                              {isStructuredPlan(parseStoredPlan(log.trainingPlan)) && (
+                                <button className="load-log-btn" onClick={() => { if (loadProgressLog(log)) setShowToday(true) }}>
+                                  On the hill
+                                </button>
+                              )}
                               {sortedLogs.length > 1 && (
                                 <button
                                   className={`compare-log-btn ${selectedLogForComparison?.id === log.id ? 'active' : ''}`}
@@ -3147,6 +3291,9 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* On-hill view of the current plan */}
+      {showToday && renderTodayView()}
 
       {/* AI Progression Analysis Modal */}
       {showProgressionModal && (
