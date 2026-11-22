@@ -5,6 +5,7 @@ Flask server that uses Claude AI to analyze CARV screenshots and generate traini
 
 import os
 import base64
+import copy
 import json
 import re
 import uuid
@@ -18,6 +19,11 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from PIL import Image
 from PIL.ExifTags import TAGS
+
+try:  # gunicorn app.main:app (from the backend folder)
+    from app.carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
+except ImportError:  # python app/main.py
+    from carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
 
 # In-memory job store for background processing
 # Format: {job_id: {"status": "pending"|"processing"|"completed"|"failed", "result": {...}, "error": "..."}}
@@ -103,6 +109,7 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 CARV_METRICS_CONTEXT = """
 You are an elite ski coach and CARV technology expert with deep knowledge of carving biomechanics.
 Your analysis is based on proven carving principles, not generic skiing advice.
+""" + CURRENT_CARV_GUIDE + """
 
 ## CORE CARVING PHILOSOPHY
 
@@ -121,9 +128,9 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 3. **Rotary Control** - Hip and shoulder alignment relative to skis
 4. **Pressure Management** - How and when you load/unload the ski
 
-## CARV METRICS - DEEP INTERPRETATION
+## CARV METRICS - DEEP INTERPRETATION (older detailed notes; the section above takes precedence)
 
-### Ski:IQ Score (Overall Performance)
+### Ski:IQ Score (Overall Performance) - rough guide only, not Carv's official bands
 - 100 = Average recreational skier
 - 100-115 = Intermediate - developing skills
 - 115-125 = Advanced intermediate - linking carved turns
@@ -131,10 +138,12 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 - 140-155 = Expert - high edge angles, dynamic skiing
 - 155+ = Elite - race-level technique
 
-### BALANCE CATEGORY (Critical for Carving)
+### FORE/AFT BALANCE (coaching concepts - Carv no longer shows these two as scores)
+Evidence today: Carv's Balance rating (Ok / Good / Great), Weight Release, and skis running
+away at the start or end of the turn. Never report a Start of Turn or Centered Balance number.
 
-**1. Start of Turn (Forward Pressure)** - Score 0-100
-- WHAT IT MEASURES: Weight shift to ski tips at turn initiation
+**1. Forward pressure at the start of the turn**
+- WHAT IT IS: Weight shift to ski tips at turn initiation
 - WHY IT MATTERS: Forward pressure engages the front of the ski first, creating early edge grip
 - LOW SCORE INDICATES:
   * Sitting back in the boots (common fear response)
@@ -143,8 +152,8 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 - BIOMECHANICS: Shin pressure against boot tongue, hips forward over toes
 - TARGET FEELING: "Driving the front of the ski into the turn"
 
-**2. Centered Balance** - Score 0-100
-- WHAT IT MEASURES: Maintaining balance over the center of the ski during the turn
+**2. Staying centred through the turn**
+- WHAT IT IS: Maintaining balance over the center of the ski during the turn
 - WHY IT MATTERS: Centered stance allows the whole ski edge to engage
 - LOW SCORE INDICATES:
   * Getting pulled into the backseat mid-turn
@@ -153,9 +162,10 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 - BIOMECHANICS: Ankle flexion, knee drive, hips stacked over feet
 - TARGET FEELING: "Balanced over the arch of the foot"
 
-**3. Transition Weight Release (TWR)** - Score 0-100%
-- WHAT IT MEASURES: Vertical G-force variation throughout the turn cycle. Compares peak forces (end of turn) to minimum forces (transition phase).
-- CALCULATION: TWR = (Peak G-force - Trough G-force) / Peak G-force × 100
+**3. Weight Release** (Carv metric, %; older sessions call it Transition Weight Release / TWR)
+- CARV'S DEFINITION: The percentage of weight you release during the transition between turns.
+- HOW TO THINK ABOUT IT: Compares peak forces (end of turn) to minimum forces (transition phase),
+  roughly (Peak G-force - Trough G-force) / Peak G-force × 100. This formula is a coaching model, not Carv's published method.
 - WHY IT MATTERS: High TWR indicates dynamic skiing with strong pressure buildup AND clean release - the hallmark of expert carving. Clean release allows quick edge change and early new edge engagement.
 - SCORE RANGES:
   * 90-100%: Elite - Full weightlessness achieved in transition. World Cup level dynamics.
@@ -212,7 +222,7 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
   * Stronger toeside vs heelside (or vice versa)
   * One hip less mobile than the other
 
-**4. Progressive Edge Build** - Score 0-100
+**4. Edge Build** (Carv metric, %; older sessions call it Progressive Edge Build)
 - WHAT IT MEASURES: Whether edge angle increases throughout the turn
 - WHY IT MATTERS: Shows controlled, confident carving vs "park and ride"
 - LOW SCORE INDICATES:
@@ -259,7 +269,7 @@ The ski's sidecut does the turning work when the ski is tipped on edge and press
 
 ## DIAGNOSTIC FRAMEWORK - SYMPTOM TO ROOT CAUSE
 
-### Low Start of Turn Score
+### Weak forward pressure at turn start (Balance rating below Great, skis running away early)
 ROOT CAUSES:
 1. Fear of speed/falling - creates defensive backseat posture
 2. Weak ankle flex - can't drive shins into boot tongue
@@ -282,7 +292,7 @@ ROOT CAUSES:
 3. Sequential movement pattern - one thing at a time instead of simultaneous
 CASCADING EFFECTS: Skidded entry, delayed grip, inconsistent turns
 
-### Low Transition Weight Release Score
+### Low Weight Release Score
 ROOT CAUSE HIERARCHY (diagnose in this order - upstream issues block downstream fixes):
 Level 1 - Fore/Aft Balance (if compromised, blocks everything below):
   * Inside ski tip lifting = aft stance
@@ -301,19 +311,36 @@ DIAGNOSTIC SIGNALS:
   * Low TWR + Low Outside Ski Pressure = Weight transfer issue (Level 2)
 CASCADING EFFECTS: Choppy transitions, loss of flow, fatigue, inability to build dynamic range
 
-### Low Centered Balance Score
+### Pulled back or off-centre mid-turn (Balance rating below Great)
 ROOT CAUSES:
 1. Getting pulled back by G-forces - not anticipating the load
 2. Upper body leaning uphill - defensive "survival" stance
 3. Weak core - can't maintain position under load
 CASCADING EFFECTS: Loss of ski control in bottom half of turn
 
-### Low Progressive Edge Build Score
+### Low Edge Build Score
 ROOT CAUSES:
 1. "Park and ride" habit - set edge angle and hold
 2. Fear of increasing commitment - playing it safe
 3. Lack of dynamic range - don't know how to increase through turn
 CASCADING EFFECTS: Predictable skiing, limited ability on varied terrain
+
+### Turn Closure outside its zone / Carv flags "Smoothly linking turns"
+ROOT CAUSES:
+1. Turns not finished: skis released before they come round across the slope (low closure),
+   often with a narrow Corridor and fast Tempo
+2. Over-finished turns: skidding or braking at the end of the turn (high closure), often a
+   speed-control habit
+3. Late or abrupt transitions: the next turn starts with a pivot rather than a roll onto the new edges
+EVIDENCE TO USE: Tempo (turns/min), Corridor (m), Radius (m), Turn Shape, Weight Release
+CASCADING EFFECTS: Choppy rhythm, inconsistent speed, turns that do not link into one flowing line
+
+### Low Edging Smoothness Score
+ROOT CAUSES:
+1. Edge set abruptly ("click" onto the edge) instead of rolled on progressively
+2. Edge dumped or released suddenly at the end of the turn
+3. Stiff ankles and knees, so edge angle changes in steps rather than continuously
+CASCADING EFFECTS: Skis chatter or lose grip, harder to link turns smoothly
 
 ## SKILL PROGRESSION LEVELS
 
@@ -372,16 +399,19 @@ You are analyzing {num_images} CARV app screenshots from a skier's session. Look
 
 Use this framework to identify ROOT CAUSES, not just symptoms:
 
-**Low Start of Turn** → Root causes: Fear (backseat), weak ankle flex, hip mobility, boot setup
-**Low Centered Balance** → Root causes: G-force pulling back, defensive uphill lean, weak core
+Judge every metric against its dashed performance zone on screen, not against generic numbers.
+
+**Balance rating below Great** → Root causes: Fear (backseat), weak ankle flex, G-force pulling back, defensive uphill lean
 **Low Weight Release** → Root causes: Fear of fall line, Z-turn habit, static body
 **Low Edge Angle** → Root causes: Fear of commitment, no hip angulation, upper body rotation
 **Low Early Edging** → Root causes: Pivot habit, slow weight transfer, sequential movements
+**Low Edging Smoothness** → Root causes: Edge set abruptly, sudden release, stiff ankles/knees
 **Low Edging Similarity** → Root causes: Dominant side, injury compensation, equipment
-**Low Progressive Edge Build** → Root causes: "Park and ride" habit, fear, limited dynamic range
+**Low Edge Build** → Root causes: "Park and ride" habit, fear, limited dynamic range
 **Low Parallel Skis** → Root causes: Stemming, A-frame, inside ski not tipping
 **Low Turn Shape** → Root causes: Pivot-based turning, speed checking, impatience
-**Low G-Force with good edges** → Skidding despite tipping - technique breakdown
+**Turn Closure outside its zone** → Root causes: Turns not finished, or over-finished/braking; check Tempo, Corridor, Radius
+**Low G-Force with good edges** → Skidding despite tipping - but on SHORT TURNS lower G-Force is expected
 
 Analyze these screenshots HOLISTICALLY - treat them as different views of the same ski session or related sessions. Look for:
 - Overall patterns across all screenshots
@@ -405,31 +435,32 @@ Return a JSON object with this EXACT structure:
       "average": <number or null>
     }},
     "terrain_types_seen": ["<list of terrain types visible across all screenshots>"],
-    "total_turns_analyzed": <sum of turns if visible, or null>
+    "total_turns_analyzed": <sum of turns if visible, or null>,
+    "location": "<resort/location as shown, e.g. 'Les Houches (Chamonix), FR', or null>",
+    "ski_iq_version": "<'stelvio' if the screenshots show the Carv app 10 layout (bottom tabs You / Activity / Community / Coaching with a round record button), 'wasatch' if they show the older layout (bottom tabs Home / Coaching / Ski / Community / More), otherwise null>"
   }},
-  "overall_metrics": {{
-    "balance": {{
-      "start_of_turn": <average score 0-100 or null>,
-      "centered_balance": <average score 0-100 or null>,
-      "transition_weight_release": <average score 0-100 or null>,
-      "category_average": <average of all balance metrics>
-    }},
-    "edging": {{
-      "edge_angle": <average score 0-100 or null>,
-      "early_edging": <average score 0-100 or null>,
-      "edging_similarity": <average score 0-100 or null>,
-      "progressive_edge_build": <average score 0-100 or null>,
-      "category_average": <average of all edging metrics>
-    }},
-    "rotary": {{
-      "parallel_skis": <average score 0-100 or null>,
-      "turn_shape": <average score 0-100 or null>,
-      "category_average": <average of all rotary metrics>
-    }},
-    "performance": {{
-      "turn_g_force": <average score 0-100 or null>,
-      "category_average": <same as turn_g_force>
+  "carv_metrics": {{
+    "<one entry per metric visible in the Ski:IQ Metrics list, using these keys only: parallel_skis, turn_shape, turn_closure, early_edging, edging_smoothness, edging_similarity, edge_build, edge_angle, weight_release, g_force, slope_pitch>": {{
+      "value": <the number exactly as shown, without the unit: % metrics as 0-100, edge_angle and slope_pitch in degrees, g_force in g>,
+      "zone": "<'below', 'in' or 'above' - where the value marker sits relative to the dashed performance zone band; null if you cannot tell>"
     }}
+  }},
+  "run_details": {{
+    "run_name": "<run or segment name if shown, e.g. 'Kandahar Supérieur La Cassure', else null>",
+    "technique": "<technique mode chip as shown, e.g. 'carving', 'short turns', 'parallel'; null if not shown>",
+    "basis": "<e.g. 'Top 8 turns' if shown, else null>",
+    "skill_highlights": [{{"number": <skill number shown, e.g. 1>, "name": "<e.g. 'Turning without skidding'>", "status": "<as shown, e.g. 'Nailed it' or 'One to work on'>"}}],
+    "pitch_deg": <number or null>,
+    "snow_surface": "<as shown, e.g. 'Smooth', or null>",
+    "carving_turns": {{"count": <e.g. 8 or null>, "of": <e.g. 8 or null>}},
+    "tempo_tpm": <turns per minute or null>,
+    "corridor_m": <metres or null>,
+    "radius_m": <metres or null>,
+    "balance_rating": "<'Ok', 'Good' or 'Great' - the highlighted level on the Balance bar, or null>",
+    "segment": {{"time": "<as shown, e.g. '1m 52s', or null>", "turns": <number or null>, "vert": "<as shown with unit, e.g. '710 ft', or null>", "distance": "<as shown with unit, e.g. '0.8 mi', or null>"}},
+    "badges": ["<badge names shown, e.g. 'Grim Ripper'>"],
+    "metric_definitions": {{"<metric key>": "<Carv's definition text, only if a Metric Details screen is included>"}},
+    "turn_by_turn": [{{"metric": "<metric key>", "turns": [{{"side": "<'L' or 'R' if marked>", "value": <number>, "counted_in_ski_iq": <true for Ski:IQ turns, false for other turns>}}]}}]
   }},
   "holistic_analysis": {{
     "skiing_style": "<describe their overall skiing style based on all data - are they aggressive, cautious, dynamic, static, etc.>",
@@ -469,8 +500,12 @@ CRITICAL INSTRUCTIONS:
 3. Average metrics where you see the same metric in multiple screenshots
 4. If a metric appears in only some screenshots, still include it
 5. Be specific and actionable in your analysis
-6. The "biggest_limiter" should be the #1 thing to work on
+6. The "biggest_limiter" should be the #1 thing to work on. If Carv's Skill Highlights mark a skill "One to work on", the limiter should match it or explain why it differs
 7. Consider how different screenshots might show different aspects of the same session
+8. Read values exactly as displayed. Never estimate a metric, field or zone that is not visible: use null or leave the key out
+9. Do NOT report Start of Turn or Centered Balance scores; Carv no longer shows them
+10. Coach the technique that was skied (see the technique notes in your instructions), and compare against the performance zones
+11. Screenshots of different runs (different location, date or time) should still be read individually: describe each in run_by_run_notes
 """
 
 TRAINING_PLAN_PROMPT = """
@@ -1319,6 +1354,9 @@ def analyze_screenshots():
                 "raw_response": response_text[:500]
             }), 500
 
+        # Units, legacy fields, category averages and Ski:IQ version
+        normalise_analysis(analysis_data)
+
         # Add metadata
         analysis_data["analyzed_at"] = datetime.now().isoformat()
         analysis_data["filenames"] = filenames
@@ -1364,7 +1402,7 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
         # Call Claude API with all images
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=4000,
+            max_tokens=8000,  # run details and per-metric zones make the JSON longer
             messages=[
                 {
                     "role": "user",
@@ -1373,6 +1411,11 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
             ],
             system=CARV_METRICS_CONTEXT
         )
+
+        if response.stop_reason == "max_tokens":
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = "The analysis was too long and got cut off. Try fewer screenshots at once."
+            return
 
         # Extract response text
         response_text = response.content[0].text
@@ -1386,6 +1429,9 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = "Failed to parse AI response. Please try again."
             return
+
+        # Units, legacy fields, category averages and Ski:IQ version
+        normalise_analysis(analysis_data)
 
         # Add metadata
         analysis_data["analyzed_at"] = datetime.now().isoformat()
@@ -1679,8 +1725,12 @@ def chat():
                 if so.get('session_date_display'):
                     session_context += f"**Session Date:** {so['session_date_display']}\n"
 
-            # Overall metrics (Balance, Edging, Rotary, Performance)
-            if 'overall_metrics' in analysis_data:
+            # Carv metrics with their real units, zones and run details (current analyses)
+            if analysis_data.get('carv_metrics') or analysis_data.get('run_details'):
+                session_context += "\n**Carv Metrics and Run Details:**\n" + describe_metrics(analysis_data) + "\n"
+
+            # Overall metrics (Balance, Edging, Rotary, Performance) - older saved analyses
+            elif 'overall_metrics' in analysis_data:
                 om = analysis_data['overall_metrics']
                 session_context += "\n**Metric Scores:**\n"
 
@@ -1763,11 +1813,15 @@ def chat():
             for i, session in enumerate(session_history):
                 session_context += f"**Session {i+1}** ({session.get('date', 'unknown date')}):\n"
                 if session.get('skiIQ'):
-                    session_context += f"  Ski:IQ: {session['skiIQ']}\n"
+                    version = session.get('skiIQVersion')
+                    version_note = {'stelvio': ' (Ski:IQ 26 scoring)', 'wasatch': ' (pre-26 scoring)'}.get(version, '')
+                    session_context += f"  Ski:IQ: {session['skiIQ']}{version_note}\n"
+                if session.get('technique') or session.get('snowSurface') or session.get('pitch') is not None:
+                    session_context += f"  Technique: {session.get('technique') or '?'}, snow: {session.get('snowSurface') or '?'}, pitch: {session.get('pitch') if session.get('pitch') is not None else '?'}°\n"
                 if session.get('balance') is not None:
                     session_context += f"  Balance: {session['balance']}/100\n"
                 if session.get('twr') is not None:
-                    session_context += f"  TWR: {session['twr']}/100\n"
+                    session_context += f"  Weight Release: {session['twr']}%\n"
                 if session.get('edging') is not None:
                     session_context += f"  Edging: {session['edging']}/100\n"
                 if session.get('edgeAngle') is not None:
@@ -1892,8 +1946,9 @@ def create_session():
 
         # Extract Ski:IQ from metrics if available
         ski_iq = None
-        metrics = data.get('metrics', {})
-        if metrics:
+        metrics = data.get('metrics') or {}
+        if isinstance(metrics, dict) and metrics:
+            normalise_analysis(metrics)
             session_overview = metrics.get('session_overview', {})
             ski_iq_range = session_overview.get('ski_iq_range', {})
             # Try 'average' first, then calculate from 'lowest'/'highest' (AI response keys)
@@ -1953,7 +2008,9 @@ def update_session(session_id):
         if not session:
             return jsonify({"error": "Session not found"}), 404
 
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "No data provided"}), 400
 
         if 'location' in data:
             session.location = data['location']
@@ -1961,6 +2018,17 @@ def update_session(session_id):
             session.notes = data['notes']
         if 'training_plan' in data:
             session.training_plan = data['training_plan']
+        if 'session_date' in data and data['session_date']:
+            try:
+                session.session_date = datetime.fromisoformat(str(data['session_date']).replace('Z', '+00:00'))
+            except ValueError:
+                return jsonify({"error": "Invalid session_date"}), 400
+        if isinstance(data.get('metrics'), dict):
+            metrics = normalise_analysis(data['metrics'])
+            session.metrics = metrics
+            ski_iq_range = (metrics.get('session_overview') or {}).get('ski_iq_range') or {}
+            if ski_iq_range.get('average') is not None:
+                session.ski_iq = ski_iq_range['average']
 
         db.session.commit()
         return jsonify(session.to_dict())
@@ -1995,13 +2063,21 @@ You have access to CARV metrics data from each session. Your PRIMARY goal is to 
 ## YOUR TASK
 
 ### 1. EXTRACT ALL METRICS
-For each session, extract EVERY metric value you can find:
-- Ski:IQ (overall score)
-- Balance metrics: outside ski %, fore/aft balance, stance width, weight distribution
-- Edging metrics: edge angle (max/avg), turn shape score, carving %
-- Rotary metrics: rotation separation, hip alignment, counter
-- Performance: G-force, speed, turn radius
-- Any other metrics present
+For each session, use the metrics that are present. Carv's current list is: Parallel Skis,
+Turn Shape, Turn Closure, Early Edging, Edging Smoothness, Edging Similarity, Edge Build,
+Edge Angle (degrees), Weight Release, G-Force (g), Slope Pitch (degrees), plus Ski:IQ and the
+run details (technique, snow surface, pitch, tempo, corridor, radius, balance rating, Carv's
+skill highlights). Older sessions may only have the legacy grouped fields. Never invent a
+metric that is not in the data.
+
+### 1b. COMPARE LIKE WITH LIKE
+- Each session has a ski_iq_version. Ski:IQ 26 (Stelvio) raised off-piste / ungroomed scores by
+  about 4.5 points on the same runs and now credits slope pitch. A change in Ski:IQ across the
+  Wasatch → Stelvio boundary is partly a scoring change: say so explicitly, and do not report it
+  as improvement on its own.
+- Compare sessions with the same technique and similar snow and pitch where you can, and say
+  when a difference may come from terrain rather than technique.
+- Turn Closure is judged against its performance zone, not "higher is better".
 
 ### 2. ANALYZE METRIC CORRELATIONS (MOST IMPORTANT)
 Look for patterns where metrics change TOGETHER:
@@ -2031,15 +2107,14 @@ Return a JSON object with this structure:
         {
             "date": "YYYY-MM-DD",
             "ski_iq": number,
+            "ski_iq_version": "stelvio|wasatch|null",
+            "technique": "string or null",
             "key_metrics": {
-                "edge_angle_max": number,
-                "outside_ski_pressure": number,
-                "balance_score": number,
-                "turn_shape": number,
-                "carving_percentage": number
+                "<carv metric key, e.g. edge_angle>": number
             }
         }
     ],
+    "scoring_change_note": "If sessions span the Wasatch → Stelvio change, explain how that affects the Ski:IQ trend; otherwise null",
     "all_metrics_tracked": ["list of all metric names found across sessions"],
     "metric_correlations": [
         {
@@ -2110,24 +2185,36 @@ def analyze_progression():
         # Build context for Claude - extract key metrics, keep payload lean for speed
         session_data = []
         for s in sessions:
-            metrics = s.metrics or {}
-            overall = metrics.get('overall_metrics', {})
-            overview = metrics.get('session_overview', {})
+            metrics = normalise_analysis(copy.deepcopy(s.metrics or {}))
+            overall = metrics.get('overall_metrics') or {}
+            overview = metrics.get('session_overview') or {}
+            details = metrics.get('run_details') or {}
+            if not overview.get('ski_iq_version') and s.session_date:
+                overview['ski_iq_version'] = default_ski_iq_version(s.session_date.isoformat())
             # Extract just the numerical data and key observations
             session_entry = {
                 "date": s.session_date.strftime("%Y-%m-%d") if s.session_date else "Unknown",
                 "session_id": s.id,
                 "location": s.location,
-                "ski_iq": overview.get('ski_iq_range', {}).get('average') or s.ski_iq,
+                "ski_iq": (overview.get('ski_iq_range') or {}).get('average') or s.ski_iq,
+                "ski_iq_version": overview.get('ski_iq_version'),
                 "terrain": overview.get('terrain_types_seen', []),
                 "turns_analyzed": overview.get('total_turns_analyzed'),
-                "balance": overall.get('balance', {}),
-                "edging": overall.get('edging', {}),
-                "rotary": overall.get('rotary', {}),
-                "performance": overall.get('performance', {}),
-                "top_priorities": [p.get('area') + f" ({p.get('current_score')})" for p in metrics.get('top_3_priorities', []) if p.get('area')],
-                "biggest_limiter": metrics.get('holistic_analysis', {}).get('biggest_limiter', ''),
-                "detailed_observations": metrics.get('detailed_observations', '')[:500]
+                "carv_metrics": metrics.get('carv_metrics'),
+                "run_details": {k: details.get(k) for k in (
+                    'technique', 'snow_surface', 'pitch_deg', 'tempo_tpm', 'corridor_m', 'radius_m',
+                    'balance_rating', 'carving_turns', 'skill_highlights'
+                ) if details.get(k) not in (None, '', [], {})} or None,
+                # Older sessions without carv_metrics still have the grouped fields
+                "legacy_metrics": None if metrics.get('carv_metrics') else {
+                    "balance": overall.get('balance', {}),
+                    "edging": overall.get('edging', {}),
+                    "rotary": overall.get('rotary', {}),
+                    "performance": overall.get('performance', {}),
+                },
+                "top_priorities": [p.get('area') + f" ({p.get('current_score')})" for p in (metrics.get('top_3_priorities') or []) if p.get('area')],
+                "biggest_limiter": (metrics.get('holistic_analysis') or {}).get('biggest_limiter', ''),
+                "detailed_observations": (metrics.get('detailed_observations') or '')[:500]
             }
             session_data.append(session_entry)
 

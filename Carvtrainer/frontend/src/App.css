@@ -5289,3 +5289,226 @@ body {
     transform: rotate(90deg);
   }
 }
+
+/* ============================================
+   Carv metrics as Carv shows them (Ski:IQ Metrics list)
+   ============================================ */
+.carv-metrics-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.75rem 1.5rem;
+}
+
+.carv-metric-row {
+  padding: 0.6rem 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.carv-metric-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.carv-metric-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--color-text-light);
+}
+
+.carv-metric-value {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.carv-metric-bottom {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+  min-height: 20px;
+}
+
+.carv-metric-bar {
+  flex: 1;
+  height: 6px;
+  background: #eef0f6;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.carv-metric-bar-fill {
+  height: 100%;
+  background: var(--primary-gradient);
+  border-radius: 3px;
+}
+
+.carv-metric-note {
+  flex: 1;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.zone-chip {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+
+.zone-chip.zone-in {
+  background: var(--color-success-bg);
+  color: #1e7b34;
+}
+
+.zone-chip.zone-below,
+.zone-chip.zone-above {
+  background: var(--color-warning-bg);
+  color: #8a6100;
+}
+
+/* Run details: technique, snow, rhythm and Carv's skill highlights */
+.run-details {
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  background: #f7f8fc;
+  border-radius: var(--radius-md);
+}
+
+.run-details-name {
+  font-weight: 700;
+  color: var(--color-text);
+  margin-bottom: 0.75rem;
+}
+
+.run-details-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 0.75rem;
+}
+
+.run-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.run-detail-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.run-detail-value {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.skill-highlights {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 1rem;
+}
+
+.skill-highlight {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+  color: var(--color-text);
+}
+
+.skill-status {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.6rem;
+  border-radius: 10px;
+}
+
+.skill-status.nailed {
+  background: #d9f7f3;
+  color: #0f6e63;
+}
+
+.skill-status.work-on {
+  background: #fde8e1;
+  color: #b4441d;
+}
+
+/* Ski:IQ scoring version selector in the session banner */
+.version-select-label {
+  display: block;
+  font-size: 0.85rem;
+  opacity: 0.85;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 0.35rem;
+}
+
+.version-select {
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--color-text);
+  background: white;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0.35rem 0.5rem;
+}
+
+/* Tags on progress log cards */
+.log-header-right {
+  gap: 0.4rem;
+}
+
+.log-tag {
+  font-size: 0.65rem;
+  font-weight: 600;
+  padding: 0.15rem 0.45rem;
+  border-radius: 8px;
+  background: #eef0f6;
+  color: var(--color-text-light);
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.log-tag.version-stelvio {
+  background: #e7e9fd;
+  color: #4c56c9;
+  text-transform: none;
+}
+
+.log-tag.version-wasatch {
+  text-transform: none;
+}
+
+.chart-summary {
+  flex-wrap: wrap;
+}
+
+.summary-note,
+.comparison-note {
+  flex-basis: 100%;
+  font-size: 0.75rem;
+  color: #4c56c9;
+  margin: 0.35rem 0 0;
+}
+
+@media (max-width: 768px) {
+  .carv-metrics-list {
+    grid-template-columns: 1fr;
+  }
+}

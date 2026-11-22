@@ -30,47 +30,42 @@ PROGRESS_FILE = Path.home() / ".carv-mcp" / "progress.json"
 CARV_METRICS_CONTEXT = """
 You are an elite ski coach and CARV technology expert with deep knowledge of carving biomechanics.
 
-## CARV METRICS INTERPRETATION
+## CARV AS IT IS TODAY
 
-### Ski:IQ Score (Overall Performance)
-- 100 = Average recreational skier
-- 100-115 = Intermediate - developing skills
-- 115-125 = Advanced intermediate - linking carved turns
-- 125-140 = Advanced - consistent carving on varied terrain
-- 140-155 = Expert - high edge angles, dynamic skiing
-- 155+ = Elite - race-level technique
+### Ski:IQ 26 "Stelvio" (announced 9 Nov 2026, Carv app version 10)
+- Same metrics; carving model unchanged. Short-turn model rewards control over raw g-force;
+  parallel model scores freeride terrain more fairly; slope pitch now feeds into Ski:IQ.
+- Ungroomed scores rise about 4.5 points on the same runs versus the previous version
+  (Wasatch): a rise across that boundary is a scoring change, not improvement.
 
-### BALANCE CATEGORY
-- **Start of Turn**: Weight shift to ski tips at turn initiation (0-100)
-- **Centered Balance**: Maintaining balance over center of ski during turn (0-100)
-- **Transition Weight Release**: How cleanly you release the old outside ski (0-100)
+### Ski:IQ Metrics list (Carv's names and units; each has a dashed performance zone)
+- Parallel Skis (%), Turn Shape (%), Turn Closure (% - judge against its zone, higher is not
+  automatically better), Early Edging (%), Edging Smoothness (%), Edging Similarity (%),
+  Edge Build (%), Edge Angle (degrees), Weight Release (% of weight released in the
+  transition), G-Force (g), Slope Pitch (degrees).
+- Run screens also show technique mode, Carv Skill Highlights ("Nailed it" / "One to work on"),
+  Pitch, Snow Surface, Carving Progression, Tempo, Corridor, Radius and a Balance rating
+  (Ok / Good / Great).
+- Carv no longer shows Start of Turn or Centered Balance scores: never report them.
+- Coach the technique that was skied: on short turns lower G-Force is not a fault; off-piste,
+  lower edge angles are expected.
 
-### EDGING CATEGORY
-- **Edge Angle**: Maximum angle of ski edge relative to snow (0-100 or degrees)
-  * 30-40°: Recreational | 45-55°: Strong intermediate | 55-65°: Advanced | 65°+: Elite
-- **Early Edging**: How quickly you establish edge grip after transition (0-100)
-- **Edging Similarity**: Consistency between left and right turns (0-100)
-- **Progressive Edge Build**: Whether edge angle increases throughout turn (0-100)
-
-### ROTARY CATEGORY
-- **Parallel Skis**: How parallel skis remain throughout turns (0-100)
-- **Turn Shape**: Smooth C-shaped arcs vs Z-shaped jerky turns (0-100)
-
-### PERFORMANCE CATEGORY
-- **Turn G-Force**: Forces generated during turns (0-100 or G value)
-  * 1.5-2.0G: Recreational | 2.0-2.5G: Strong | 2.5-3.0G: Expert | 3.0G+: Elite
+### Ski:IQ rough guide (not Carv's official bands)
+- 100 = Average recreational | 115-125 = Advanced intermediate | 125-140 = Advanced
+- 140-155 = Expert | 155+ = Elite
 
 ## DIAGNOSTIC FRAMEWORK
 
-### Low Start of Turn → Root causes: Fear (backseat), weak ankle flex, hip mobility, boot setup
-### Low Centered Balance → Root causes: G-force pulling back, defensive uphill lean, weak core
+### Balance rating below Great → Root causes: Fear (backseat), weak ankle flex, G-force pulling back, defensive uphill lean
 ### Low Weight Release → Root causes: Fear of fall line, Z-turn habit, static body
 ### Low Edge Angle → Root causes: Fear of commitment, no hip angulation, upper body rotation
 ### Low Early Edging → Root causes: Pivot habit, slow weight transfer, sequential movements
 ### Low Edging Similarity → Root causes: Dominant side, injury compensation, equipment
-### Low Progressive Edge Build → Root causes: "Park and ride" habit, fear, limited dynamic range
+### Low Edge Build → Root causes: "Park and ride" habit, fear, limited dynamic range
 ### Low Parallel Skis → Root causes: Stemming, A-frame, inside ski not tipping
 ### Low Turn Shape → Root causes: Pivot-based turning, speed checking, impatience
+### Turn Closure outside its zone → Root causes: Turns not finished, or over-finished/braking; check Tempo, Corridor, Radius
+### Low Edging Smoothness → Root causes: Edge set abruptly, sudden release, stiff ankles/knees
 """
 
 ANALYSIS_PROMPT = """
@@ -81,24 +76,28 @@ Return a JSON object with this structure:
   "ski_iq": <number or null>,
   "metrics": {
     "balance": {
-      "start_of_turn": <0-100 or null>,
-      "centered_balance": <0-100 or null>,
-      "transition_weight_release": <0-100 or null>
+      "transition_weight_release": <Weight Release % or null>,
+      "balance_rating": "<Ok, Good or Great if shown, else null>"
     },
     "edging": {
-      "edge_angle": <0-100 or null>,
+      "edge_angle": <Edge Angle in degrees or null>,
       "early_edging": <0-100 or null>,
+      "edging_smoothness": <0-100 or null>,
       "edging_similarity": <0-100 or null>,
-      "progressive_edge_build": <0-100 or null>
+      "progressive_edge_build": <Edge Build 0-100 or null>
     },
     "rotary": {
       "parallel_skis": <0-100 or null>,
-      "turn_shape": <0-100 or null>
+      "turn_shape": <0-100 or null>,
+      "turn_closure": <0-100 or null>
     },
     "performance": {
-      "turn_g_force": <0-100 or null>
+      "turn_g_force": <G-Force in g or null>,
+      "slope_pitch": <degrees or null>
     }
   },
+  "technique": "<technique mode shown, e.g. carving, or null>",
+  "skill_highlights": ["<e.g. 'Skill 4 Smoothly linking turns: One to work on'>"],
   "session_date": "<date shown on screenshot or null>",
   "terrain": "<terrain type if visible>",
   "turns_analyzed": <number or null>,
@@ -368,40 +367,24 @@ def format_analysis_summary(analysis: dict) -> str:
     # Metrics
     metrics = analysis.get("metrics", {})
 
-    if metrics.get("balance"):
-        lines.append("### Balance")
-        for k, v in metrics["balance"].items():
-            if v is not None:
-                name = k.replace("_", " ").title()
+    # Units for metrics that are not percentages; strings (e.g. balance rating) are shown as-is
+    units = {"edge_angle": "°", "slope_pitch": "°", "turn_g_force": " g"}
+    labels = {"transition_weight_release": "Weight Release", "progressive_edge_build": "Edge Build",
+              "turn_g_force": "G-Force"}
+    for category in ("balance", "edging", "rotary", "performance"):
+        values = metrics.get(category)
+        if not isinstance(values, dict) or not values:
+            continue
+        lines.append(f"### {category.title()}")
+        for k, v in values.items():
+            if v is None:
+                continue
+            name = labels.get(k, k.replace("_", " ").title())
+            if isinstance(v, (int, float)) and k not in units:
                 emoji = "🟢" if v >= 70 else "🟡" if v >= 50 else "🔴"
-                lines.append(f"- {name}: {emoji} **{v}**")
-        lines.append("")
-
-    if metrics.get("edging"):
-        lines.append("### Edging")
-        for k, v in metrics["edging"].items():
-            if v is not None:
-                name = k.replace("_", " ").title()
-                emoji = "🟢" if v >= 70 else "🟡" if v >= 50 else "🔴"
-                lines.append(f"- {name}: {emoji} **{v}**")
-        lines.append("")
-
-    if metrics.get("rotary"):
-        lines.append("### Rotary")
-        for k, v in metrics["rotary"].items():
-            if v is not None:
-                name = k.replace("_", " ").title()
-                emoji = "🟢" if v >= 70 else "🟡" if v >= 50 else "🔴"
-                lines.append(f"- {name}: {emoji} **{v}**")
-        lines.append("")
-
-    if metrics.get("performance"):
-        lines.append("### Performance")
-        for k, v in metrics["performance"].items():
-            if v is not None:
-                name = k.replace("_", " ").title()
-                emoji = "🟢" if v >= 70 else "🟡" if v >= 50 else "🔴"
-                lines.append(f"- {name}: {emoji} **{v}**")
+                lines.append(f"- {name}: {emoji} **{v}%**")
+            else:
+                lines.append(f"- {name}: **{v}{units.get(k, '')}**")
         lines.append("")
 
     # Insights

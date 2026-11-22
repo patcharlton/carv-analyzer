@@ -84,6 +84,55 @@ const mergeDbSessionsIntoLogs = (localLogs, sessions) => {
   return merged
 }
 
+// The Ski:IQ Metrics list as the Carv app shows it, in Carv's order and units.
+// Mirrors CARV_METRICS in backend/app/carv_metrics.py.
+const CARV_METRIC_DEFS = [
+  { key: 'parallel_skis', label: 'Parallel Skis', unit: '%', legacy: ['rotary', 'parallel_skis'] },
+  { key: 'turn_shape', label: 'Turn Shape', unit: '%', legacy: ['rotary', 'turn_shape'] },
+  { key: 'turn_closure', label: 'Turn Closure', unit: '%', zoneOnly: true, legacy: ['rotary', 'turn_closure'] },
+  { key: 'early_edging', label: 'Early Edging', unit: '%', legacy: ['edging', 'early_edging'] },
+  { key: 'edging_smoothness', label: 'Edging Smoothness', unit: '%', legacy: ['edging', 'edging_smoothness'] },
+  { key: 'edging_similarity', label: 'Edging Similarity', unit: '%', legacy: ['edging', 'edging_similarity'] },
+  { key: 'edge_build', label: 'Edge Build', unit: '%', legacy: ['edging', 'progressive_edge_build'] },
+  { key: 'edge_angle', label: 'Edge Angle', unit: '°', legacy: ['edging', 'edge_angle'] },
+  { key: 'weight_release', label: 'Weight Release', unit: '%', legacy: ['balance', 'transition_weight_release'] },
+  { key: 'g_force', label: 'G-Force', unit: 'g', legacy: ['performance', 'turn_g_force'] },
+  { key: 'slope_pitch', label: 'Slope Pitch', unit: '°' }
+]
+
+const ZONE_LABELS = { below: 'Below zone', in: 'In zone', above: 'Above zone' }
+
+// Ski:IQ 26 "Stelvio" was announced on this date (Carv app 10)
+const STELVIO_RELEASE_DATE = '2026-11-09'
+const SKI_IQ_VERSION_LABELS = { stelvio: 'Ski:IQ 26', wasatch: 'Pre-26' }
+
+// Which Ski:IQ scoring an analysis was scored with: as read from the screenshots
+// (or set by hand), otherwise guessed from the session date
+const getSkiIQVersion = (analysis, fallbackDate = null) => {
+  const version = analysis?.session_overview?.ski_iq_version
+  if (version === 'stelvio' || version === 'wasatch') return version
+  const date = normaliseLocalDateTime(analysis?.session_overview?.session_datetime || fallbackDate)
+  if (!date) return null
+  return date.slice(0, 10) >= STELVIO_RELEASE_DATE ? 'stelvio' : 'wasatch'
+}
+
+const formatMetricValue = (value, unit) => {
+  if (value === null || value === undefined) return '-'
+  if (unit === 'g') return `${Number(value).toFixed(1)} g`
+  return `${Math.round(value)}${unit}`
+}
+
+// A Carv metric's value from a progress log: the Carv metrics list when present,
+// otherwise the older grouped fields saved by earlier versions of the app
+const getLogMetricValue = (log, def) => {
+  const carvValue = log?.analysis?.carv_metrics?.[def.key]?.value
+  if (carvValue !== null && carvValue !== undefined) return carvValue
+  if (!def.legacy) return null
+  const [category, key] = def.legacy
+  const value = log?.metrics?.[category]?.[key] ?? log?.analysis?.overall_metrics?.[category]?.[key]
+  return value === undefined ? null : value
+}
+
 function App() {
   // Auth state
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -720,8 +769,45 @@ function App() {
       lines.push('')
     }
 
-    // Overall Metrics
-    if (analysis.overall_metrics) {
+    // Carv metrics and run details (current analyses)
+    const exportVersion = getSkiIQVersion(analysis, sessionDateTime)
+    if (exportVersion) {
+      lines.push(`Ski:IQ scoring: ${exportVersion === 'stelvio' ? 'Ski:IQ 26 (Stelvio)' : 'Pre-26 (Wasatch)'}`)
+      lines.push('')
+    }
+    const details = analysis.run_details
+    if (details) {
+      lines.push('RUN DETAILS')
+      lines.push(subDivider)
+      const detailLines = [
+        ['Run', details.run_name], ['Based on', details.basis], ['Technique', details.technique],
+        ['Snow surface', details.snow_surface], ['Pitch', details.pitch_deg != null ? `${details.pitch_deg}°` : null],
+        ['Carving turns', details.carving_turns?.count != null ? `${details.carving_turns.count}/${details.carving_turns.of ?? '?'}` : null],
+        ['Tempo', details.tempo_tpm != null ? `${details.tempo_tpm} turns/min` : null],
+        ['Corridor', details.corridor_m != null ? `${details.corridor_m} m` : null],
+        ['Radius', details.radius_m != null ? `${details.radius_m} m` : null],
+        ['Balance', details.balance_rating]
+      ]
+      detailLines.forEach(([label, value]) => { if (value) lines.push(`${label}: ${value}`) })
+      ;(details.skill_highlights || []).forEach(skill => {
+        if (skill?.name) lines.push(`Carv skill${skill.number ? ` ${skill.number}` : ''}: ${skill.name} - ${skill.status || '?'}`)
+      })
+      lines.push('')
+    }
+    if (analysis.carv_metrics) {
+      lines.push('CARV METRICS')
+      lines.push(subDivider)
+      CARV_METRIC_DEFS.forEach(def => {
+        const entry = analysis.carv_metrics[def.key]
+        if (entry?.value == null) return
+        const zone = entry.zone ? ` (${ZONE_LABELS[entry.zone].toLowerCase()})` : ''
+        lines.push(`${def.label}: ${formatMetricValue(entry.value, def.unit)}${zone}`)
+      })
+      lines.push('')
+    }
+
+    // Overall Metrics (older analyses without the Carv metrics list)
+    if (analysis.overall_metrics && !analysis.carv_metrics) {
       lines.push('OVERALL METRICS')
       lines.push(subDivider)
 
@@ -843,8 +929,12 @@ function App() {
         balance: log.metrics?.balance?.category_average,
         edging: log.metrics?.edging?.category_average,
         rotary: log.metrics?.rotary?.category_average,
-        twr: log.metrics?.balance?.transition_weight_release,
-        edgeAngle: log.metrics?.edging?.edge_angle,
+        twr: getLogMetricValue(log, CARV_METRIC_DEFS.find(d => d.key === 'weight_release')),
+        edgeAngle: getLogMetricValue(log, CARV_METRIC_DEFS.find(d => d.key === 'edge_angle')),
+        skiIQVersion: getSkiIQVersion(log.analysis, log.datetime),
+        technique: log.analysis?.run_details?.technique || null,
+        snowSurface: log.analysis?.run_details?.snow_surface || null,
+        pitch: log.analysis?.run_details?.pitch_deg ?? log.analysis?.carv_metrics?.slope_pitch?.value ?? null,
         notes: log.notes
       })) : null
 
@@ -923,6 +1013,93 @@ function App() {
         </div>
       </div>
     )
+  }
+
+  // Carv's Ski:IQ Metrics list with units and performance-zone position
+  const renderCarvMetrics = (carvMetrics) => {
+    const rows = CARV_METRIC_DEFS.filter(def => carvMetrics?.[def.key]?.value != null)
+    if (rows.length === 0) return null
+    return (
+      <div className="carv-metrics-list">
+        {rows.map(def => {
+          const { value, zone } = carvMetrics[def.key]
+          const showBar = def.unit === '%' && !def.zoneOnly
+          return (
+            <div key={def.key} className="carv-metric-row">
+              <div className="carv-metric-top">
+                <span className="carv-metric-label">{def.label}</span>
+                <span className="carv-metric-value">{formatMetricValue(value, def.unit)}</span>
+              </div>
+              <div className="carv-metric-bottom">
+                {showBar ? (
+                  <div className="carv-metric-bar">
+                    <div className="carv-metric-bar-fill" style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
+                  </div>
+                ) : (
+                  <span className="carv-metric-note">
+                    {def.zoneOnly ? 'Judged against its zone' : ''}
+                  </span>
+                )}
+                {zone && <span className={`zone-chip zone-${zone}`}>{ZONE_LABELS[zone]}</span>}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  // Run details Carv shows around the metrics: technique, snow, rhythm, Carv's own skill verdicts
+  const renderRunDetails = (details) => {
+    if (!details) return null
+    const capitalise = (text) => text ? text.charAt(0).toUpperCase() + text.slice(1) : text
+    const items = [
+      ['Technique', capitalise(details.technique)],
+      ['Snow', capitalise(details.snow_surface)],
+      ['Pitch', details.pitch_deg != null ? `${details.pitch_deg}°` : null],
+      ['Carving turns', details.carving_turns?.count != null ? `${details.carving_turns.count}/${details.carving_turns.of ?? '?'}` : null],
+      ['Tempo', details.tempo_tpm != null ? `${details.tempo_tpm} tpm` : null],
+      ['Corridor', details.corridor_m != null ? `${details.corridor_m} m` : null],
+      ['Radius', details.radius_m != null ? `${details.radius_m} m` : null],
+      ['Balance', details.balance_rating],
+      ['Segment', [details.segment?.time, details.segment?.turns != null ? `${details.segment.turns} turns` : null, details.segment?.vert, details.segment?.distance].filter(Boolean).join(' · ') || null]
+    ].filter(([, value]) => value)
+    const skills = (details.skill_highlights || []).filter(s => s?.name)
+    if (items.length === 0 && skills.length === 0) return null
+    return (
+      <div className="run-details">
+        {details.run_name && <div className="run-details-name">{details.run_name}{details.basis ? ` · ${details.basis}` : ''}</div>}
+        {items.length > 0 && (
+          <div className="run-details-grid">
+            {items.map(([label, value]) => (
+              <div key={label} className="run-detail">
+                <span className="run-detail-label">{label}</span>
+                <span className="run-detail-value">{value}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {skills.length > 0 && (
+          <div className="skill-highlights">
+            <span className="run-detail-label">Carv skill highlights</span>
+            {skills.map((skill, idx) => (
+              <div key={idx} className="skill-highlight">
+                <span>{skill.number ? `Skill ${skill.number}: ` : ''}{skill.name}</span>
+                <span className={`skill-status ${/work on/i.test(skill.status || '') ? 'work-on' : 'nailed'}`}>{skill.status}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Set the Ski:IQ scoring version on the current analysis (Carv rescored with Ski:IQ 26)
+  const setAnalysisSkiIQVersion = (version) => {
+    setAnalysis(prev => prev ? {
+      ...prev,
+      session_overview: { ...(prev.session_overview || {}), ski_iq_version: version }
+    } : prev)
   }
 
   // Parse training plan into structured sections
@@ -1827,16 +2004,47 @@ function App() {
         normaliseLocalDateTime(sessionDateTime) ||
         toLocalInputValue()
 
-      // Save to database first (source of truth)
+      // Store the scoring version explicitly so later comparisons don't depend on a guess
+      const analysisToSave = {
+        ...analysis,
+        session_overview: {
+          ...(analysis.session_overview || {}),
+          ski_iq_version: getSkiIQVersion(analysis, masterDateTime)
+        }
+      }
+
+      // Same run saved before (same time and, when known, same location)? The same Carv
+      // run can be screenshotted twice, e.g. before and after the Carv app 10 update.
+      const location = analysis?.session_overview?.location || null
+      const existingLog = progressLogs.find(log =>
+        normaliseLocalDateTime(log.datetime) === masterDateTime &&
+        (!location || !log.analysis?.session_overview?.location || log.analysis.session_overview.location === location)
+      )
+      if (existingLog && !window.confirm(
+        `A session at ${formatDateTime(existingLog.datetime, existingLog.datetimeDisplay)} is already saved. Replace it with this analysis?\n\nOK replaces it. Cancel keeps the existing one and does not save.`
+      )) {
+        setShowSaveDialog(false)
+        return
+      }
+
+      const sessionPayload = {
+        session_date: masterDateTime,
+        location,
+        metrics: analysisToSave,
+        training_plan: trainingPlan,
+        notes: sessionNotes
+      }
+
+      // Save to database first (source of truth): update the existing copy or create a new one
       let dbSession = null
       try {
-        dbSession = await saveSessionToDb({
-          session_date: masterDateTime,
-          location: analysis?.session_overview?.location || null,
-          metrics: analysis,
-          training_plan: trainingPlan,
-          notes: sessionNotes
-        })
+        if (existingLog?.dbSessionId) {
+          const response = await axios.put(`${API_BASE_URL}/sessions/${existingLog.dbSessionId}`, sessionPayload)
+          dbSession = response.data
+          setDbSessions(prev => prev.map(s => s.id === dbSession.id ? dbSession : s))
+        } else {
+          dbSession = await saveSessionToDb(sessionPayload)
+        }
       } catch (err) {
         console.warn('Database save failed, saving to localStorage only:', err)
       }
@@ -1850,7 +2058,7 @@ function App() {
           (sessionDateTime ? 'exif_or_filename' : 'current_time'),
         notes: sessionNotes,
         savedAt: new Date().toISOString(),
-        analysis: analysis,
+        analysis: analysisToSave,
         trainingPlan: trainingPlan,
         metrics: {
           skiIQ: skiIQ,
@@ -1861,8 +2069,11 @@ function App() {
         }
       }
 
-      // Save to localStorage as cache (no base64 previews)
-      setProgressLogs(prev => [...prev, logEntry])
+      // Save to localStorage as cache (no base64 previews); a replaced run swaps in place
+      setProgressLogs(prev => existingLog
+        ? prev.map(log => log.id === existingLog.id ? { ...logEntry, id: existingLog.id, dbSessionId: dbSession?.id || existingLog.dbSessionId } : log)
+        : [...prev, logEntry])
+      setAnalysis(analysisToSave)
 
       setShowSaveDialog(false)
       setSessionNotes('')
@@ -1972,24 +2183,28 @@ function App() {
   }
 
   // Render comparison metric row
-  const renderComparisonRow = (label, valueA, valueB, unit = '') => {
-    const diff = valueA !== null && valueB !== null ? valueB - valueA : null
-    const percentChange = valueA && diff ? ((diff / valueA) * 100) : null
+  const renderComparisonRow = (label, valueA, valueB, unit = '', neutral = false) => {
+    const hasA = valueA !== null && valueA !== undefined
+    const hasB = valueB !== null && valueB !== undefined
+    const diff = hasA && hasB ? valueB - valueA : null
+    const percentChange = hasA && valueA !== 0 && diff ? ((diff / valueA) * 100) : null
+    const decimals = unit === 'g' ? 1 : 0
+    const formatDiff = (d) => `${d > 0 ? '+' : ''}${d.toFixed(decimals)}`
     return (
       <div className="comparison-row">
         <span className="comparison-label">{label}</span>
-        <span className="comparison-value old">{valueA !== null ? Math.round(valueA) : '-'}{unit}</span>
-        <span className={`comparison-diff ${diff > 0 ? 'positive' : diff < 0 ? 'negative' : ''}`}>
+        <span className="comparison-value old">{hasA ? formatMetricValue(valueA, unit) : '-'}</span>
+        <span className={`comparison-diff ${neutral ? '' : diff > 0 ? 'positive' : diff < 0 ? 'negative' : ''}`}>
           {diff !== null ? (
             <>
-              {diff > 0 ? '+' : ''}{Math.round(diff)}
+              {formatDiff(diff)}
               {percentChange !== null && Math.abs(percentChange) >= 1 && (
                 <small> ({percentChange > 0 ? '+' : ''}{percentChange.toFixed(1)}%)</small>
               )}
             </>
           ) : '-'}
         </span>
-        <span className="comparison-value new">{valueB !== null ? Math.round(valueB) : '-'}{unit}</span>
+        <span className="comparison-value new">{hasB ? formatMetricValue(valueB, unit) : '-'}</span>
       </div>
     )
   }
@@ -2207,6 +2422,19 @@ function App() {
                 )}
                 <div className="session-stats">
                   <div className="stat">
+                    <label className="version-select-label" htmlFor="ski-iq-version">Scoring</label>
+                    <select
+                      id="ski-iq-version"
+                      className="version-select"
+                      value={getSkiIQVersion(analysis, sessionDateTime) || ''}
+                      onChange={(e) => setAnalysisSkiIQVersion(e.target.value)}
+                      title="Ski:IQ 26 (Stelvio) rescored off-piste runs about 4.5 points higher. Change this if the guess is wrong."
+                    >
+                      <option value="stelvio">Ski:IQ 26 (Stelvio)</option>
+                      <option value="wasatch">Pre-26 (Wasatch)</option>
+                    </select>
+                  </div>
+                  <div className="stat">
                     <span className="stat-value">{analysis.num_screenshots}</span>
                     <span className="stat-label">Screenshots Analyzed</span>
                   </div>
@@ -2265,8 +2493,14 @@ function App() {
               </section>
             )}
 
-            {/* Metrics Grid */}
-            {analysis.overall_metrics && (
+            {/* Carv metrics as Carv shows them (current analyses) */}
+            {(analysis.carv_metrics || analysis.run_details) ? (
+              <section className="metrics-section">
+                <h2>Carv Metrics</h2>
+                {renderRunDetails(analysis.run_details)}
+                {renderCarvMetrics(analysis.carv_metrics)}
+              </section>
+            ) : analysis.overall_metrics && (
               <section className="metrics-section">
                 <h2>Overall Metrics</h2>
                 <div className="metrics-grid">
@@ -2581,8 +2815,23 @@ function App() {
                         const lastVal = values[values.length - 1]
                         const trend = lastVal - firstVal
 
+                        // Where Ski:IQ scoring switched to Ski:IQ 26 (Stelvio): scores either side aren't directly comparable
+                        const versions = chartLogs.map(l => getSkiIQVersion(l.analysis, l.datetime))
+                        const boundaryIdx = versions.findIndex((v, i) => i > 0 && v === 'stelvio' && versions[i - 1] === 'wasatch')
+                        const boundaryX = selectedMetric === 'skiIQ' && boundaryIdx > 0
+                          ? padding.left + ((boundaryIdx - 0.5) / (chartLogs.length - 1)) * chartWidth
+                          : null
+
                         return (
                           <svg viewBox={`0 0 ${width} ${height}`} className="line-chart-svg">
+                            {boundaryX !== null && (
+                              <g>
+                                <line x1={boundaryX} y1={padding.top} x2={boundaryX} y2={height - padding.bottom}
+                                  stroke="#667eea" strokeWidth="1" strokeDasharray="3 3" />
+                                <text x={boundaryX + 3} y={padding.top + 8} fontSize="8" fill="#667eea">Ski:IQ 26</text>
+                                <title>Carv changed Ski:IQ scoring here (Ski:IQ 26 Stelvio). Off-piste scores rose about 4.5 points for the same skiing.</title>
+                              </g>
+                            )}
                             {/* Grid lines */}
                             {[0, 0.25, 0.5, 0.75, 1].map((pct, i) => (
                               <g key={i}>
@@ -2682,6 +2931,9 @@ function App() {
                               {trend >= 0 ? '+' : ''}{trend.toFixed(1)} pts
                             </span>
                             <span className="summary-range">({Math.round(firstVal)} → {Math.round(lastVal)})</span>
+                            {selectedMetric === 'skiIQ' && new Set(chartLogs.map(l => getSkiIQVersion(l.analysis, l.datetime)).filter(Boolean)).size > 1 && (
+                              <span className="summary-note">Includes Ski:IQ 26 rescoring: off-piste scores rose about 4.5 points for the same skiing.</span>
+                            )}
                           </>
                         )
                       })()}
@@ -2722,6 +2974,16 @@ function App() {
                             </div>
                           </div>
                           <div className="log-header-right">
+                            {(() => {
+                              const version = getSkiIQVersion(log.analysis, log.datetime)
+                              const technique = log.analysis?.run_details?.technique
+                              return (
+                                <>
+                                  {technique && <span className="log-tag">{technique}</span>}
+                                  {version && <span className={`log-tag version-${version}`}>{SKI_IQ_VERSION_LABELS[version]}</span>}
+                                </>
+                              )
+                            })()}
                             <div className="log-skiiq-badge">
                               <span className="skiiq-value">{log.metrics.skiIQ ? Math.round(log.metrics.skiIQ) : '?'}</span>
                               {skiIQChange !== null && (
@@ -2735,7 +2997,8 @@ function App() {
 
                         {isExpanded && (
                           <div className="log-card-body">
-                            {/* Metrics Grid */}
+                            {/* Carv metrics with units for current analyses; grouped bars for older ones */}
+                            {log.analysis?.carv_metrics ? renderCarvMetrics(log.analysis.carv_metrics) : (
                             <div className="log-metrics-expanded">
                               <div className="metric-row">
                                 <span className="metric-name">Balance</span>
@@ -2772,12 +3035,13 @@ function App() {
                                 <div className="metric-bar-container">
                                   <div
                                     className="metric-bar gforce"
-                                    style={{ width: `${log.metrics.performance?.turn_g_force || 0}%` }}
+                                    style={{ width: `${Math.min(100, ((log.metrics.performance?.turn_g_force || 0) / 3) * 100)}%` }}
                                   />
                                 </div>
-                                <span className="metric-val">{log.metrics.performance?.turn_g_force ? Math.round(log.metrics.performance.turn_g_force) : '-'}</span>
+                                <span className="metric-val">{log.metrics.performance?.turn_g_force ? `${Number(log.metrics.performance.turn_g_force).toFixed(1)} g` : '-'}</span>
                               </div>
                             </div>
+                            )}
 
                             {/* Notes */}
                             {log.notes && (
@@ -2991,63 +3255,27 @@ function App() {
                   <span>Current</span>
                 </div>
                 {renderComparisonRow('Ski:IQ', comparisonLogA.metrics?.skiIQ, comparisonLogB.metrics?.skiIQ)}
+                {getSkiIQVersion(comparisonLogA.analysis, comparisonLogA.datetime) !== getSkiIQVersion(comparisonLogB.analysis, comparisonLogB.datetime) && (
+                  <p className="comparison-note">These sessions were scored with different Ski:IQ versions. Ski:IQ 26 raised off-piste scores by about 4.5 points for the same skiing, so part of any change may be the rescoring.</p>
+                )}
               </div>
 
-              {/* Balance */}
+              {/* Carv metrics (Carv's list and units; older sessions use their saved fields) */}
               <div className="comparison-section">
-                <h3>Balance</h3>
+                <h3>Carv Metrics</h3>
                 <div className="comparison-header-row">
                   <span></span>
                   <span>Baseline</span>
                   <span>Change</span>
                   <span>Current</span>
                 </div>
-                {renderComparisonRow('Category Average', comparisonLogA.metrics?.balance?.category_average, comparisonLogB.metrics?.balance?.category_average)}
-                {renderComparisonRow('Centered Balance', comparisonLogA.metrics?.balance?.centered_balance, comparisonLogB.metrics?.balance?.centered_balance)}
-                {renderComparisonRow('Start of Turn', comparisonLogA.metrics?.balance?.start_of_turn, comparisonLogB.metrics?.balance?.start_of_turn)}
-                {renderComparisonRow('Transition Weight', comparisonLogA.metrics?.balance?.transition_weight_release, comparisonLogB.metrics?.balance?.transition_weight_release)}
-              </div>
-
-              {/* Edging */}
-              <div className="comparison-section">
-                <h3>Edging</h3>
-                <div className="comparison-header-row">
-                  <span></span>
-                  <span>Baseline</span>
-                  <span>Change</span>
-                  <span>Current</span>
-                </div>
-                {renderComparisonRow('Category Average', comparisonLogA.metrics?.edging?.category_average, comparisonLogB.metrics?.edging?.category_average)}
-                {renderComparisonRow('Edge Angle', comparisonLogA.metrics?.edging?.edge_angle, comparisonLogB.metrics?.edging?.edge_angle)}
-                {renderComparisonRow('Early Edging', comparisonLogA.metrics?.edging?.early_edging, comparisonLogB.metrics?.edging?.early_edging)}
-                {renderComparisonRow('Edging Similarity', comparisonLogA.metrics?.edging?.edging_similarity, comparisonLogB.metrics?.edging?.edging_similarity)}
-                {renderComparisonRow('Progressive Edge', comparisonLogA.metrics?.edging?.progressive_edge_build, comparisonLogB.metrics?.edging?.progressive_edge_build)}
-              </div>
-
-              {/* Rotary */}
-              <div className="comparison-section">
-                <h3>Rotary</h3>
-                <div className="comparison-header-row">
-                  <span></span>
-                  <span>Baseline</span>
-                  <span>Change</span>
-                  <span>Current</span>
-                </div>
-                {renderComparisonRow('Category Average', comparisonLogA.metrics?.rotary?.category_average, comparisonLogB.metrics?.rotary?.category_average)}
-                {renderComparisonRow('Parallel Skis', comparisonLogA.metrics?.rotary?.parallel_skis, comparisonLogB.metrics?.rotary?.parallel_skis)}
-                {renderComparisonRow('Turn Shape', comparisonLogA.metrics?.rotary?.turn_shape, comparisonLogB.metrics?.rotary?.turn_shape)}
-              </div>
-
-              {/* Performance */}
-              <div className="comparison-section">
-                <h3>Performance</h3>
-                <div className="comparison-header-row">
-                  <span></span>
-                  <span>Baseline</span>
-                  <span>Change</span>
-                  <span>Current</span>
-                </div>
-                {renderComparisonRow('Turn G-Force', comparisonLogA.metrics?.performance?.turn_g_force, comparisonLogB.metrics?.performance?.turn_g_force)}
+                {CARV_METRIC_DEFS.map(def => {
+                  const valueA = getLogMetricValue(comparisonLogA, def)
+                  const valueB = getLogMetricValue(comparisonLogB, def)
+                  if (valueA === null && valueB === null) return null
+                  // Turn Closure is judged by its zone and pitch is terrain, so neither change is "better" or "worse"
+                  return <div key={def.key}>{renderComparisonRow(def.label, valueA, valueB, def.unit, def.zoneOnly || def.key === 'slope_pitch')}</div>
+                })}
               </div>
             </div>
           </div>
