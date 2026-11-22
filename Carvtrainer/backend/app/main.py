@@ -14,7 +14,7 @@ import re
 import uuid
 import threading
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from flask_cors import CORS
@@ -33,9 +33,6 @@ except ImportError:  # python app/main.py
     from training_plan import (PLAN_TOOL, PlanError, assemble_plan, history_entry,
                                system_blocks as plan_system_blocks, user_message as plan_user_message)
 
-# In-memory job store for background processing
-# Format: {job_id: {"status": "pending"|"processing"|"completed"|"failed", "result": {...}, "error": "..."}}
-jobs = {}
 
 # Load environment variables
 load_dotenv()
@@ -177,12 +174,42 @@ class Session(db.Model):
         }
 
 
-# Create tables on startup
+class Job(db.Model):
+    """A screenshot analysis running in the background. Kept in the database (not in memory)
+    so polling works across workers and a restart leaves a clear 'failed' instead of a 404."""
+    __tablename__ = "analysis_jobs"
+
+    id = db.Column(db.String(36), primary_key=True)
+    status = db.Column(db.String(20), nullable=False, default="pending")  # pending|processing|completed|failed
+    result = db.Column(db.JSON)
+    error = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+JOB_KEEP_SECONDS = 3600       # delete finished jobs after an hour
+JOB_STALE_SECONDS = 10 * 60   # a job not updated for this long was lost (worker restarted)
+
+# Create tables on startup (new tables only; existing ones are left as they are)
 with app.app_context():
     db.create_all()
 
-# Initialize Anthropic client
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+def set_job(job_id, **fields):
+    """Update a job from the background thread (which needs its own app context)."""
+    with app.app_context():
+        job = db.session.get(Job, job_id)
+        if job is None:
+            return
+        for key, value in fields.items():
+            setattr(job, key, value)
+        db.session.commit()
+
+# Initialize Anthropic client. Each attempt is capped so a slow reply fails cleanly:
+# request routes stay inside gunicorn's 120s timeout (55s x 2 attempts), and the
+# background analysis stays inside the frontend's 3-minute polling window.
+client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=55.0, max_retries=1)
+ANALYSIS_TIMEOUT_SECONDS = 80.0
 
 # Screenshot analysis (vision). claude-sonnet-4-20250514, used here before, was retired on 15 June 2026.
 ANALYSIS_MODEL = "claude-sonnet-5-5"
@@ -196,7 +223,7 @@ def create_analysis_message(**kwargs):
     frontend's 3-minute polling window; max_tokens covers thinking as well as the JSON reply.
     The server-side fallback re-runs the request on another model if this one declines it.
     """
-    return client.beta.messages.create(
+    return client.with_options(timeout=ANALYSIS_TIMEOUT_SECONDS).beta.messages.create(
         model=ANALYSIS_MODEL,
         max_tokens=16000,
         output_config={"effort": "medium"},
@@ -209,6 +236,40 @@ def create_analysis_message(**kwargs):
 def get_reply_text(response):
     """The reply's text. Newer models put a thinking block first, so never read content[0]."""
     return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+
+
+class ModelReplyError(Exception):
+    """A model reply that can't be used; the message is safe to show the user."""
+
+
+def request_json_reply(create, attempts=2):
+    """
+    Call `create()` (a function making one model request) and parse the JSON reply.
+    A reply that isn't valid JSON is retried once; refusals and cut-off replies are not.
+    """
+    for attempt in range(attempts):
+        response = create()
+        if response.stop_reason == "refusal":
+            raise ModelReplyError("The AI declined this request. Please try again with CARV screenshots only.")
+        if response.stop_reason == "max_tokens":
+            raise ModelReplyError("The AI reply was too long and got cut off. Try fewer screenshots at once.")
+        try:
+            return json.loads(clean_json_response(get_reply_text(response)))
+        except json.JSONDecodeError:
+            app.logger.warning("Model reply was not valid JSON (attempt %d of %d)", attempt + 1, attempts)
+    raise ModelReplyError("The AI reply wasn't in the expected format. Please try again.")
+
+
+def api_error_message(error):
+    """A user-facing message for an exception from a model call (details go to the log)."""
+    text = str(error).lower()
+    if "api_key" in text or "authentication" in text:
+        return "The server's Anthropic API key is missing or invalid."
+    if "rate_limit" in text:
+        return "Rate limited. Please wait a moment and try again."
+    if "timeout" in text or "timed out" in text:
+        return "The AI took too long to reply. Please try again."
+    return "Analysis failed. Please try again."
 
 # CARV Metrics Context for AI Analysis - Comprehensive Carving Knowledge Base
 CARV_METRICS_CONTEXT = """
@@ -770,211 +831,35 @@ def health_check():
     })
 
 
-@app.route('/analyze', methods=['POST'])
-def analyze_screenshots():
-    """
-    Analyze one or more CARV screenshots holistically using Claude's vision.
-
-    Expects: multipart/form-data with one or more 'images' files
-    Returns: JSON with holistic analysis of all screenshots
-    """
-    try:
-        # Check if image files are present
-        if 'images' not in request.files:
-            return jsonify({
-                "error": "No image files provided",
-                "message": "Please upload at least one CARV screenshot"
-            }), 400
-
-        files = request.files.getlist('images')
-        if len(files) > MAX_FILES_PER_UPLOAD:
-            return jsonify({
-                "error": "Too many files",
-                "message": f"Please upload at most {MAX_FILES_PER_UPLOAD} screenshots at a time"
-            }), 400
-
-        if len(files) == 0 or (len(files) == 1 and files[0].filename == ''):
-            return jsonify({
-                "error": "No files selected",
-                "message": "Please select at least one CARV screenshot to upload"
-            }), 400
-
-        # Process all images
-        image_contents = []
-        filenames = []
-
-        for file in files:
-            if file.filename == '':
-                continue
-
-            # Check file size (max 5MB each)
-            file.seek(0, 2)
-            file_size = file.tell()
-            file.seek(0)
-
-            if file_size > 5 * 1024 * 1024:
-                return jsonify({
-                    "error": "File too large",
-                    "message": f"{file.filename} is larger than 5MB"
-                }), 400
-
-            # Read and encode image
-            image_data = file.read()
-            base64_image = base64.standard_b64encode(image_data).decode('utf-8')
-            media_type = get_media_type(file.filename)
-
-            image_contents.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": base64_image
-                }
-            })
-            filenames.append(file.filename)
-
-        num_images = len(image_contents)
-
-        if num_images == 0:
-            return jsonify({
-                "error": "No valid images",
-                "message": "Please upload at least one valid image file"
-            }), 400
-
-        # Build the message content with all images + prompt
-        message_content = image_contents.copy()
-        message_content.append({
-            "type": "text",
-            "text": HOLISTIC_ANALYSIS_PROMPT.format(num_images=num_images)
-        })
-
-        # Call Claude API with all images
-        response = create_analysis_message(
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ],
-            system=CARV_METRICS_CONTEXT
-        )
-
-        # Extract response text
-        response_text = get_reply_text(response)
-
-        # Clean and parse JSON
-        cleaned_json = clean_json_response(response_text)
-
-        try:
-            analysis_data = json.loads(cleaned_json)
-        except json.JSONDecodeError as e:
-            return jsonify({
-                "error": "Failed to parse AI response",
-                "message": "The AI response wasn't in the expected format. Please try again."
-            }), 500
-
-        # Units, legacy fields, category averages and Ski:IQ version
-        normalise_analysis(analysis_data)
-
-        # Add metadata
-        analysis_data["analyzed_at"] = datetime.now().isoformat()
-        analysis_data["filenames"] = filenames
-        analysis_data["num_screenshots"] = num_images
-
-        return jsonify(analysis_data)
-
-    except Exception as e:
-        error_message = str(e)
-
-        if "api_key" in error_message.lower() or "authentication" in error_message.lower():
-            return jsonify({
-                "error": "API Key Error",
-                "message": "The server's Anthropic API key is missing or invalid."
-            }), 401
-
-        if "rate_limit" in error_message.lower():
-            return jsonify({
-                "error": "Rate Limited",
-                "message": "Too many requests. Please wait a moment and try again."
-            }), 429
-
-        app.logger.error("Analysis failed: %s", error_message)
-        return jsonify({
-            "error": "Analysis failed",
-            "message": "Something went wrong during analysis. Please try again."
-        }), 500
-
-
 def process_analysis_job(job_id, image_contents, filenames, num_images):
-    """Background worker function to process image analysis."""
-    global jobs
-
+    """Background worker: analyse the screenshots and store the result on the job."""
     try:
-        jobs[job_id]["status"] = "processing"
+        set_job(job_id, status="processing")
 
-        # Build the message content with all images + prompt
-        message_content = image_contents.copy()
-        message_content.append({
+        message_content = image_contents + [{
             "type": "text",
             "text": HOLISTIC_ANALYSIS_PROMPT.format(num_images=num_images)
-        })
-
-        # Call Claude API with all images
-        response = create_analysis_message(
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ],
-            system=CARV_METRICS_CONTEXT
-        )
-
-        if response.stop_reason == "refusal":
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = "The AI declined to analyse these screenshots. Please try again with CARV screenshots only."
-            return
-
-        if response.stop_reason == "max_tokens":
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = "The analysis was too long and got cut off. Try fewer screenshots at once."
-            return
-
-        # Extract response text
-        response_text = get_reply_text(response)
-
-        # Clean and parse JSON
-        cleaned_json = clean_json_response(response_text)
-
-        try:
-            analysis_data = json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = "Failed to parse AI response. Please try again."
-            return
+        }]
+        analysis_data = request_json_reply(lambda: create_analysis_message(
+            messages=[{"role": "user", "content": message_content}],
+            system=CARV_METRICS_CONTEXT,
+        ))
+        if not isinstance(analysis_data, dict):
+            raise ModelReplyError("The AI reply wasn't in the expected format. Please try again.")
 
         # Units, legacy fields, category averages and Ski:IQ version
         normalise_analysis(analysis_data)
-
-        # Add metadata
         analysis_data["analyzed_at"] = datetime.now().isoformat()
         analysis_data["filenames"] = filenames
         analysis_data["num_screenshots"] = num_images
 
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["result"] = analysis_data
+        set_job(job_id, status="completed", result=analysis_data)
 
+    except ModelReplyError as e:
+        set_job(job_id, status="failed", error=str(e))
     except Exception as e:
-        jobs[job_id]["status"] = "failed"
-        error_message = str(e)
-
-        if "api_key" in error_message.lower() or "authentication" in error_message.lower():
-            jobs[job_id]["error"] = "API key is missing or invalid."
-        elif "rate_limit" in error_message.lower():
-            jobs[job_id]["error"] = "Rate limited. Please wait and try again."
-        else:
-            app.logger.error("Analysis job %s failed: %s", job_id, error_message)
-            jobs[job_id]["error"] = "Analysis failed. Please try again."
+        app.logger.error("Analysis job %s failed: %s", job_id, e)
+        set_job(job_id, status="failed", error=api_error_message(e))
 
 
 @app.route('/analyze-async', methods=['POST'])
@@ -1046,9 +931,12 @@ def analyze_screenshots_async():
                 "message": "Please upload at least one valid image file"
             }), 400
 
-        # Create job and return immediately
+        # Create the job (and clear out old ones), then return immediately
         job_id = str(uuid.uuid4())
-        jobs[job_id] = {"status": "pending", "result": None, "error": None}
+        cutoff = datetime.utcnow() - timedelta(seconds=JOB_KEEP_SECONDS)
+        Job.query.filter(Job.created_at < cutoff).delete()
+        db.session.add(Job(id=job_id, status="pending"))
+        db.session.commit()
 
         # Start background thread for processing
         thread = threading.Thread(
@@ -1078,26 +966,25 @@ def get_job_status(job_id):
     Get the status of an async analysis job.
     Returns status and result (if completed) or error (if failed).
     """
-    if job_id not in jobs:
+    job = db.session.get(Job, job_id)
+    if job is None:
         return jsonify({
             "error": "Job not found",
-            "message": f"No job found with ID: {job_id}"
+            "message": "This analysis is no longer available. Please analyze again."
         }), 404
 
-    job = jobs[job_id]
+    # A job nobody has updated for a while was lost when its worker restarted
+    if job.status in ("pending", "processing") and job.updated_at and \
+            (datetime.utcnow() - job.updated_at).total_seconds() > JOB_STALE_SECONDS:
+        job.status = "failed"
+        job.error = "The server restarted during this analysis. Please analyze again."
+        db.session.commit()
 
-    response = {
-        "job_id": job_id,
-        "status": job["status"]
-    }
-
-    if job["status"] == "completed":
-        response["result"] = job["result"]
-        # Clean up completed job after returning
-        # (Keep it for a bit in case of retry, but could add TTL cleanup)
-    elif job["status"] == "failed":
-        response["error"] = job["error"]
-
+    response = {"job_id": job.id, "status": job.status}
+    if job.status == "completed":
+        response["result"] = job.result
+    elif job.status == "failed":
+        response["error"] = job.error
     return jsonify(response)
 
 
@@ -1472,11 +1359,11 @@ def create_session():
             session_overview = metrics.get('session_overview', {})
             ski_iq_range = session_overview.get('ski_iq_range', {})
             # Try 'average' first, then calculate from 'lowest'/'highest' (AI response keys)
-            if ski_iq_range.get('average'):
+            if ski_iq_range.get('average') is not None:
                 ski_iq = ski_iq_range['average']
-            elif ski_iq_range.get('lowest') and ski_iq_range.get('highest'):
+            elif ski_iq_range.get('lowest') is not None and ski_iq_range.get('highest') is not None:
                 ski_iq = (ski_iq_range['lowest'] + ski_iq_range['highest']) / 2
-            elif ski_iq_range.get('min') and ski_iq_range.get('max'):
+            elif ski_iq_range.get('min') is not None and ski_iq_range.get('max') is not None:
                 ski_iq = (ski_iq_range['min'] + ski_iq_range['max']) / 2
 
         session = Session(
@@ -1514,7 +1401,7 @@ def list_sessions():
 def get_session(session_id):
     """Get a single session by ID."""
     try:
-        session = Session.query.get(session_id)
+        session = db.session.get(Session, session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
         return jsonify(session.to_dict())
@@ -1527,7 +1414,7 @@ def get_session(session_id):
 def update_session(session_id):
     """Update a session (e.g., add notes or training plan)."""
     try:
-        session = Session.query.get(session_id)
+        session = db.session.get(Session, session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
 
@@ -1565,7 +1452,7 @@ def update_session(session_id):
 def delete_session(session_id):
     """Delete a session."""
     try:
-        session = Session.query.get(session_id)
+        session = db.session.get(Session, session_id)
         if not session:
             return jsonify({"error": "Session not found"}), 404
 
@@ -1744,7 +1631,7 @@ def analyze_progression():
             session_data.append(session_entry)
 
         # Call Claude for analysis - use Haiku for speed within Render's timeout
-        response = client.messages.create(
+        progression_request = lambda: client.messages.create(
             model=FAST_MODEL,  # Fast model to stay within Render timeout
             max_tokens=4000,
             messages=[{
@@ -1762,16 +1649,12 @@ Return ONLY valid JSON, no markdown code blocks."""
             system=CARV_METRICS_CONTEXT
         )
 
-        response_text = get_reply_text(response)
-        cleaned_json = clean_json_response(response_text)
-
         try:
-            progression_data = json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            return jsonify({
-                "error": "Failed to parse progression analysis",
-                "message": "The AI reply wasn't in the expected format. Please try again."
-            }), 500
+            progression_data = request_json_reply(progression_request)
+        except ModelReplyError as e:
+            return jsonify({"error": "Progression analysis failed", "message": str(e)}), 502
+        if not isinstance(progression_data, dict):
+            return jsonify({"error": "Progression analysis failed", "message": "The AI reply wasn't in the expected format. Please try again."}), 502
 
         progression_data["sessions_analyzed"] = len(sessions)
         progression_data["session_ids_analyzed"] = [s.id for s in sessions]
@@ -1796,83 +1679,6 @@ Return ONLY valid JSON, no markdown code blocks."""
     except Exception as e:
         app.logger.exception("Progression analysis failed")
         return jsonify({"error": "Progression analysis failed", "message": "Something went wrong analysing your progression. Please try again."}), 500
-
-
-@app.route('/compare', methods=['POST'])
-def compare_sessions():
-    """Compare two specific sessions side-by-side."""
-    try:
-        data = request.get_json()
-
-        if not data or 'session_id_1' not in data or 'session_id_2' not in data:
-            return jsonify({
-                "error": "Missing session IDs",
-                "message": "Provide session_id_1 and session_id_2"
-            }), 400
-
-        session1 = Session.query.get(data['session_id_1'])
-        session2 = Session.query.get(data['session_id_2'])
-
-        if not session1 or not session2:
-            return jsonify({"error": "One or both sessions not found"}), 404
-
-        # Determine which is earlier/later
-        if session1.session_date <= session2.session_date:
-            earlier, later = session1, session2
-        else:
-            earlier, later = session2, session1
-
-        # Call Claude for comparison
-        response = client.messages.create(
-            model=FAST_MODEL,
-            max_tokens=1500,
-            messages=[{
-                "role": "user",
-                "content": f"""Compare these two skiing sessions and describe what changed:
-
-EARLIER SESSION ({earlier.session_date.strftime("%Y-%m-%d") if earlier.session_date else "Unknown"}):
-Location: {earlier.location}
-Ski:IQ: {earlier.ski_iq}
-Metrics: {json.dumps(earlier.metrics, indent=2) if earlier.metrics else "No metrics"}
-
-LATER SESSION ({later.session_date.strftime("%Y-%m-%d") if later.session_date else "Unknown"}):
-Location: {later.location}
-Ski:IQ: {later.ski_iq}
-Metrics: {json.dumps(later.metrics, indent=2) if later.metrics else "No metrics"}
-
-Provide a comparison in JSON format:
-{{
-    "ski_iq_change": {{"from": X, "to": Y, "change": "+/-Z", "assessment": "..."}},
-    "key_improvements": ["..."],
-    "areas_declined": ["..."],
-    "technique_changes": "Plain language description of how technique evolved",
-    "recommendations": "What to focus on next based on this comparison"
-}}
-
-Return ONLY valid JSON."""
-            }],
-            system=CARV_METRICS_CONTEXT
-        )
-
-        response_text = get_reply_text(response)
-        cleaned_json = clean_json_response(response_text)
-
-        try:
-            comparison_data = json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            return jsonify({
-                "error": "Failed to parse comparison",
-                "message": "The AI reply wasn't in the expected format. Please try again."
-            }), 500
-
-        comparison_data["session_1"] = earlier.to_dict()
-        comparison_data["session_2"] = later.to_dict()
-
-        return jsonify(comparison_data)
-
-    except Exception as e:
-        app.logger.exception("Comparison failed")
-        return jsonify({"error": "Comparison failed", "message": "Something went wrong comparing these sessions. Please try again."}), 500
 
 
 if __name__ == '__main__':

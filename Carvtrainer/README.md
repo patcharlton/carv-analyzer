@@ -31,8 +31,15 @@ AI-powered skiing analysis tool that extracts metrics from CARV app screenshots 
    ```bash
    cd backend
    cp .env.example .env
-   # Edit .env and add your ANTHROPIC_API_KEY
+   # Edit .env: set ANTHROPIC_API_KEY, APP_PASSWORD (the site password)
+   # and SECRET_KEY (any long random string). Without the last two the API refuses requests.
    pip install -r requirements.txt
+   ```
+
+   To run the backend tests (no API calls are made):
+   ```bash
+   pip install -r requirements-dev.txt
+   python -m pytest
    ```
 
 3. **Set up the frontend**
