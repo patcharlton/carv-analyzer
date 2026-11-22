@@ -5512,3 +5512,48 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* Training plan options next to "Generate Training Plan" */
+.plan-options {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.plan-options label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--color-text-light);
+  gap: 0.2rem;
+}
+
+.plan-options input {
+  width: 4.5rem;
+  font: inherit;
+  font-size: 0.95rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+/* Numbered steps inside a drill card */
+.drill-steps {
+  margin: 0.4rem 0 0 1.2rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+.cue-card small {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  opacity: 0.7;
+}

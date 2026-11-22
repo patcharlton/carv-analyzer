@@ -22,8 +22,12 @@ from PIL.ExifTags import TAGS
 
 try:  # gunicorn app.main:app (from the backend folder)
     from app.carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
+    from app.training_plan import (PLAN_TOOL, PlanError, assemble_plan, history_entry,
+                                   system_blocks as plan_system_blocks, user_message as plan_user_message)
 except ImportError:  # python app/main.py
     from carv_metrics import CURRENT_CARV_GUIDE, default_ski_iq_version, describe_metrics, normalise_analysis
+    from training_plan import (PLAN_TOOL, PlanError, assemble_plan, history_entry,
+                               system_blocks as plan_system_blocks, user_message as plan_user_message)
 
 # In-memory job store for background processing
 # Format: {job_id: {"status": "pending"|"processing"|"completed"|"failed", "result": {...}, "error": "..."}}
@@ -534,601 +538,7 @@ CRITICAL INSTRUCTIONS:
 11. Screenshots of different runs (different location, date or time) should still be read individually: describe each in run_by_run_notes
 """
 
-TRAINING_PLAN_PROMPT = """
-Based on this COMPREHENSIVE CARV skiing analysis from multiple screenshots, create a personalized training plan.
-
-ANALYSIS DATA:
-{analysis_data}
-
-This analysis represents data from {num_runs} screenshot(s) giving us a complete picture of this skier.
-
-## DRILL LIBRARY - SELECT APPROPRIATE DRILLS BASED ON ISSUES IDENTIFIED
-
-### FOUNDATION DRILLS (Building Blocks)
-
-**1. Thousand Steps**
-- Purpose: Develops balance, weight transfer awareness, edge feel
-- Execution: Make tiny rapid steps from ski to ski while traversing/turning
-- Feel: Dancing on the snow, constant weight shifting
-- Duration: 2-3 runs, green/easy blue terrain
-- Improves: Centered Balance, Weight Release, Edging Similarity
-- Common Mistake: Steps too big - keep them small and quick
-- Video: https://www.youtube.com/results?search_query=1000+steps+ski+drill+carving
-
-**2. Javelin Turns**
-- Purpose: Forces commitment to outside ski, eliminates inside ski dependency
-- Execution: Lift inside ski completely off snow, hold parallel to outside ski during turn
-- Feel: All weight on one ski, total commitment
-- Duration: 5-8 turns each side, moderate blue terrain
-- Improves: Edge Angle, Start of Turn, Centered Balance
-- Common Mistake: Leaning into hill for balance instead of angulating
-- Video: https://www.youtube.com/results?search_query=javelin+turns+ski+drill+carving
-
-**3. Shuffle Turns**
-- Purpose: Builds awareness of fore/aft range of motion and balance
-- Execution: While skiing, shuffle feet forward/back against each other
-- Variants: Straight line shuffle, two-footed shuffle, shuffle while turning
-- Feel: Distinct pressure shifts along foot length, exploring balance range
-- Duration: Full run, green/blue terrain
-- Improves: Fore/Aft Balance awareness, Centered Balance, proprioception
-- Success Criteria: Can feel distinct pressure shifts along foot length
-- Video: https://www.youtube.com/results?search_query=shuffle+turns+ski+drill+balance
-
-**4. Pivot Slips**
-- Purpose: Develops rotary control and edge release ability
-- Execution: From standstill, release edges and pivot 180°, then stop
-- Feel: Controlled sliding, precise edge control
-- Duration: 10 pivots each direction
-- Improves: Transition Weight Release, edge awareness
-- Video: https://www.youtube.com/results?search_query=pivot+slips+ski+drill+edge+control
-
-### EDGE ANGLE DEVELOPMENT DRILLS
-
-**5. Railroad Track Carving**
-- Purpose: Develops pure carving - no skidding
-- Execution: Make turns leaving only two clean pencil lines in snow
-- Feel: Train on tracks, no sideways sliding
-- Duration: Full runs, focus on quality not quantity
-- Improves: Edge Angle, Turn Shape, Progressive Edge Build
-- Common Mistake: Going too fast - start slow, prioritize clean tracks
-- Video: https://www.youtube.com/results?search_query=railroad+track+carving+ski+drill
-
-**6. J-Turns (Edge Lock Drill)**
-- Purpose: Maximizes edge angle commitment
-- Execution: From traverse, commit to fall line, carve hard uphill until stop
-- Feel: Maximum edge engagement, G-force building, ski bending
-- Duration: 5 each direction, moderate pitch
-- Improves: Edge Angle, Progressive Edge Build, commitment
-- Video: https://www.youtube.com/results?search_query=j+turns+edge+lock+ski+drill+carving
-
-**7. Angulation Exaggeration**
-- Purpose: Develops hip angulation for higher edge angles
-- Execution: Touch outside hand to outside boot during turns
-- Feel: Body folding at waist, hips pushing into hill
-- Duration: 4-6 turns each direction
-- Improves: Edge Angle, Centered Balance
-- Common Mistake: Bending at waist instead of creating hip angle
-- Video: https://www.youtube.com/results?search_query=angulation+drill+skiing+hip+angulation
-
-**8. Pole Drag Carving**
-- Purpose: Forces upper body countering and angulation
-- Execution: Drag inside pole tip in snow throughout turn
-- Feel: Upper body stays facing downhill, separation from lower body
-- Duration: Full run
-- Improves: Edge Angle, Turn Shape, upper/lower body separation
-- Video: https://www.youtube.com/results?search_query=pole+drag+carving+ski+drill
-
-### BALANCE & FORE-AFT DRILLS
-
-**9. Shin Banger**
-- Purpose: Develops forward pressure and ankle flex
-- Execution: Feel constant shin pressure on boot tongue throughout turn
-- Feel: Shins pressing forward, never losing contact
-- Duration: Every turn, conscious focus
-- Improves: Start of Turn, Centered Balance
-- Cue: "Crush the tongue"
-- Video: https://www.youtube.com/results?search_query=shin+pressure+boot+tongue+ski+drill+forward+stance
-
-**10. Hands on Knees Turns**
-- Purpose: Forces forward stance and commitment
-- Execution: Ski with hands resting on kneecaps
-- Feel: Stacked, forward, can't sit back
-- Duration: 4-6 turns, easy terrain
-- Improves: Start of Turn, Centered Balance
-- Common Mistake: Bending too much at waist
-- Video: https://www.youtube.com/results?search_query=hands+on+knees+ski+drill+forward+stance
-
-**11. Tall-Small Transitions**
-- Purpose: Develops flexion/retraction timing for dynamic transitions
-- Execution: Build pressure (tall/strong outside leg) through turn, then actively collapse/flex old outside leg at transition to release. Don't push off - just flex and untip.
-- Feel: Hips stay level through transition, significant vertical separation of skis at crossover
-- Duration: Full run, exaggerate the flex/collapse at transition
-- Improves: Transition Weight Release, Pressure Management
-- Key Point: This is a down-unweighting/retraction pattern, not an extension-push pattern. Collapse to release, don't stand up to release.
-- Video: https://www.youtube.com/results?search_query=tall+small+transitions+ski+drill+retraction
-
-**12. Touch the Outside Boot**
-- Purpose: Develops outside ski pressure and forward commitment
-- Execution: Reach down and touch outside boot at turn apex
-- Feel: Weight over outside ski, forward and low
-- Duration: Alternating turns
-- Improves: Start of Turn, Centered Balance, Edge Angle
-- Video: https://www.youtube.com/results?search_query=touch+outside+boot+ski+drill+carving
-
-### TRANSITION & FLOW DRILLS
-
-**13. White Pass Turns**
-- Purpose: Develops early weight transfer and commitment to new turn
-- Execution: Transfer weight to new ski BEFORE releasing old turn
-- Feel: New turn starts before old one ends, overlapping commitment
-- Duration: Focus drill, 6-8 turns
-- Improves: Transition Weight Release, Early Edging
-- Common Mistake: Finishing old turn completely before starting new
-- Video: https://www.youtube.com/results?search_query=white+pass+turns+ski+drill+early+weight+transfer
-
-**14. Crossover Focus**
-- Purpose: Develops positive movement into new turn
-- Execution: Feel center of mass crossing over skis into new turn
-- Feel: Body moving downhill into the new arc, not pulling back
-- Duration: Every transition, conscious awareness
-- Improves: Transition Weight Release, Early Edging
-- Cue: "Fall into the new turn"
-- Video: https://www.youtube.com/results?search_query=crossover+skiing+drill+center+of+mass+transition
-
-**15. No Pole Skiing**
-- Purpose: Develops balance without pole crutch
-- Execution: Remove poles, hands on hips or crossed on chest
-- Feel: Pure balance, can't push off anything
-- Duration: Full runs
-- Improves: Centered Balance, Core engagement
-- Video: https://www.youtube.com/results?search_query=no+pole+skiing+drill+balance
-
-**16. Patience Turns**
-- Purpose: Develops complete turn finish and clean transitions
-- Execution: Let each turn finish completely up the hill before transitioning
-- Feel: No rushing, complete the arc
-- Duration: Focus on slow rhythmic skiing
-- Improves: Turn Shape, Transition Weight Release
-- Video: https://www.youtube.com/results?search_query=patience+turns+ski+drill+complete+turn+shape
-
-### ADVANCED PERFORMANCE DRILLS
-
-**17. Retraction Turns**
-- Purpose: Develops quick edge-to-edge transitions
-- Execution: Pull feet up under body at transition, extend into new turn
-- Feel: Light feet at crossover, snappy transition
-- Duration: Moderate to steep terrain
-- Improves: Transition Weight Release, Early Edging, G-Force
-- Video: https://www.youtube.com/results?search_query=retraction+turns+ski+drill+edge+change
-
-**18. Dolphin Turns**
-- Purpose: Develops dynamic fore/aft cycling through each turn
-- Execution: Pop off ski tails, land on shovels. Back-pedaling motion with feet - push feet forward to pop off tails, pull feet back with heels up to land on shovels
-- Feel: Visible "dolphin" shape to ski trajectory, dynamic fore/aft weight shift
-- Duration: Blue/Black terrain, focus on clean edge change while airborne
-- Improves: Transition Weight Release, Fore/Aft Balance, Dynamic Range
-- Success Criteria: Clean edge change while airborne, visible dolphin trajectory
-- Video: https://www.youtube.com/results?search_query=dolphin+turns+ski+drill+dynamic+fore+aft
-
-**19. Speed Carving**
-- Purpose: Develops trust in edge grip at speed
-- Execution: Increase speed while maintaining pure carved turns
-- Feel: Acceleration through the arc, G-forces building
-- Duration: Open blue/black runs
-- Improves: Edge Angle, Turn G-Force, confidence
-- Video: https://www.youtube.com/results?search_query=speed+carving+ski+high+edge+angle+GS+turns
-
-**20. Variable Radius Carving**
-- Purpose: Develops ability to adjust turn shape
-- Execution: Alternate between long radius and short radius carved turns
-- Feel: Adjustable pressure/edge, ski bending different amounts
-- Duration: Full runs
-- Improves: Progressive Edge Build, Turn Shape, versatility
-- Video: https://www.youtube.com/results?search_query=variable+radius+carving+ski+short+long+turns
-
-### HIGH-PERFORMANCE DRILLS
-
-**21. Hop Transitions**
-- Purpose: Develops explosive edge change
-- Execution: Hop both skis off snow at transition, land on new edges
-- Feel: Explosive, athletic, immediate edge engagement
-- Duration: Steep terrain, short sections
-- Improves: Early Edging, Transition Weight Release, athleticism
-- Video: https://www.youtube.com/results?search_query=hop+transitions+ski+drill+edge+change+carving
-
-**22. One-Ski Carving**
-- Purpose: Ultimate balance and edge control test
-- Execution: Remove one ski, carve turns on single ski
-- Feel: Total commitment, no backup
-- Duration: Easy terrain, 3-4 turns per side
-- Improves: Edge Angle, Centered Balance, balance mastery
-- Video: https://www.youtube.com/results?search_query=one+ski+carving+drill+single+ski+balance
-
-**23. Gate Training Simulation**
-- Purpose: Develops race-timing and line
-- Execution: Visualize gates, commit to apex, accelerate out
-- Feel: Early pressure, round the gate, explode out
-- Duration: Open slope, mark mental gates
-- Improves: All metrics, race application
-- Video: https://www.youtube.com/results?search_query=gate+training+simulation+ski+racing+drill
-
-### TWR-SPECIFIC DRILLS (Organized by Root Cause Level)
-
-#### Level 1: Fore/Aft Balance Drills (Fix First if Balance is Compromised)
-
-**24. Stork Turns**
-- Purpose: Forces forward commitment - cannot execute if aft
-- Execution: Lift inside ski's tail only, keeping tip on snow throughout turn
-- Difficulty: Beginner-Intermediate
-- Terrain: Green/Blue
-- Progression: Start on gentle terrain, increase steepness as competent
-- Improves: Start of Turn, Centered Balance, Transition Weight Release
-- Success Criteria: Can maintain tip contact without losing balance backward
-- Video: https://www.youtube.com/results?search_query=stork+turns+ski+drill+inside+ski+tip
-
-**25. Outside-to-Outside**
-- Purpose: 100% commitment to stance ski, requires forward balance
-- Execution: Lift entire inside ski parallel to snow surface (few inches clearance)
-- Difficulty: Intermediate
-- Terrain: Blue
-- Progression: Start with minimal lift, increase height as balance improves
-- Improves: Outside Ski Pressure, Fore/Aft Balance, Transition Weight Release
-- Common Error: Dragging pole for stability (remove crutch by holding poles at mid-shaft)
-- Success Criteria: Can link 6+ turns with inside ski lifted, no pole assistance
-- Video: https://www.youtube.com/results?search_query=outside+ski+to+outside+ski+drill+carving
-
-**26. Unbuckled Boots**
-- Purpose: Removes boot cuff as balance crutch. Forces standing on feet, not shins.
-- Execution: Ski with boot buckles open
-- Difficulty: Intermediate
-- Terrain: Green/Easy Blue ONLY
-- Improves: Centered Balance, proprioception, stance awareness
-- Caution: Very easy terrain only. Instant feedback when aft.
-- Success Criteria: Can make controlled turns without relying on boot support
-- Video: https://www.youtube.com/results?search_query=unbuckled+boots+ski+drill+balance+proprioception
-
-**27. Range of Motion Turns**
-- Purpose: Exploring full fore/aft range, building proprioceptive awareness
-- Execution: Deliberately ski as far forward as possible, then as far aft as possible
-- Difficulty: Intermediate
-- Terrain: Green/Blue ONLY
-- Improves: Fore/Aft Balance awareness, ability to find centered position
-- Caution: Never above blue groomers
-- Success Criteria: Can identify and feel the "centered" position between extremes
-- Video: https://www.youtube.com/results?search_query=range+of+motion+ski+drill+fore+aft+balance
-
-#### Level 2: Outside Ski Pressure Drills (Fix if Weak Pressure Buildup)
-
-**28. Single Leg Carving (Basic)**
-- Purpose: Proves full commitment to outside ski
-- Execution: Lift inside ski completely after transition is established
-- Difficulty: Intermediate
-- Terrain: Blue
-- Progression: Lift late in turn → lift mid-turn → lift at transition
-- Improves: Outside Ski Pressure, Transition Weight Release, Edge Angle
-- Success Criteria: Can carve clean arcs on single ski through shaping phase
-- Video: https://www.youtube.com/results?search_query=single+leg+carving+outside+ski+drill
-
-**29. Single Leg Carving (Advanced)**
-- Purpose: Early weight transfer to new outside ski
-- Execution: Lift inside ski at or before the transition
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Improves: Transition Weight Release, Early Edging, commitment
-- Success Criteria: Can lift inside ski while still on "wrong" edge, maintain carved arc
-- Video: https://www.youtube.com/results?search_query=advanced+single+ski+carving+early+weight+transfer
-
-**30. Up and Over (Early Stepping)**
-- Purpose: Earliest possible platform on new stance ski
-- Execution: Transfer weight to new outside ski while still on uphill edge (before edge change)
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Reference: Ted Ligety technique, US Ski Team staple drill
-- Improves: Transition Weight Release, Early Edging, Outside Ski Pressure
-- Success Criteria: Weight commits to new outside ski before that ski changes edges
-- Video: https://www.youtube.com/results?search_query=up+and+over+early+stepping+ski+drill+ted+ligety
-
-**31. Skating**
-- Purpose: Learn to tip lower leg to establish edge platform before pushing
-- Execution: Skate on skis without poles
-- Difficulty: Beginner-Intermediate
-- Terrain: Flat/Slight Uphill
-- Best With: Short skis (130cm) or slalom skis
-- Improves: Edge awareness, Outside Ski Pressure, weight transfer timing
-- Success Criteria: Can generate forward momentum through proper edge-then-push sequence
-- Video: https://www.youtube.com/results?search_query=skating+on+skis+drill+edge+platform+weight+transfer
-
-#### Level 3: Transition Mechanics Drills (Fix if Peaks Good but Troughs Shallow)
-
-**32. Hop Drill (Tom Gellie)**
-- Purpose: Building control, lightness, and confidence in unweighting
-- Execution: Hop from one set of edges to the other, exaggerating unweighting
-- Difficulty: Advanced
-- Terrain: Steep Blue/Black (steeper terrain naturally challenges balance, timing, precision)
-- Goal: Skis completely off ground during transition
-- Improves: Transition Weight Release, edge change confidence, athleticism
-- Success Criteria: Can hop cleanly between edge sets with controlled landings
-- Video: https://www.youtube.com/results?search_query=tom+gellie+hop+drill+skiing+edge+change
-
-**33. The Power Release**
-- Purpose: Flexing to release, maintaining low position through transition
-- Execution: Wide stance carving. Long/strong outside leg at apex, then actively collapse/flex that leg while keeping hips level.
-- Mechanics: Collapse old outside leg → pull inside boot up → extend new outside leg passively
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Key Point: Don't push off old outside ski. Just flex and untip.
-- Improves: Transition Weight Release, dynamic range, pressure modulation
-- Success Criteria: Hips stay level through transition, significant vertical separation of skis at crossover
-- Video: https://www.youtube.com/results?search_query=power+release+ski+drill+flex+retraction+transition
-
-**34. Bounce Turns (Powder Variant)**
-- Purpose: Weightless transition feeling, flow development
-- Execution: Short-radius turns focusing on finding bounce rhythm
-- Difficulty: Intermediate-Advanced
-- Terrain: Powder
-- Adjustments: Experiment with stance width and pressure distribution (outside ski focus vs two-footed platform)
-- Improves: Transition Weight Release, rhythm, flow
-- Success Criteria: Rhythmic "float" feeling between turns in powder
-- Video: https://www.youtube.com/results?search_query=bounce+turns+powder+skiing+rhythm+drill
-
-**35. Retraction Practice**
-- Purpose: Down-unweighting, creating weightlessness at transition
-- Execution: At turn's end, actively pull knees toward body
-- Difficulty: Advanced
-- Terrain: Blue/Black
-- Contrast With: Extension release where you stand up through transition
-- Improves: Transition Weight Release, edge change speed, lightness
-- Success Criteria: Skis feel light/weightless at transition, clean edge change
-- Video: https://www.youtube.com/results?search_query=retraction+release+skiing+down+unweighting+transition
-
-**36. 3-3-3 Balance Drill**
-- Purpose: Refines sensory awareness, develops ability to relocate balance state on demand
-- Execution: 3 turns FORE, 3 turns AFT, 3 turns CENTERED. Repeat.
-- Difficulty: Intermediate
-- Terrain: Blue
-- Variant: Add FORE-to-AFT within single turn (fore at initiation, aft at completion)
-- Improves: Fore/Aft Balance, Centered Balance, proprioceptive awareness
-- Success Criteria: Can consciously shift between balance states while maintaining turn quality
-- Video: https://www.youtube.com/results?search_query=3-3-3+balance+drill+skiing+fore+aft+centered
-
-## DRILL SELECTION FRAMEWORK
-
-Based on the skier's profile, select drills using this logic:
-
-**For Low START OF TURN scores**: Shin Banger, Hands on Knees, Touch Outside Boot
-**For Low CENTERED BALANCE scores**: Javelin Turns, Thousand Steps, No Pole Skiing
-**For Low TRANSITION WEIGHT RELEASE scores** (diagnose root cause first):
-  - If TWR < 50% AND Edge Angle < 40°: Prioritize Level 1 Fore/Aft drills (Shuffle Turns, Stork Turns, Range of Motion Turns)
-  - If TWR < 50% AND Edge Angle > 40°: Prioritize Level 3 Transition drills (Power Release, Retraction Practice, Hop Drill)
-  - If Outside Ski Pressure < 70%: Prioritize Level 2 drills (Single Leg Carving, Javelin Turns, Up and Over)
-  - If TWR 50-70%: Mix of Level 2 and Level 3 drills (Tall-Small, Dolphin Turns, 3-3-3 Balance)
-**For Low EDGE ANGLE scores**: J-Turns, Angulation Exaggeration, Pole Drag Carving
-**For Low EARLY EDGING scores**: White Pass Turns, Retraction Turns, Hop Transitions
-**For Low EDGING SIMILARITY scores**: Thousand Steps, One-Ski Carving, Javelin Turns (weak side focus)
-**For Low PROGRESSIVE EDGE BUILD scores**: J-Turns, Dolphin Turns, Railroad Track Carving
-**For Low PARALLEL SKIS scores**: Shuffle Turns, Thousand Steps
-**For Low TURN SHAPE scores**: Patience Turns, Railroad Track Carving, Variable Radius
-**For Low G-FORCE with good edge angles**: Speed Carving, Dolphin Turns (indicates skidding despite tipping)
-
-## SESSION STRUCTURE RECOMMENDATIONS
-
-**Warm-up Phase (First 2-3 runs)**
-- Free skiing at 70% effort
-- One foundation drill (Thousand Steps or Shuffle Turns)
-- Activate key movement patterns
-
-**Focus Phase (4-6 runs)**
-- Primary improvement drill (selected for biggest limiter)
-- 3-4 focused turns, then free skiing
-- Rest between attempts
-
-**Integration Phase (2-3 runs)**
-- Free skiing incorporating new feel
-- Higher speed/steeper terrain
-- Don't think, just ski with new patterns
-
-**Cool-down (Final run)**
-- Free skiing, enjoyment focus
-- Notice what felt different today
-
----
-
-Based on this skier's analysis, create a plan following this structure:
-
-# Training Plan for Ski:IQ {ski_iq}
-
-## The Big Picture
-- Summarize this skier in 2-3 sentences based on the holistic analysis
-- Their current progression level (Entry/Development/Performance/High Performance)
-- The ONE biggest limiter holding them back
-
-## Immediate Focus (Next 1-3 Runs)
-Based on their BIGGEST LIMITER:
-- The primary issue to address
-- The single best drill from the library above
-- Detailed execution instructions
-- What success feels like
-- Mental cue (3-5 words)
-
-## Your 3 Key Drills
-
-YOU MUST INCLUDE EXACTLY 3 DRILLS with full details. Select from the Drill Library above based on their weakest metrics.
-
-### Drill 1: [Name] - Primary Focus
-- **Target Metric**: [The CARV metric this improves]
-- **Why This Drill**: [How it addresses their specific weakness]
-- **How To Do It (Step-by-Step)**:
-  1. [Starting position - where to stand, stance width, pole position]
-  2. [The initiation - how to begin the movement]
-  3. [The main movement - what your body does during the drill]
-  4. [The finish - how to complete each rep/turn]
-  5. [Reset - how to prepare for the next rep]
-- **Terrain**: [Green/Blue/Black, groomed, pitch]
-- **Runs**: [X runs], [X focused turns per run, then free ski]
-- **Success Feels Like**: [Specific physical sensations - what you feel in feet, legs, hips]
-- **Mental Cue**: [3-5 word phrase to think while doing it]
-- **Common Mistakes**:
-  - [Mistake 1 and how to fix it]
-  - [Mistake 2 and how to fix it]
-- **Make It Harder**: [How to progress as they improve]
-- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
-
-### Drill 2: [Name] - Secondary Focus
-- **Target Metric**: [The CARV metric this improves]
-- **Why This Drill**: [How it addresses their specific weakness]
-- **How To Do It (Step-by-Step)**:
-  1. [Starting position]
-  2. [The initiation]
-  3. [The main movement]
-  4. [The finish]
-- **Terrain**: [Recommendation]
-- **Runs**: [X runs], [X focused turns per run]
-- **Success Feels Like**: [Specific physical sensations]
-- **Mental Cue**: [3-5 word phrase]
-- **Common Mistakes**:
-  - [Mistake and fix]
-- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
-
-### Drill 3: [Name] - Integration/Refinement
-- **Target Metric**: [The CARV metric this improves]
-- **Why This Drill**: [How it ties everything together]
-- **How To Do It (Step-by-Step)**:
-  1. [Starting position]
-  2. [The initiation]
-  3. [The main movement]
-  4. [The finish]
-- **Terrain**: [Recommendation]
-- **Runs**: [X runs], [X focused turns per run]
-- **Success Feels Like**: [Specific physical sensations]
-- **Mental Cue**: [3-5 word phrase]
-- **Video**: [Copy the exact Video URL from the drill's entry in the Drill Library above]
-
-## Daily Session Plan (10 Runs)
-
-Structure each ski day like this:
-
-**Run 1-2: Warm-Up Phase**
-- Free skiing at 70% effort
-- Focus: Get loose, feel the snow
-- Optional: Thousand Steps or Shuffle Turns to activate
-
-**Run 3-4: Drill 1 - [Name]**
-- [X] focused turns, then free ski to bottom
-- Rest at bottom, think about the feel
-- Repeat with intention
-
-**Run 5-6: Drill 2 - [Name]**
-- [X] focused turns, then free ski
-- Connect the feeling to Drill 1
-
-**Run 7-8: Drill 3 - [Name]**
-- [X] focused turns, then free ski
-- Integrate all three concepts
-
-**Run 9: Integration Run**
-- Free skiing at 80% effort
-- Apply all three drill concepts naturally
-- Don't think, just feel
-
-**Run 10: Fun Run**
-- Pure enjoyment skiing
-- Notice what feels different
-- End on a high note
-
-## Weekly Training Schedule
-
-### Day 1: Foundation Day
-- **Primary Focus**: Drill 1 (4 runs)
-- **Secondary**: Drill 2 (2 runs)
-- **Terrain**: Easier runs, perfect technique
-- **Goal**: Establish the movement patterns
-
-### Day 2: Development Day
-- **Primary Focus**: Drill 2 (4 runs)
-- **Secondary**: Drill 1 review (2 runs)
-- **Add**: Drill 3 introduction (2 runs)
-- **Terrain**: Progress to moderate terrain
-- **Goal**: Build on Day 1, add complexity
-
-### Day 3: Integration Day
-- **Primary Focus**: All 3 drills equally (2 runs each)
-- **Integration runs**: 4 runs applying concepts
-- **Terrain**: Varied - test on different pitches
-- **Goal**: Connect everything, build confidence
-
-### Day 4: Challenge Day
-- **Warm-up**: Quick drill review (1 run each)
-- **Challenge**: Apply to steeper/faster terrain
-- **Focus**: Maintain technique under pressure
-- **Goal**: Test limits, find new baseline
-
-### Day 5: Recovery & Assessment
-- **Light Focus**: Favorite drill only (2-3 runs)
-- **Mostly**: Free skiing with awareness
-- **End**: Take CARV screenshots for comparison
-- **Goal**: Consolidate gains, measure progress
-
-## This Week's Priorities
-
-### Priority 1: [Biggest Limiter]
-- Current: [score] → Target: [realistic target]
-- Primary Drill: Drill 1
-- Runs needed: 15-20 runs this week
-- Expected improvement: +5-8 points
-
-### Priority 2: [Second Issue]
-- Current: [score] → Target: [target]
-- Primary Drill: Drill 2
-- Runs needed: 10-15 runs this week
-- How it connects to Priority 1
-
-### Priority 3: [Third Issue]
-- Current: [score] → Target: [target]
-- Primary Drill: Drill 3
-- Runs needed: 8-10 runs this week
-- Integration with other priorities
-
-## Building on Strengths
-How to use their top strengths to accelerate improvement:
-- [Strength 1]: How it helps with [specific weakness]
-- [Strength 2]: How to leverage it
-
-## 4-Week Progression
-
-### Week 1-2: Foundation Building
-- Focus: [Primary limiter]
-- Drills: All 3 as described above
-- Drill Runs: 60% Drill 1, 30% Drill 2, 10% Drill 3
-- Target Metrics: [What CARV scores to watch]
-- Signs of Progress: [What they'll feel/see]
-
-### Week 3-4: Integration & Challenge
-- Progression: Increase terrain difficulty
-- Drill Balance: 40% Drill 1, 35% Drill 2, 25% Drill 3
-- Add Challenge: Speed, steeper terrain, variable snow
-- Target Metrics: [Updated goals]
-
-## Progress Checkpoints
-- After 5 runs: [What should improve first - usually awareness]
-- After 10 runs: [Expected metric changes]
-- After 20 runs: [Target achievements]
-- After 1 week: Take new CARV screenshots
-- After 2 weeks: Compare metrics, adjust drill focus
-
-## Mental Cues for This Skier
-Based on their specific pattern:
-- Primary Cue: "[3-5 words for their main focus]"
-- Transition Cue: "[For moving between turns]"
-- Confidence Cue: "[When they need to commit more]"
-
-## Common Traps to Avoid
-Based on their profile:
-- [Specific trap #1 they might fall into]
-- [Specific trap #2]
-- [What to do instead]
-
-Remember: Perfect practice makes perfect. 10 focused turns beat 100 mindless ones!
-"""
+# The training plan prompt, schema and drill library live in training_plan.py and drills.py
 
 
 def get_media_type(filename):
@@ -1601,106 +1011,95 @@ def get_job_status(job_id):
 @app.route('/generate-plan', methods=['POST'])
 def generate_training_plan():
     """
-    Generate a personalized training plan based on holistic analysis results.
+    Generate a personalised training plan from an analysis.
 
-    Expects: JSON with analysis data
-    Returns: Markdown formatted training plan
+    Expects JSON: the analysis object (as returned by /analyze-async), optionally with
+    "days_available" (1-7, default 5), "runs_per_day" (4-20, default 10) and "session_id"
+    (a saved session to exclude from history).
+    Returns: {"training_plan": <structured plan>, ...}
     """
-    try:
-        data = request.get_json()
-
-        if not data:
-            return jsonify({
-                "error": "No analysis data provided",
-                "message": "Please analyze screenshots first before generating a training plan"
-            }), 400
-
-        # Extract key info for the prompt
-        ski_iq = "Unknown"
-        num_runs = data.get('num_screenshots', 1)
-
-        # Try to get Ski:IQ from session_overview
-        if 'session_overview' in data:
-            ski_iq_range = data['session_overview'].get('ski_iq_range', {})
-            avg_iq = ski_iq_range.get('average')
-            if avg_iq:
-                ski_iq = avg_iq
-
-        # Format analysis data for the prompt
-        analysis_json = json.dumps(data, indent=2)
-
-        # Create the prompt
-        prompt = TRAINING_PLAN_PROMPT.format(
-            analysis_data=analysis_json,
-            ski_iq=ski_iq,
-            num_runs=num_runs
-        )
-
-        # Call Claude API for training plan (using Haiku for speed on Render's 30s timeout)
-        response = client.messages.create(
-            model=FAST_MODEL,
-            max_tokens=6000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            system="""You are an elite ski coach with deep expertise in carving biomechanics and CARV technology.
-
-Your knowledge is based on proven carving principles:
-- A carved turn means the ski tail follows the exact arc of the tip (train on tracks)
-- The 4 pillars: Edge Angle, Fore/Aft Balance, Rotary Control, Pressure Management
-- G-force is a RESULT of good technique, not the goal itself
-- Clean edge lock leaves a single thin line in snow
-
-When creating training plans:
-1. ALWAYS select drills from the provided Drill Library - these are proven, specific exercises
-2. Match drills to the specific metric deficiencies identified
-3. Use the Drill Selection Framework to pick appropriate drills
-4. Include detailed execution instructions, not vague suggestions
-5. Provide specific mental cues (3-5 words max)
-6. Be encouraging but honest about what needs work
-7. Use actual scores from the analysis
-8. Structure sessions: Warm-up → Focus Phase → Integration → Cool-down
-9. For EVERY drill recommended, include the YouTube video search link from the drill's Video field as a clickable reference (format: [Watch examples](URL))
-
-Key principles:
-- Quality over quantity (10 perfect turns beat 100 sloppy ones)
-- One focus at a time during practice
-- Progress from easy terrain to challenging
-- Build on strengths to fix weaknesses
-- Address root causes, not just symptoms"""
-        )
-
-        training_plan = response_text(response)
-
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not (data.get('carv_metrics') or data.get('overall_metrics') or data.get('holistic_analysis')):
         return jsonify({
-            "training_plan": training_plan,
-            "generated_at": datetime.now().isoformat(),
-            "based_on_ski_iq": ski_iq,
-            "based_on_screenshots": num_runs
-        })
+            "error": "No analysis data provided",
+            "message": "Please analyze screenshots first before generating a training plan"
+        }), 400
 
+    def bounded_int(value, default, low, high):
+        try:
+            return max(low, min(high, int(value)))
+        except (TypeError, ValueError):
+            return default
+
+    days_available = bounded_int(data.pop('days_available', None), 5, 1, 7)
+    runs_per_day = bounded_int(data.pop('runs_per_day', None), 10, 4, 20)
+    exclude_session_id = data.pop('session_id', None)
+
+    analysis = normalise_analysis(copy.deepcopy(data))
+    overview = analysis.get('session_overview') or {}
+    ski_iq = (overview.get('ski_iq_range') or {}).get('average')
+
+    # The three most recent saved sessions before this one, so the plan can build on them
+    history = []
+    try:
+        query = Session.query
+        session_dt = overview.get('session_datetime')
+        if session_dt:
+            try:
+                query = query.filter(Session.session_date < datetime.fromisoformat(str(session_dt).replace('Z', '+00:00')))
+            except ValueError:
+                pass
+        if exclude_session_id:
+            query = query.filter(Session.id != exclude_session_id)
+        history = [history_entry(s) for s in query.order_by(Session.session_date.desc()).limit(3).all()]
+    except Exception as e:  # history is a bonus; never block a plan on it
+        app.logger.warning("Could not load session history for plan: %s", e)
+
+    try:
+        response = client.messages.create(
+            model=FAST_MODEL,  # fast model keeps plan generation inside Render's request limits
+            max_tokens=8000,
+            system=plan_system_blocks(CARV_METRICS_CONTEXT),
+            tools=[PLAN_TOOL],
+            tool_choice={"type": "tool", "name": PLAN_TOOL["name"]},
+            messages=[{"role": "user", "content": plan_user_message(analysis, history, days_available, runs_per_day)}],
+        )
     except Exception as e:
         error_message = str(e)
-
+        app.logger.error("Plan generation failed: %s", error_message)
         if "api_key" in error_message.lower() or "authentication" in error_message.lower():
-            return jsonify({
-                "error": "API Key Error",
-                "message": "Your Anthropic API key is missing or invalid. Please check your .env file."
-            }), 401
-
+            return jsonify({"error": "API Key Error", "message": "The Anthropic API key is missing or invalid."}), 401
         if "rate_limit" in error_message.lower():
-            return jsonify({
-                "error": "Rate Limited",
-                "message": "Too many requests. Please wait a moment and try again."
-            }), 429
+            return jsonify({"error": "Rate Limited", "message": "Too many requests. Please wait a moment and try again."}), 429
+        return jsonify({"error": "Plan generation failed", "message": "Something went wrong generating your training plan. Please try again."}), 500
 
-        return jsonify({
-            "error": "Plan generation failed",
-            "message": f"Something went wrong generating your training plan. Error: {error_message}"
-        }), 500
+    if response.stop_reason == "max_tokens":
+        return jsonify({"error": "Plan cut off", "message": "The training plan was too long and got cut off. Please try again."}), 502
+
+    tool_input = next((block.input for block in response.content if getattr(block, "type", None) == "tool_use"), None)
+    try:
+        plan = assemble_plan(
+            tool_input,
+            ski_iq=ski_iq,
+            days_available=days_available,
+            runs_per_day=runs_per_day,
+            generated_at=datetime.now().isoformat(),
+        )
+    except PlanError as e:
+        return jsonify({"error": "Plan generation failed", "message": f"{e} Please try again."}), 502
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        app.logger.info("Plan tokens: input %s, cache read %s, cache write %s, output %s",
+                        usage.input_tokens, getattr(usage, "cache_read_input_tokens", None),
+                        getattr(usage, "cache_creation_input_tokens", None), usage.output_tokens)
+
+    return jsonify({
+        "training_plan": plan,
+        "generated_at": plan["generated_at"],
+        "based_on_ski_iq": ski_iq,
+        "based_on_sessions": len(history),
+    })
 
 
 @app.route('/chat', methods=['POST'])

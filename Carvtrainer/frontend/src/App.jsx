@@ -57,7 +57,7 @@ const dbSessionToLog = (session) => {
     notes: session.notes || '',
     savedAt: session.created_at || session.session_date,
     analysis: session.metrics || null,
-    trainingPlan: session.training_plan || null,
+    trainingPlan: parseStoredPlan(session.training_plan),
     metrics: {
       skiIQ: session.ski_iq ?? metrics.session_overview?.ski_iq_range?.average ?? null,
       balance: overall.balance || null,
@@ -133,6 +133,110 @@ const getLogMetricValue = (log, def) => {
   return value === undefined ? null : value
 }
 
+// Structured training plans (from /generate-plan). Older plans are markdown strings.
+const PLAN_FORMAT = 'carv-plan-v1'
+
+// A training plan from state, localStorage or the database: a structured plan object,
+// or the original markdown string for plans made before structured plans existed
+const parseStoredPlan = (value) => {
+  if (!value) return null
+  if (typeof value === 'object') return value.format === PLAN_FORMAT ? value : null
+  if (typeof value === 'string' && value.trimStart().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed?.format === PLAN_FORMAT) return parsed
+    } catch {
+      // not JSON: an old markdown plan
+    }
+  }
+  return value
+}
+
+// The database column is text, so structured plans are stored as JSON
+const serializePlan = (plan) => (plan && typeof plan === 'object' ? JSON.stringify(plan) : plan || null)
+
+const isStructuredPlan = (plan) => !!plan && typeof plan === 'object' && plan.format === PLAN_FORMAT
+
+const drillName = (drill) => drill?.reference?.name || drill?.drill_id || 'Drill'
+
+// A ski day built from the plan's three drills: warm-up, a block per drill, integration, a fun run
+const buildDailySchedule = (plan) => {
+  const totalRuns = plan.runs_per_day || 10
+  const drills = plan.drills || []
+  const warmUp = totalRuns >= 8 ? 2 : 1
+  const drillRuns = Math.max(drills.length, totalRuns - warmUp - 2)
+  const perDrill = drills.map((_, idx) => Math.floor(drillRuns / drills.length) + (idx < drillRuns % drills.length ? 1 : 0))
+  const phases = []
+  let run = 1
+  const span = (count) => {
+    const label = count > 1 ? `${run}-${run + count - 1}` : `${run}`
+    run += count
+    return label
+  }
+  phases.push({ runs: span(warmUp), phase: 'Warm-up', details: ['Free skiing at about 70% effort', 'Get loose and feel the snow'] })
+  drills.forEach((drill, idx) => {
+    phases.push({
+      runs: span(perDrill[idx]),
+      phase: drillName(drill),
+      details: [
+        `${drill.focused_turns || 4} focused turns, then free ski to the bottom`,
+        drill.mental_cue ? `Cue: "${drill.mental_cue}"` : null,
+        idx > 0 ? 'Connect the feeling to the drill before' : 'Rest at the bottom and think about the feel'
+      ].filter(Boolean)
+    })
+  })
+  phases.push({ runs: span(1), phase: 'Integration run', details: ['Free skiing at about 80% effort', 'Let the drills show up without thinking'] })
+  phases.push({ runs: span(1), phase: 'Fun run', details: ['Ski for enjoyment', 'Notice what feels different'] })
+  return phases
+}
+
+// A training week built from the plan's three drills, sized to the days available
+const buildWeeklySchedule = (plan) => {
+  const [primary, secondary, integration] = (plan.drills || []).map(drillName)
+  const templates = {
+    foundation: { name: 'Foundation', primaryFocus: `${primary} (about 4 runs)`, secondary: `${secondary} (about 2 runs)`, terrain: 'Easier runs, perfect technique', goal: 'Establish the movement pattern' },
+    development: { name: 'Development', primaryFocus: `${secondary} (about 4 runs)`, secondary: `${primary} review (2 runs), introduce ${integration}`, terrain: 'Moderate terrain', goal: 'Build on day one and add complexity' },
+    integration: { name: 'Integration', primaryFocus: `All three drills, about 2 runs each`, secondary: 'Several free runs applying them', terrain: 'Varied pitch', goal: 'Connect everything and build confidence' },
+    challenge: { name: 'Challenge', primaryFocus: 'One run of each drill as a warm-up', secondary: 'Apply them on steeper or faster terrain', terrain: 'Steeper terrain', goal: 'Keep the technique under pressure' },
+    recovery: { name: 'Recovery and check', primaryFocus: 'Your favourite drill (2-3 runs)', secondary: 'Mostly free skiing with awareness', terrain: 'Comfortable runs', goal: 'Take new Carv screenshots to compare' }
+  }
+  const orders = {
+    1: ['integration'],
+    2: ['foundation', 'integration'],
+    3: ['foundation', 'integration', 'recovery'],
+    4: ['foundation', 'development', 'integration', 'recovery'],
+    5: ['foundation', 'development', 'integration', 'challenge', 'recovery'],
+    6: ['foundation', 'development', 'integration', 'integration', 'challenge', 'recovery'],
+    7: ['foundation', 'development', 'integration', 'challenge', 'integration', 'challenge', 'recovery']
+  }
+  const days = Math.min(7, Math.max(1, plan.days_available || 5))
+  return orders[days].map((key, idx) => ({ dayNum: idx + 1, ...templates[key] }))
+}
+
+// Plain-text version of a structured plan for the text export
+const planToText = (plan) => {
+  if (!isStructuredPlan(plan)) return typeof plan === 'string' ? plan : ''
+  const lines = []
+  if (plan.summary) lines.push(plan.summary, '')
+  if (plan.biggest_limiter) lines.push(`Biggest limiter: ${plan.biggest_limiter}`)
+  if (plan.carv_alignment) lines.push(`Carv's view: ${plan.carv_alignment}`)
+  if (plan.changes_since_last) lines.push(`Since last time: ${plan.changes_since_last}`)
+  lines.push('')
+  ;(plan.drills || []).forEach((drill, idx) => {
+    lines.push(`DRILL ${idx + 1}: ${drillName(drill)} (${drill.role}) - target ${drill.target_metric}`)
+    if (drill.why) lines.push(`  Why: ${drill.why}`)
+    ;(drill.steps || []).forEach((step, sIdx) => lines.push(`  ${sIdx + 1}. ${step}`))
+    lines.push(`  ${drill.runs} runs, ${drill.focused_turns} focused turns per run`)
+    if (drill.success_feels_like) lines.push(`  Success feels like: ${drill.success_feels_like}`)
+    if (drill.mental_cue) lines.push(`  Cue: "${drill.mental_cue}"`)
+    ;(drill.common_mistakes || []).forEach(m => lines.push(`  Mistake: ${m.mistake} - fix: ${m.fix}`))
+    if (drill.reference?.video_url) lines.push(`  Video: ${drill.reference.video_url}`)
+    lines.push('')
+  })
+  ;(plan.priorities || []).forEach((p, idx) => lines.push(`Priority ${idx + 1}: ${p.metric} ${p.current} -> ${p.target}${p.drill_name ? ` (${p.drill_name})` : ''}`))
+  return lines.join('\n')
+}
+
 function App() {
   // Auth state
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -145,6 +249,8 @@ function App() {
   const [trainingPlan, setTrainingPlan] = useState(null)
   const [loading, setLoading] = useState(false)
   const [planLoading, setPlanLoading] = useState(false)
+  const [planDays, setPlanDays] = useState(5) // ski days this week, for the plan's schedule
+  const [planRuns, setPlanRuns] = useState(10) // runs per ski day
   const [error, setError] = useState(null)
   const fileInputRef = useRef(null)
 
@@ -402,7 +508,7 @@ function App() {
               performance: log.metrics?.performance
             }
           },
-          training_plan: log.trainingPlan || null
+          training_plan: serializePlan(log.trainingPlan)
         }
 
         const response = await axios.post(`${API_BASE_URL}/sessions`, sessionData)
@@ -689,8 +795,15 @@ function App() {
     setError(null)
 
     try {
-      const response = await axios.post(`${API_BASE_URL}/generate-plan`, analysis)
-      setTrainingPlan(response.data.training_plan)
+      // If this analysis is a saved session, don't count it as its own history
+      const savedLog = progressLogs.find(log => log.analysis === analysis)
+      const response = await axios.post(`${API_BASE_URL}/generate-plan`, {
+        ...analysis,
+        days_available: planDays,
+        runs_per_day: planRuns,
+        session_id: savedLog?.dbSessionId || null
+      })
+      setTrainingPlan(parseStoredPlan(response.data.training_plan))
     } catch (err) {
       const errorMessage = err.response?.data?.message ||
                           err.response?.data?.error ||
@@ -882,7 +995,7 @@ function App() {
       lines.push(divider)
       lines.push('TRAINING PLAN')
       lines.push(divider)
-      lines.push(trainingPlan)
+      lines.push(planToText(parseStoredPlan(trainingPlan)))
       lines.push('')
     }
 
@@ -1102,274 +1215,6 @@ function App() {
     } : prev)
   }
 
-  // Parse training plan into structured sections
-  const parseTrainingPlan = (text) => {
-    if (!text) return null
-
-    const sections = {
-      title: '',
-      bigPicture: [],
-      immediateFocus: { drill: '', cue: '', details: [] },
-      drills: [], // NEW: 3 key drills
-      dailyPlan: [], // NEW: daily session plan
-      weeklySchedule: [], // NEW: weekly training schedule
-      weekPlan: [],
-      strengths: [],
-      progression: { week1_2: [], week3_4: [] },
-      sessionPlan: [],
-      checkpoints: [],
-      mentalCues: [],
-      traps: [],
-      rawSections: {}
-    }
-
-    // Split by main headers
-    const lines = text.split('\n')
-    let currentSection = ''
-    let currentContent = []
-    let currentPriority = null
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-
-      // Main title
-      if (line.startsWith('# ')) {
-        sections.title = line.replace('# ', '').trim()
-        continue
-      }
-
-      // Section headers
-      if (line.startsWith('## ')) {
-        // Save previous section
-        if (currentSection) {
-          sections.rawSections[currentSection] = currentContent.join('\n')
-        }
-        currentSection = line.replace('## ', '').trim()
-        currentContent = []
-        continue
-      }
-
-      // Sub-section headers
-      if (line.startsWith('### ')) {
-        currentContent.push(line)
-        continue
-      }
-
-      currentContent.push(line)
-    }
-
-    // Save last section
-    if (currentSection) {
-      sections.rawSections[currentSection] = currentContent.join('\n')
-    }
-
-    // Parse specific sections
-    Object.keys(sections.rawSections).forEach(key => {
-      const content = sections.rawSections[key]
-      const keyLower = key.toLowerCase()
-
-      if (keyLower.includes('big picture')) {
-        sections.bigPicture = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-
-      if (keyLower.includes('immediate focus')) {
-        const lines = content.split('\n').filter(l => l.trim())
-        sections.immediateFocus.details = lines.map(l => {
-          if (l.includes('Mental cue') || l.includes('mental cue') || l.includes('Cue:')) {
-            sections.immediateFocus.cue = l.replace(/.*?[:"]\s*/, '').replace(/[""]/g, '').trim()
-          }
-          return l.replace(/^-\s*/, '').replace(/^\*\*.*?\*\*:?\s*/, '').trim()
-        }).filter(l => l && !l.startsWith('#'))
-      }
-
-      if (keyLower.includes("week's game plan") || keyLower.includes('week plan') || keyLower.includes('priorities')) {
-        // Parse priority blocks
-        const priorityBlocks = content.split(/###\s*Priority\s*\d+/i).filter(b => b.trim())
-        sections.weekPlan = priorityBlocks.map(block => {
-          const lines = block.split('\n').filter(l => l.trim())
-          const priority = {
-            name: '',
-            current: '',
-            target: '',
-            drill: '',
-            terrain: '',
-            details: []
-          }
-          lines.forEach(line => {
-            if (line.includes('Current:') && line.includes('→')) {
-              const match = line.match(/Current:\s*(\d+).*?→.*?(\d+)/i)
-              if (match) {
-                priority.current = match[1]
-                priority.target = match[2]
-              }
-            }
-            if (line.includes(':')) {
-              const [label, value] = line.split(':').map(s => s.trim())
-              if (label.toLowerCase().includes('drill')) priority.drill = value.replace(/\*\*/g, '')
-              if (label.toLowerCase().includes('terrain')) priority.terrain = value.replace(/\*\*/g, '')
-              if (!priority.name && line.startsWith('###')) {
-                priority.name = line.replace('###', '').replace(/\[.*?\]/g, '').trim()
-              }
-            }
-            priority.details.push(line.replace(/^-\s*/, '').replace(/^\*\*.*?\*\*:?\s*/, '').trim())
-          })
-          if (!priority.name && lines[0]) priority.name = lines[0].replace(/[:\[\]#*]/g, '').trim()
-          return priority
-        }).filter(p => p.name || p.drill)
-      }
-
-      if (keyLower.includes('building on strength')) {
-        sections.strengths = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-
-      // Parse 3 Key Drills
-      if (keyLower.includes('3 key drills') || keyLower.includes('your 3 key drills')) {
-        const drillBlocks = content.split(/###\s*Drill\s*\d+/i).filter(b => b.trim())
-        sections.drills = drillBlocks.map(block => {
-          const lines = block.split('\n').filter(l => l.trim())
-          const drill = {
-            name: '',
-            focus: '',
-            targetMetric: '',
-            why: '',
-            execution: '',
-            runsPerSession: '',
-            turnsPerRun: '',
-            terrain: '',
-            successFeels: '',
-            commonMistake: '',
-            progression: '',
-            videoUrl: ''
-          }
-          lines.forEach(line => {
-            const cleanLine = line.replace(/^-\s*/, '').replace(/\*\*/g, '')
-            // Check for markdown video link format: [Watch examples](URL)
-            const mdLinkMatch = line.match(/\[Watch[^\]]*\]\((https?:\/\/[^)]+)\)/)
-            if (mdLinkMatch) {
-              drill.videoUrl = mdLinkMatch[1]
-            }
-            if (line.includes(':')) {
-              const colonIdx = cleanLine.indexOf(':')
-              const label = cleanLine.substring(0, colonIdx).toLowerCase()
-              const value = cleanLine.substring(colonIdx + 1).trim()
-
-              if (label.includes('target metric')) drill.targetMetric = value
-              if (label.includes('why this drill')) drill.why = value
-              if (label.includes('execution') || label.includes('how to do it')) drill.execution = value
-              if (label.includes('runs per session') || (label.includes('runs') && !label.includes('run'))) drill.runsPerSession = value
-              if (label.includes('turns per run')) drill.turnsPerRun = value
-              if (label.includes('terrain')) drill.terrain = value
-              if (label.includes('success feels')) drill.successFeels = value
-              if (label.includes('common mistake')) drill.commonMistake = value
-              if (label.includes('make it harder') || label.includes('progression')) drill.progression = value
-              if (label.includes('video') || label.includes('watch')) {
-                const urlMatch = value.match(/https?:\/\/[^\s\])]+ /)?.[0]?.trim() || value.match(/https?:\/\/[^\s\])]+/)?.[0] || ''
-                drill.videoUrl = urlMatch || value.replace(/[\[\]()]/g, '').trim()
-              }
-            }
-            // Get drill name from first line or header remnant
-            if (!drill.name && lines.indexOf(line) === 0) {
-              drill.name = cleanLine.replace(/[:\-–]/g, ' ').replace(/Primary Focus|Secondary Focus|Integration|Refinement/gi, '').trim()
-              const focusMatch = line.match(/(Primary Focus|Secondary Focus|Integration|Refinement)/i)
-              if (focusMatch) drill.focus = focusMatch[1]
-            }
-          })
-          return drill
-        }).filter(d => d.name || d.execution)
-      }
-
-      // Parse Daily Session Plan
-      if (keyLower.includes('daily session plan') || keyLower.includes('daily plan')) {
-        const runBlocks = content.split(/\*\*Run\s*[\d-]+/i).filter(b => b.trim())
-        sections.dailyPlan = []
-        const runMatches = content.match(/\*\*Run\s*[\d-]+[^*]*\*\*/gi) || []
-        runMatches.forEach((runHeader, idx) => {
-          const runMatch = runHeader.match(/Run\s*([\d-]+)/i)
-          const phaseMatch = runHeader.match(/:\s*([^*]+)/i)
-          const blockContent = runBlocks[idx + 1] || ''
-          const details = blockContent.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-
-          sections.dailyPlan.push({
-            runs: runMatch ? runMatch[1] : '',
-            phase: phaseMatch ? phaseMatch[1].trim() : '',
-            details: details
-          })
-        })
-      }
-
-      // Parse Weekly Training Schedule
-      if (keyLower.includes('weekly training schedule') || keyLower.includes('weekly schedule')) {
-        const dayBlocks = content.split(/###\s*Day\s*\d+/i).filter(b => b.trim())
-        sections.weeklySchedule = dayBlocks.map((block, idx) => {
-          const lines = block.split('\n').filter(l => l.trim())
-          const day = {
-            dayNum: idx + 1,
-            name: '',
-            primaryFocus: '',
-            secondary: '',
-            terrain: '',
-            goal: '',
-            details: []
-          }
-          lines.forEach(line => {
-            const cleanLine = line.replace(/^-\s*/, '').replace(/\*\*/g, '')
-            if (line.includes(':')) {
-              const colonIdx = cleanLine.indexOf(':')
-              const label = cleanLine.substring(0, colonIdx).toLowerCase()
-              const value = cleanLine.substring(colonIdx + 1).trim()
-
-              if (label.includes('primary focus')) day.primaryFocus = value
-              if (label.includes('secondary')) day.secondary = value
-              if (label.includes('terrain')) day.terrain = value
-              if (label.includes('goal')) day.goal = value
-              if (label.includes('add')) day.details.push('Add: ' + value)
-            }
-            // Get day name from first line
-            if (!day.name && lines.indexOf(line) === 0) {
-              day.name = cleanLine.replace(/[:\-–]/g, ' ').trim()
-            }
-          })
-          return day
-        }).filter(d => d.name || d.primaryFocus)
-      }
-
-      if (keyLower.includes('progression') || keyLower.includes('4-week')) {
-        const week1Match = content.match(/###\s*Week\s*1[-–]2[\s\S]*?(?=###|$)/i)
-        const week3Match = content.match(/###\s*Week\s*3[-–]4[\s\S]*?(?=###|$)/i)
-        if (week1Match) {
-          sections.progression.week1_2 = week1Match[0].split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-        }
-        if (week3Match) {
-          sections.progression.week3_4 = week3Match[0].split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-        }
-      }
-
-      if (keyLower.includes('session plan') || keyLower.includes('sample session')) {
-        sections.sessionPlan = content.split('\n').filter(l => l.trim().startsWith('**') || l.trim().startsWith('Run')).map(l => {
-          const match = l.match(/\*\*(Run\s*[\d-]+)\*\*:?\s*(.*)/i) || l.match(/(Run\s*[\d-]+):?\s*(.*)/i)
-          if (match) {
-            return { run: match[1], activity: match[2].replace(/\*\*/g, '') }
-          }
-          return { run: '', activity: l.replace(/\*\*/g, '').trim() }
-        }).filter(s => s.activity)
-      }
-
-      if (keyLower.includes('checkpoint') || keyLower.includes('progress')) {
-        sections.checkpoints = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-
-      if (keyLower.includes('mental cue')) {
-        sections.mentalCues = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-
-      if (keyLower.includes('trap') || keyLower.includes('avoid')) {
-        sections.traps = content.split('\n').filter(l => l.trim().startsWith('-')).map(l => l.replace(/^-\s*/, '').trim())
-      }
-    })
-
-    return sections
-  }
-
   // Extract search query from YouTube URL and build embed URL
   const getYouTubeSearchQuery = (url) => {
     if (!url) return null
@@ -1380,6 +1225,21 @@ function App() {
       return null
     }
   }
+
+  // Light markdown for chat replies and older text plans: headings, bullets, **bold**
+  const renderInlineBold = (line) => line.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+    part.startsWith('**') && part.endsWith('**') ? <strong key={i}>{part.slice(2, -2)}</strong> : part
+  )
+  const renderTextLines = (text, keyPrefix = '') => text.split('\n').map((line, i) => {
+    const key = `${keyPrefix}${i}`
+    const trimmed = line.trim()
+    if (trimmed === '') return <br key={key} />
+    const heading = trimmed.match(/^(#{1,4})\s+(.*)$/)
+    if (heading) return <p key={key} className={`md-heading md-h${heading[1].length}`}><strong>{heading[2].replace(/\*\*/g, '')}</strong></p>
+    const bullet = trimmed.match(/^[-*]\s+(.*)$/)
+    if (bullet) return <p key={key} style={{ paddingLeft: '12px' }}>{'• '}{renderInlineBold(bullet[1])}</p>
+    return <p key={key}>{renderInlineBold(line)}</p>
+  })
 
   // Render chat/text content with embedded YouTube videos
   const renderContentWithVideos = (text) => {
@@ -1409,16 +1269,7 @@ function App() {
 
     if (videoLinks.length === 0) {
       // No YouTube links, render as formatted text
-      return text.split('\n').map((line, i) => {
-        if (line.startsWith('**') && line.endsWith('**')) {
-          return <p key={i}><strong>{line.replace(/\*\*/g, '')}</strong></p>
-        }
-        if (line.startsWith('- ')) {
-          return <p key={i} style={{paddingLeft: '12px'}}>{'• ' + line.slice(2)}</p>
-        }
-        if (line.trim() === '') return <br key={i} />
-        return <p key={i}>{line.replace(/\*\*([^*]+)\*\*/g, (_, text) => text)}</p>
-      })
+      return renderTextLines(text)
     }
 
     // Split the text and insert video embeds
@@ -1429,10 +1280,7 @@ function App() {
     allMatches.forEach((m, i) => {
       const before = text.slice(lastIndex, m.index)
       if (before) {
-        parts.push(<span key={`t${i}`}>{before.split('\n').map((line, li) => {
-          if (line.trim() === '') return <br key={li} />
-          return <span key={li}>{line}{li < before.split('\n').length - 1 ? <br/> : null}</span>
-        })}</span>)
+        parts.push(<div key={`t${i}`}>{renderTextLines(before.replace(/\[$/, ''), `t${i}-`)}</div>)
       }
       const url = m[2] || m[3]
       const query = getYouTubeSearchQuery(url)
@@ -1458,448 +1306,297 @@ function App() {
 
     const remaining = text.slice(lastIndex)
     if (remaining) {
-      parts.push(<span key="end">{remaining.split('\n').map((line, li) => {
-        if (line.trim() === '') return <br key={li} />
-        return <span key={li}>{line}{li < remaining.split('\n').length - 1 ? <br/> : null}</span>
-      })}</span>)
+      parts.push(<div key="end">{renderTextLines(remaining, 'end-')}</div>)
     }
 
     return <>{parts}</>
   }
 
-  // Render structured training plan
-  const renderTrainingPlan = (planText) => {
-    const plan = parseTrainingPlan(planText)
-    if (!plan) return <div className="training-plan-raw"><pre>{planText}</pre></div>
-
-    // Check if we actually parsed any meaningful content
-    const hasContent = plan.drills.length > 0 || plan.bigPicture.length > 0 ||
-      plan.immediateFocus.details.length > 0 || plan.dailyPlan.length > 0 ||
-      plan.weekPlan.length > 0 || plan.weeklySchedule.length > 0
-    if (!hasContent) {
-      // Fallback: render as formatted text with video links
-      return <div className="training-plan-raw">{renderContentWithVideos(planText)}</div>
+  // Render a training plan: structured plans as sections, older markdown plans as formatted text
+  const renderTrainingPlan = (storedPlan) => {
+    const plan = parseStoredPlan(storedPlan)
+    if (!plan) return null
+    if (!isStructuredPlan(plan)) {
+      return <div className="training-plan-raw">{renderContentWithVideos(plan)}</div>
     }
+
+    const icon = (children) => (
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">{children}</svg>
+    )
+    const dailySchedule = buildDailySchedule(plan)
+    const weeklySchedule = buildWeeklySchedule(plan)
+    const focusDrill = plan.immediate_focus?.reference
+    const cues = [
+      ['Primary', plan.mental_cues?.primary],
+      ['Transition', plan.mental_cues?.transition],
+      ['Confidence', plan.mental_cues?.confidence]
+    ].filter(([, cue]) => cue)
 
     return (
       <div className="training-plan-structured">
-        {/* Plan Header */}
-        {plan.title && (
-          <div className="plan-header">
-            <div className="plan-header-icon">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
-                <polyline points="14 2 14 8 20 8"/>
-                <line x1="16" y1="13" x2="8" y2="13"/>
-                <line x1="16" y1="17" x2="8" y2="17"/>
-                <line x1="10" y1="9" x2="8" y2="9"/>
-              </svg>
-            </div>
-            <h1>{plan.title}</h1>
+        <div className="plan-header">
+          <div className="plan-header-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
           </div>
-        )}
+          <h1>Training Plan{plan.ski_iq ? ` for Ski:IQ ${Math.round(plan.ski_iq)}` : ''}</h1>
+        </div>
 
-        {/* Big Picture Summary */}
-        {plan.bigPicture.length > 0 && (
-          <div className="plan-section big-picture-section">
-            <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="11" cy="11" r="8"/>
-                  <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                  <circle cx="11" cy="11" r="3"/>
-                </svg>
-              </span>
-              <h2>The Big Picture</h2>
-            </div>
-            <div className="big-picture-content">
-              {plan.bigPicture.map((item, idx) => (
-                <p key={idx}>{item}</p>
-              ))}
-            </div>
+        {/* The Big Picture */}
+        <div className="plan-section big-picture-section">
+          <div className="section-header">
+            <span className="section-icon">{icon(<><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></>)}</span>
+            <h2>The Big Picture</h2>
+            {plan.level && <span className="section-badge">{plan.level}</span>}
           </div>
-        )}
+          <div className="big-picture-content">
+            {plan.summary && <p>{plan.summary}</p>}
+            {plan.biggest_limiter && <p><strong>Biggest limiter:</strong> {plan.biggest_limiter}</p>}
+            {plan.carv_alignment && <p><strong>Carv's view:</strong> {plan.carv_alignment}</p>}
+            {plan.changes_since_last && <p><strong>Since last time:</strong> {plan.changes_since_last}</p>}
+          </div>
+        </div>
 
-        {/* Immediate Focus - Hero Card */}
-        {plan.immediateFocus.details.length > 0 && (
+        {/* Immediate Focus */}
+        {plan.immediate_focus?.issue && (
           <div className="plan-section immediate-focus-section">
             <div className="section-header">
-              <span className="section-icon focus-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <circle cx="12" cy="12" r="6"/>
-                  <circle cx="12" cy="12" r="2"/>
-                </svg>
-              </span>
+              <span className="section-icon focus-icon">{icon(<><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></>)}</span>
               <h2>Immediate Focus</h2>
               <span className="section-badge">Next 1-3 Runs</span>
             </div>
             <div className="focus-card">
-              {plan.immediateFocus.cue && (
+              {plan.immediate_focus.cue && (
                 <div className="mental-cue-hero">
                   <span className="cue-label">Your Mantra</span>
-                  <span className="cue-text">"{plan.immediateFocus.cue}"</span>
+                  <span className="cue-text">"{plan.immediate_focus.cue}"</span>
                 </div>
               )}
               <ul className="focus-details">
-                {plan.immediateFocus.details.slice(0, 5).map((detail, idx) => (
-                  <li key={idx}>{detail}</li>
-                ))}
+                <li>{plan.immediate_focus.issue}</li>
+                {focusDrill && <li>Drill: {focusDrill.name}{focusDrill.execution ? ` - ${focusDrill.execution}` : ''}</li>}
+                {plan.immediate_focus.what_success_feels_like && <li>Success feels like: {plan.immediate_focus.what_success_feels_like}</li>}
               </ul>
             </div>
           </div>
         )}
 
         {/* 3 Key Drills */}
-        {plan.drills.length > 0 && (
-          <div className="plan-section drills-section">
-            <div className="section-header">
-              <span className="section-icon drills-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-                </svg>
-              </span>
-              <h2>Your 3 Key Drills</h2>
-              <span className="section-badge drill-badge">Master These</span>
-            </div>
-            <div className="drills-grid">
-              {plan.drills.map((drill, idx) => (
-                <div key={idx} className={`drill-card drill-${idx + 1}`}>
-                  <div className="drill-header">
-                    <span className="drill-number">{idx + 1}</span>
-                    <div className="drill-title">
-                      <h3>{drill.name}</h3>
-                      {drill.focus && <span className="drill-focus-tag">{drill.focus}</span>}
-                    </div>
+        <div className="plan-section drills-section">
+          <div className="section-header">
+            <span className="section-icon drills-icon">{icon(<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>)}</span>
+            <h2>Your 3 Key Drills</h2>
+            <span className="section-badge drill-badge">Master These</span>
+          </div>
+          <div className="drills-grid">
+            {plan.drills.map((drill, idx) => (
+              <div key={drill.drill_id + idx} className={`drill-card drill-${idx + 1}`}>
+                <div className="drill-header">
+                  <span className="drill-number">{idx + 1}</span>
+                  <div className="drill-title">
+                    <h3>{drillName(drill)}</h3>
+                    {drill.role && <span className="drill-focus-tag">{drill.role.charAt(0).toUpperCase() + drill.role.slice(1)}</span>}
                   </div>
-                  {drill.targetMetric && (
-                    <div className="drill-metric">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <circle cx="12" cy="12" r="10"/>
-                        <circle cx="12" cy="12" r="3"/>
+                </div>
+                {drill.target_metric && (
+                  <div className="drill-metric">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
+                    <span>Target: {drill.target_metric}</span>
+                  </div>
+                )}
+                {drill.why && <p className="drill-why">{drill.why}</p>}
+                {drill.steps?.length > 0 && (
+                  <div className="drill-execution">
+                    <strong>How to do it:</strong>
+                    <ol className="drill-steps">
+                      {drill.steps.map((step, sIdx) => <li key={sIdx}>{step}</li>)}
+                    </ol>
+                  </div>
+                )}
+                <div className="drill-stats">
+                  <div className="drill-stat">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                    <span>{drill.runs} run{drill.runs === 1 ? '' : 's'} a day</span>
+                  </div>
+                  <div className="drill-stat">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    <span>{drill.focused_turns} focused turns per run</span>
+                  </div>
+                  {(drill.reference?.terrain || drill.reference?.duration) && (
+                    <div className="drill-stat terrain">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 17l6-6 4 4 8-8"/></svg>
+                      <span>{drill.reference.terrain || drill.reference.duration}</span>
+                    </div>
+                  )}
+                </div>
+                {drill.success_feels_like && (
+                  <div className="drill-success">
+                    <span className="success-label">Success feels like:</span>
+                    <span className="success-text">"{drill.success_feels_like}"</span>
+                  </div>
+                )}
+                {drill.mental_cue && (
+                  <div className="drill-success">
+                    <span className="success-label">Cue:</span>
+                    <span className="success-text">"{drill.mental_cue}"</span>
+                  </div>
+                )}
+                {(drill.common_mistakes || []).map((m, mIdx) => (
+                  <div key={mIdx} className="drill-warning">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                    <span>Watch out: {m.mistake}{m.fix ? `. Fix: ${m.fix}` : ''}</span>
+                  </div>
+                ))}
+                {drill.make_it_harder && <p className="drill-why"><strong>Make it harder:</strong> {drill.make_it_harder}</p>}
+                {drill.reference?.video_url && (
+                  <div className="drill-video-section">
+                    <a href={drill.reference.video_url} target="_blank" rel="noopener noreferrer" className="drill-video-btn">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                        <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
                       </svg>
-                      <span>Target: {drill.targetMetric}</span>
-                    </div>
-                  )}
-                  {drill.why && (
-                    <p className="drill-why">{drill.why}</p>
-                  )}
-                  {drill.execution && (
-                    <div className="drill-execution">
-                      <strong>How to do it:</strong>
-                      <p>{drill.execution}</p>
-                    </div>
-                  )}
-                  <div className="drill-stats">
-                    {drill.runsPerSession && (
-                      <div className="drill-stat">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                          <circle cx="9" cy="7" r="4"/>
-                        </svg>
-                        <span>{drill.runsPerSession}</span>
-                      </div>
-                    )}
-                    {drill.turnsPerRun && (
-                      <div className="drill-stat">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <polyline points="23 4 23 10 17 10"/>
-                          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-                        </svg>
-                        <span>{drill.turnsPerRun}</span>
-                      </div>
-                    )}
-                    {drill.terrain && (
-                      <div className="drill-stat terrain">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M3 17l6-6 4 4 8-8"/>
-                        </svg>
-                        <span>{drill.terrain}</span>
-                      </div>
-                    )}
+                      Watch Examples
+                    </a>
                   </div>
-                  {drill.successFeels && (
-                    <div className="drill-success">
-                      <span className="success-label">Success feels like:</span>
-                      <span className="success-text">"{drill.successFeels}"</span>
-                    </div>
-                  )}
-                  {drill.commonMistake && (
-                    <div className="drill-warning">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <circle cx="12" cy="12" r="10"/>
-                        <line x1="12" y1="8" x2="12" y2="12"/>
-                        <line x1="12" y1="16" x2="12.01" y2="16"/>
-                      </svg>
-                      <span>Watch out: {drill.commonMistake}</span>
-                    </div>
-                  )}
-                  {drill.videoUrl && (
-                    <div className="drill-video-section">
-                      <a
-                        href={drill.videoUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="drill-video-btn"
-                      >
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-                          <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
-                        </svg>
-                        Watch Examples
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="external-icon">
-                          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-                          <polyline points="15 3 21 3 21 9"/>
-                          <line x1="10" y1="14" x2="21" y2="3"/>
-                        </svg>
-                      </a>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
+                )}
+              </div>
+            ))}
           </div>
-        )}
+        </div>
 
-        {/* Daily Session Plan */}
-        {plan.dailyPlan.length > 0 && (
-          <div className="plan-section daily-plan-section">
-            <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <polyline points="12 6 12 12 16 14"/>
-                </svg>
-              </span>
-              <h2>Daily Session Plan</h2>
-              <span className="section-badge">10 Runs</span>
-            </div>
-            <div className="daily-timeline">
-              {plan.dailyPlan.map((phase, idx) => (
-                <div key={idx} className={`daily-phase phase-${idx + 1}`}>
-                  <div className="phase-marker">
-                    <div className="phase-dot"></div>
-                    {idx < plan.dailyPlan.length - 1 && <div className="phase-line"></div>}
-                  </div>
-                  <div className="phase-content">
-                    <div className="phase-header">
-                      <span className="phase-runs">Run {phase.runs}</span>
-                      <span className="phase-name">{phase.phase}</span>
-                    </div>
-                    {phase.details.length > 0 && (
-                      <ul className="phase-details">
-                        {phase.details.map((detail, dIdx) => (
-                          <li key={dIdx}>{detail}</li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
+        {/* Daily Session Plan, built from the three drills */}
+        <div className="plan-section daily-plan-section">
+          <div className="section-header">
+            <span className="section-icon">{icon(<><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>)}</span>
+            <h2>Daily Session Plan</h2>
+            <span className="section-badge">{plan.runs_per_day || 10} Runs</span>
           </div>
-        )}
-
-        {/* Weekly Training Schedule */}
-        {plan.weeklySchedule.length > 0 && (
-          <div className="plan-section weekly-schedule-section">
-            <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
-                  <line x1="16" y1="2" x2="16" y2="6"/>
-                  <line x1="8" y1="2" x2="8" y2="6"/>
-                  <line x1="3" y1="10" x2="21" y2="10"/>
-                </svg>
-              </span>
-              <h2>Weekly Training Schedule</h2>
-            </div>
-            <div className="weekly-grid">
-              {plan.weeklySchedule.map((day, idx) => (
-                <div key={idx} className={`day-card day-${idx + 1}`}>
-                  <div className="day-header">
-                    <span className="day-number">Day {day.dayNum}</span>
-                    <span className="day-name">{day.name}</span>
-                  </div>
-                  <div className="day-content">
-                    {day.primaryFocus && (
-                      <div className="day-focus primary">
-                        <span className="focus-label">Primary:</span>
-                        <span className="focus-value">{day.primaryFocus}</span>
-                      </div>
-                    )}
-                    {day.secondary && (
-                      <div className="day-focus secondary">
-                        <span className="focus-label">Secondary:</span>
-                        <span className="focus-value">{day.secondary}</span>
-                      </div>
-                    )}
-                    {day.terrain && (
-                      <div className="day-terrain">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M3 17l6-6 4 4 8-8"/>
-                        </svg>
-                        {day.terrain}
-                      </div>
-                    )}
-                    {day.goal && (
-                      <div className="day-goal">
-                        <span className="goal-label">Goal:</span>
-                        <span className="goal-value">{day.goal}</span>
-                      </div>
-                    )}
-                  </div>
+          <div className="daily-timeline">
+            {dailySchedule.map((phase, idx) => (
+              <div key={idx} className={`daily-phase phase-${idx + 1}`}>
+                <div className="phase-marker">
+                  <div className="phase-dot"></div>
+                  {idx < dailySchedule.length - 1 && <div className="phase-line"></div>}
                 </div>
-              ))}
-            </div>
+                <div className="phase-content">
+                  <div className="phase-header">
+                    <span className="phase-runs">Run {phase.runs}</span>
+                    <span className="phase-name">{phase.phase}</span>
+                  </div>
+                  <ul className="phase-details">
+                    {phase.details.map((detail, dIdx) => <li key={dIdx}>{detail}</li>)}
+                  </ul>
+                </div>
+              </div>
+            ))}
           </div>
-        )}
+        </div>
 
-        {/* Weekly Game Plan - Priorities */}
-        {plan.weekPlan.length > 0 && (
+        {/* Weekly Training Schedule, sized to the days available */}
+        <div className="plan-section weekly-schedule-section">
+          <div className="section-header">
+            <span className="section-icon">{icon(<><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></>)}</span>
+            <h2>Weekly Training Schedule</h2>
+            <span className="section-badge">{weeklySchedule.length} Day{weeklySchedule.length === 1 ? '' : 's'}</span>
+          </div>
+          <div className="weekly-grid">
+            {weeklySchedule.map((day, idx) => (
+              <div key={idx} className={`day-card day-${idx + 1}`}>
+                <div className="day-header">
+                  <span className="day-number">Day {day.dayNum}</span>
+                  <span className="day-name">{day.name}</span>
+                </div>
+                <div className="day-content">
+                  <div className="day-focus primary"><span className="focus-label">Primary:</span><span className="focus-value">{day.primaryFocus}</span></div>
+                  <div className="day-focus secondary"><span className="focus-label">Then:</span><span className="focus-value">{day.secondary}</span></div>
+                  <div className="day-terrain">{day.terrain}</div>
+                  <div className="day-goal"><span className="goal-label">Goal:</span><span className="goal-value">{day.goal}</span></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Priorities */}
+        {plan.priorities?.length > 0 && (
           <div className="plan-section week-plan-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-                  <polyline points="22 4 12 14.01 9 11.01"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>)}</span>
               <h2>This Week's Priorities</h2>
             </div>
             <div className="priorities-cards">
-              {plan.weekPlan.map((priority, idx) => (
+              {plan.priorities.map((priority, idx) => (
                 <div key={idx} className={`priority-card priority-${idx + 1}`}>
                   <div className="priority-badge">Priority {idx + 1}</div>
-                  <h3>{priority.name}</h3>
-                  {(priority.current || priority.target) && (
-                    <div className="score-progression">
-                      <span className="current-score">{priority.current}</span>
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <line x1="5" y1="12" x2="19" y2="12"/>
-                        <polyline points="12 5 19 12 12 19"/>
-                      </svg>
-                      <span className="target-score">{priority.target}</span>
-                    </div>
-                  )}
-                  {priority.drill && (
+                  <h3>{priority.metric}</h3>
+                  <div className="score-progression">
+                    <span className="current-score">{priority.current}</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                    <span className="target-score">{priority.target}</span>
+                  </div>
+                  {priority.drill_name && (
                     <div className="drill-tag">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-                      </svg>
-                      {priority.drill}
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                      {priority.drill_name}
                     </div>
                   )}
-                  {priority.terrain && (
-                    <div className="terrain-tag">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                        <circle cx="9" cy="7" r="4"/>
-                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-                        <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                      </svg>
-                      {priority.terrain}
-                    </div>
-                  )}
+                  {priority.note && <p className="drill-why">{priority.note}</p>}
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        {/* Session Structure */}
-        {plan.sessionPlan.length > 0 && (
-          <div className="plan-section session-plan-section">
+        {/* Building on strengths */}
+        {plan.strengths?.length > 0 && (
+          <div className="plan-section checkpoints-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-                </svg>
-              </span>
-              <h2>Session Structure</h2>
+              <span className="section-icon">{icon(<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>)}</span>
+              <h2>Building on Strengths</h2>
             </div>
-            <div className="session-timeline">
-              {plan.sessionPlan.map((session, idx) => (
-                <div key={idx} className="session-item">
-                  <div className="session-marker">
-                    <div className="marker-dot"></div>
-                    {idx < plan.sessionPlan.length - 1 && <div className="marker-line"></div>}
-                  </div>
-                  <div className="session-content">
-                    <span className="session-run">{session.run}</span>
-                    <span className="session-activity">{session.activity}</span>
-                  </div>
-                </div>
+            <div className="checkpoints-list">
+              {plan.strengths.map((s, idx) => (
+                <div key={idx} className="checkpoint-item"><span><strong>{s.strength}:</strong> {s.how_to_use}</span></div>
               ))}
             </div>
           </div>
         )}
 
         {/* 4-Week Progression */}
-        {(plan.progression.week1_2.length > 0 || plan.progression.week3_4.length > 0) && (
+        {(plan.progression?.weeks_1_2?.length > 0 || plan.progression?.weeks_3_4?.length > 0) && (
           <div className="plan-section progression-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="12" y1="20" x2="12" y2="10"/>
-                  <line x1="18" y1="20" x2="18" y2="4"/>
-                  <line x1="6" y1="20" x2="6" y2="16"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></>)}</span>
               <h2>4-Week Progression</h2>
             </div>
             <div className="progression-grid">
-              {plan.progression.week1_2.length > 0 && (
-                <div className="progression-phase">
-                  <div className="phase-header">
-                    <span className="phase-icon">1-2</span>
-                    <h3>Foundation</h3>
-                  </div>
-                  <ul>
-                    {plan.progression.week1_2.map((item, idx) => (
-                      <li key={idx}>{item}</li>
-                    ))}
-                  </ul>
+              {[['1-2', 'Foundation', plan.progression.weeks_1_2, ''], ['3-4', 'Integration', plan.progression.weeks_3_4, ' phase-advanced']].map(([weeks, title, items, extra]) => items?.length > 0 && (
+                <div key={weeks} className={`progression-phase${extra}`}>
+                  <div className="phase-header"><span className="phase-icon">{weeks}</span><h3>{title}</h3></div>
+                  <ul>{items.map((item, idx) => <li key={idx}>{item}</li>)}</ul>
                 </div>
-              )}
-              {plan.progression.week3_4.length > 0 && (
-                <div className="progression-phase phase-advanced">
-                  <div className="phase-header">
-                    <span className="phase-icon">3-4</span>
-                    <h3>Integration</h3>
-                  </div>
-                  <ul>
-                    {plan.progression.week3_4.map((item, idx) => (
-                      <li key={idx}>{item}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              ))}
             </div>
           </div>
         )}
 
         {/* Progress Checkpoints */}
-        {plan.checkpoints.length > 0 && (
+        {plan.checkpoints?.length > 0 && (
           <div className="plan-section checkpoints-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-                  <polyline points="22 4 12 14.01 9 11.01"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>)}</span>
               <h2>Progress Checkpoints</h2>
             </div>
             <div className="checkpoints-list">
               {plan.checkpoints.map((checkpoint, idx) => (
                 <div key={idx} className="checkpoint-item">
                   <div className="checkpoint-icon">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="9 11 12 14 22 4"/>
-                      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
-                    </svg>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
                   </div>
-                  <span>{checkpoint}</span>
+                  <span><strong>{checkpoint.when}:</strong> {checkpoint.expect}</span>
                 </div>
               ))}
             </div>
@@ -1907,23 +1604,18 @@ function App() {
         )}
 
         {/* Mental Cues */}
-        {plan.mentalCues.length > 0 && (
+        {cues.length > 0 && (
           <div className="plan-section cues-section">
             <div className="section-header">
-              <span className="section-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
-                  <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
-                  <line x1="12" y1="22.08" x2="12" y2="12"/>
-                </svg>
-              </span>
+              <span className="section-icon">{icon(<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>)}</span>
               <h2>Mental Cues</h2>
             </div>
             <div className="cues-grid">
-              {plan.mentalCues.map((cue, idx) => (
-                <div key={idx} className="cue-card">
+              {cues.map(([label, cue]) => (
+                <div key={label} className="cue-card">
                   <span className="cue-quote">"</span>
-                  <p>{cue.replace(/["]/g, '').replace(/^(Primary|Transition|Confidence)\s*Cue:\s*/i, '')}</p>
+                  <p>{cue}</p>
+                  <small>{label}</small>
                 </div>
               ))}
             </div>
@@ -1931,35 +1623,26 @@ function App() {
         )}
 
         {/* Traps to Avoid */}
-        {plan.traps.length > 0 && (
+        {plan.traps?.length > 0 && (
           <div className="plan-section traps-section">
             <div className="section-header">
-              <span className="section-icon warning-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-                  <line x1="12" y1="9" x2="12" y2="13"/>
-                  <line x1="12" y1="17" x2="12.01" y2="17"/>
-                </svg>
-              </span>
+              <span className="section-icon warning-icon">{icon(<><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></>)}</span>
               <h2>Traps to Avoid</h2>
             </div>
             <div className="traps-list">
               {plan.traps.map((trap, idx) => (
                 <div key={idx} className="trap-item">
                   <span className="trap-icon">!</span>
-                  <span>{trap}</span>
+                  <span>{trap.trap}{trap.instead ? `. Instead: ${trap.instead}` : ''}</span>
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        {/* Motivational Footer */}
         <div className="plan-footer">
           <div className="footer-quote">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-            </svg>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
             <p>Perfect practice makes perfect. 10 focused turns beat 100 mindless ones!</p>
           </div>
         </div>
@@ -2031,7 +1714,7 @@ function App() {
         session_date: masterDateTime,
         location,
         metrics: analysisToSave,
-        training_plan: trainingPlan,
+        training_plan: serializePlan(trainingPlan),
         notes: sessionNotes
       }
 
@@ -2122,7 +1805,7 @@ function App() {
       }
     }
     setAnalysis(log.analysis)
-    setTrainingPlan(log.trainingPlan)
+    setTrainingPlan(parseStoredPlan(log.trainingPlan))
     setSessionDateTime(normaliseLocalDateTime(log.datetime) || '')
     setShowProgressPanel(false)
   }
@@ -2354,6 +2037,18 @@ function App() {
             </button>
             {analysis && (
               <>
+                <div className="plan-options">
+                  <label>
+                    Ski days
+                    <input type="number" min="1" max="7" value={planDays}
+                      onChange={(e) => setPlanDays(Math.min(7, Math.max(1, Number(e.target.value) || 1)))} />
+                  </label>
+                  <label>
+                    Runs a day
+                    <input type="number" min="4" max="20" value={planRuns}
+                      onChange={(e) => setPlanRuns(Math.min(20, Math.max(4, Number(e.target.value) || 4)))} />
+                  </label>
+                </div>
                 <button
                   className="btn btn-secondary"
                   onClick={generateTrainingPlan}
