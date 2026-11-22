@@ -206,7 +206,7 @@ def create_analysis_message(**kwargs):
     )
 
 
-def response_text(response):
+def get_reply_text(response):
     """The reply's text. Newer models put a thinking block first, so never read content[0]."""
     return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
 
@@ -860,7 +860,7 @@ def analyze_screenshots():
         )
 
         # Extract response text
-        response_text = response_text(response)
+        response_text = get_reply_text(response)
 
         # Clean and parse JSON
         cleaned_json = clean_json_response(response_text)
@@ -941,7 +941,7 @@ def process_analysis_job(job_id, image_contents, filenames, num_images):
             return
 
         # Extract response text
-        response_text = response_text(response)
+        response_text = get_reply_text(response)
 
         # Clean and parse JSON
         cleaned_json = clean_json_response(response_text)
@@ -1412,7 +1412,7 @@ def chat():
 You're having a friendly, expert conversation with Patrick. Be personable but professional."""
         )
 
-        ai_response = response_text(response)
+        ai_response = get_reply_text(response)
 
         return jsonify({
             "response": ai_response,
@@ -1762,7 +1762,7 @@ Return ONLY valid JSON, no markdown code blocks."""
             system=CARV_METRICS_CONTEXT
         )
 
-        response_text = response_text(response)
+        response_text = get_reply_text(response)
         cleaned_json = clean_json_response(response_text)
 
         try:
@@ -1854,7 +1854,7 @@ Return ONLY valid JSON."""
             system=CARV_METRICS_CONTEXT
         )
 
-        response_text = response_text(response)
+        response_text = get_reply_text(response)
         cleaned_json = clean_json_response(response_text)
 
         try:

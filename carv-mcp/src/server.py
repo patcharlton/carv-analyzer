@@ -160,7 +160,7 @@ def save_progress(logs: list[dict]) -> None:
 MODEL = "claude-sonnet-5-5"
 
 
-def response_text(response) -> str:
+def get_reply_text(response) -> str:
     """The reply's text. Newer models put a thinking block first, so never read content[0]."""
     return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
 
@@ -331,7 +331,7 @@ async def analyze_screenshot(image_path: str) -> list[TextContent]:
             }]
         )
 
-        response_text = response_text(response)
+        response_text = get_reply_text(response)
 
         # Try to parse JSON and format nicely
         try:
@@ -435,7 +435,7 @@ async def generate_plan(analysis_json: str) -> list[TextContent]:
             }]
         )
 
-        return [TextContent(type="text", text=response_text(response))]
+        return [TextContent(type="text", text=get_reply_text(response))]
 
     except json.JSONDecodeError:
         return [TextContent(type="text", text="Error: Invalid JSON. Please provide the analysis JSON from analyze_carv_screenshot.")]
